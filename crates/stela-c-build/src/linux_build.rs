@@ -53,7 +53,11 @@ pub fn upstream_warnings(build: &mut cc::Build) {
         // Linux builds with -std=gnu11, so clang's GNU extension warnings are
         // off (-Wno-gnu in the top-level Makefile): amdgpu's SR-IOV message
         // header puts a variably sized union before the end of a struct.
-        .flag("-Wno-gnu");
+        .flag("-Wno-gnu")
+        // Linux includes tagged structs anonymously in others (mm/slab.h's
+        // struct slab holds a struct freelist_counters) and turns clang's
+        // warning for the extension off, as its CC_FLAGS_DIALECT do.
+        .flag("-Wno-microsoft-anon-tag");
     // The rest of scripts/Makefile.warn's default (no W=) clang profile.
     for warning in [
         "format-security",
