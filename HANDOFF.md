@@ -9,6 +9,8 @@ verificare** (dedotto o ricordato, non controllato).
 - Branch di lavoro: `claude/amd-radeon-rx9070-rdna4-y12vd2`
 - Repository: fork `LBNM-ONE/Stela` di `tylertms/Stela`. Alla data dell'analisi
   il fork coincide con l'upstream (`f39ffb3`).
+- Aggiornato il 2026-11-12 dalla sessione locale sul PC con l'hardware:
+  sezioni «Verificato sul PC», «Ambiente di build sul PC» e «Stato».
 
 ## Obiettivo
 
@@ -19,8 +21,8 @@ RDNA4, GFX12). Oggi Stela supporta solo NVIDIA (GTX 16 / RTX 20 e successive).
 
 - CPU: AMD Ryzen 9 7900X, con grafica integrata (Raphael, RDNA2).
 - GPU: AMD Radeon RX 9070.
-- Il sistema operativo del PC locale non è noto. I controlli hardware elencati
-  sotto richiedono Linux (anche una live USB).
+- Sistema operativo del PC: Ubuntu 26.04.1 LTS, kernel 7.0.0-43-generic
+  (dettagli in «Verificato sul PC»).
 
 ## Verdetto
 
@@ -146,20 +148,75 @@ Dimensioni, righe di `.c` e `.h` in `drivers/gpu/drm/amd/`:
   (`stela_nvk_submit_thread`, `stela_nvk_submit_failure` e simili) e
   `compat/mesa/nir_options.c`.
 
+## Verificato sul PC (2026-11-12)
+
+Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
+
+- Sistema: Ubuntu 26.04.1 LTS, kernel 7.0.0-43-generic, avvio UEFI, Secure
+  Boot disattivato. Scheda madre Gigabyte B850 AORUS ELITE WIFI7 ICE, BIOS
+  F12c del 2026-07-21. ESP su `/boot/efi` (`nvme0n1p2`) con `BOOT`,
+  `Microsoft` e `ubuntu`. 29 GB di RAM, 125 GB liberi su disco.
+- RX 9070: `0000:03:00.0`, ID PCI `1002:7550` rev `c3`, subsystem
+  `1da2:4499`, VBIOS `113-4E490TX-UP5`, 16 GB GDDR6 a 256 bit (VRAM 16304M),
+  56 CU attive (4 SE, 2 SH per SE, 8 CU per SH). Funzione audio `03:00.1`
+  (`1002:ab40`). La scheda sta dietro il proprio switch PCIe: upstream port
+  `01:00.0` (`1002:1478`), downstream port `02:00.0` (`1002:1479`). È il
+  `boot_vga`.
+- iGPU Raphael: `0000:12:00.0`, ID `1002:164e` rev `c2`, GC 10.3.6, DCN
+  3.1.5, 512 MB di VRAM, pilotata da amdgpu: la grafica integrata è attiva
+  nel BIOS. Nessuna uscita collegata.
+- Monitor: due, entrambi sulla 9070 (`card1-DP-2` e `card1-HDMI-A-2`
+  connessi e abilitati). Le uscite della iGPU (`card0-DP-3/4/5`,
+  `card0-HDMI-A-3`) sono scollegate. Per la tappa 2 del piano i monitor
+  vanno spostati sulle uscite della scheda madre.
+- Reset: `/sys/bus/pci/devices/0000:03:00.0/reset_method` elenca solo `bus`,
+  quindi il kernel non trova FLR (né reset PM o ACPI) sulla 9070; lo stesso
+  vale per la iGPU. Il reset del bus secondario passa dal downstream port
+  `02:00.0` e coinvolge anche `03:00.1`. amdgpu usa BACO per il runtime pm.
+  Il bit `FLReset` di `DevCap` resta da leggere con
+  `sudo lspci -nnvv -s 03:00.0`.
+- Versioni IP della 9070 (da `ip_discovery`, 46 IP): GC 12.0.1, MP0 (PSP)
+  14.0.3, MP1 (SMU) 14.0.3, SDMA0 e SDMA1 7.0.1, LSDMA 7.0.1, DMU 4.1.0 (DCN
+  4.0.1), VCN 5.0.0, NBIF 6.3.1, MMHUB 4.1.0, ATHUB 4.1.0, HDP 7.0.0, OSSSYS
+  7.0.0, UMC 8.14.0 (8 istanze), SMUIO 14.0.2, THM 14.0.2, DF 4.15.1,
+  SYSTEMHUB 2.3.0, PWR 9.0.0. PSP 14.0.3, SMU 14.0.3 e SDMA 7.0.1 sono
+  confermati.
+- Blocchi IP che amdgpu 3.64.0 (kernel 7.0) istanzia per la 9070:
+  soc24_common, gmc_v12_0, ih_v7_0, psp_v14_0, smu_v14_0, dm, gfx_v12_0,
+  sdma_v7_0, vcn_v5_0_0, jpeg_v5_0_0, mes_v12_0. MES: `gfx_hqd_mask 0xfe`,
+  `compute_hqd_mask 0x0c`, `sdma_hqd_mask 0xfc`. Ring: gfx_0.0.0,
+  comp_1.0.0, comp_1.1.0, comp_1.0.1, comp_1.1.1, sdma0, sdma1,
+  vcn_unified_0, jpeg_dec.
+- Firmware caricati sulla 9070: sos 0x003a1014, ta_ras 0x1b3a0001, imu
+  0x0c302b00, pfp 0xbea, me 0xb9a, mec 0xcda, mes e mes_kiq 0x89, rlc
+  0x00be7da0, sdma 0x00798e96, smc 0x00684c00 (104.76.0), dmcub 0x0a000800,
+  vcn 0x0910c00f. I file sono in `/lib/firmware/amdgpu/`, compressi `.zst`:
+  `gc_12_0_1_{pfp,me,mec,mes,mes1,rlc,imu}.bin` e varianti `_kicker`,
+  `psp_14_0_3_{sos,ta}.bin` e `_kicker`, `smu_14_0_3.bin` e `_kicker`,
+  `sdma_7_0_1.bin`, `dcn_4_0_1_dmcub.bin`; `gc_12_0_1_toc.bin` e
+  `gc_12_0_1_uni_mes.bin` sono link a `gc_12_0_0_*`. TMZ non supportato; le
+  TA opzionali RAP e SECUREDISPLAY mancano.
+- Memoria e BAR della 9070: il firmware lascia BAR0 a 256 MB
+  (`0xfce0000000`); è amdgpu che lo allarga a 16 GB (Resizable BAR, BAR =
+  VRAM) e lo sposta a `0xc00000000`. BAR2 2 MB (doorbell) a `0x1000000000`,
+  registri MMIO 512 KB a `0xdfc00000`, I/O a `0xf000`. GART 512M, vm size
+  262144 GB (4 livelli, blocchi e frammenti da 9 bit).
+- Interrupt: un solo vettore MSI per la 9070 (`msi_irqs` = 1).
+- IOMMU: AMD IOMMU attivo (`ivhd0`). Gruppi: `03:00.0` → 14 da sola,
+  `03:00.1` → 15, `02:00.0` → 13, `01:00.0` → 12, `12:00.0` → 29.
+
 ## Da verificare
 
-- Che Navi 48 usi proprio PSP 14.0.3, SMU 14.0.3 e SDMA 7.0.1. La
-  corrispondenza è dedotta dai nomi. `dmesg` sul PC lo conferma.
-- L'ID PCI della RX 9070. Ricordo `1002:7550`, non controllato.
-- Se la RX 9070 supporta il Function Level Reset. `cold.rs` lo richiede. Se
-  manca, serve un'altra via: reset del bus secondario sul bridge a monte,
-  oppure il reset interno di amdgpu.
+- Il bit `FLReset` in `DevCap` della 9070 (`sudo lspci -nnvv -s 03:00.0`).
+  sysfs dice già che il kernel non trova FLR; se `DevCap` lo conferma,
+  `cold.rs` ha bisogno di un'altra via: reset del bus secondario sul
+  downstream port `02:00.0`, oppure il reset interno di amdgpu (il metodo
+  che `amdgpu_asic_reset` sceglie per SOC24 è da leggere nei sorgenti).
+- Quale ramo di `gmc_v12_0.c` (maschera DMA a 44 o 52 bit) valga per Navi 48.
 - Se, con la 9070 senza display e il monitor sulla iGPU, il desktop di macOS
   arriva davvero sullo schermo del firmware. Il commento in `gpu/display.rs`
   lo suggerisce, ma il percorso dal DCP modellato allo scanout del firmware
-  non è stato tracciato.
-- Quanti servizi kernel mancano ad amdgpu nell'ambiente ospitato. È
-  l'incognita principale e la misura il primo passo qui sotto.
+  non è stato tracciato. Oggi i monitor stanno sulla 9070.
 - Se l'upstream sta già lavorando su AMD. Il README annuncia altro supporto
   hardware e `autoconf.h` contiene già default per i915/xe. Conviene chiedere
   sul loro Discord prima di investire mesi.
@@ -174,7 +231,8 @@ Dimensioni, righe di `.c` e `.h` in `drivers/gpu/drm/amd/`:
    - Aggiungere le opzioni a `autoconf.h`: `CONFIG_DRM_AMDGPU`, lasciando
      spenti DC, KFD, ACP, ISP, CIK, SI e USERPTR.
    - Fornire i servizi kernel mancanti in `crates/stela-linux/src/compat/kernel`
-     e `crates/stela-driver-gpu/src/compat/linux/kernel`.
+     e `crates/stela-driver-gpu/src/compat/linux/kernel`. Misurati il
+     2026-11-12: 82 propri di amdgpu, vedi «Censimento amdgpu: risultati».
 2. **Firmware**: ricette linux-firmware per i blob amdgpu, sul modello GSP in
    `recipes.rs`, e selezione per IP invece che per chipset.
 3. **Boot**: generalizzare `claim`, `claim_all` e `cold.rs` oltre NVIDIA.
@@ -202,16 +260,162 @@ Dimensioni, righe di `.c` e `.h` in `drivers/gpu/drm/amd/`:
 Scopo: misurare il lavoro kernel prima di impegnarsi.
 
 1. Prerequisiti: Rust (da `rust-toolchain.toml`), LLVM con Clang 21 o più
-   recente, Python 3.10 o più recente.
+   recente, Python 3.10 o più recente. Fatto il 2026-11-12: vedi «Ambiente
+   di build sul PC» per il PATH.
 2. `cargo xtask gpu fetch`. Scarica Linux, Mesa, LLVM, libdrm e xnu ai commit
-   pinnati, in checkout sparse, e applica le patch di Stela. È lungo.
+   pinnati, in checkout sparse, e applica le patch di Stela. Fatto il
+   2026-11-12: due minuti e mezzo su questo PC.
 3. Aggiungere `/drivers/gpu/drm/amd/` a `third_party/linux.sparse` e rifare
-   il fetch.
+   il fetch. Fatto il 2026-11-12, prima del primo fetch.
 4. Creare `crates/stela-driver-gpu/build/amdgpu.rs` sul modello di
-   `build/nouveau.rs`, dietro una feature `amdgpu-port`.
+   `build/nouveau.rs`, dietro una feature `amdgpu-port`. Fatto il 2026-11-12.
 5. Compilare gli oggetti di amdgpu con DC spento e leggere l'elenco dei
-   simboli kernel che nulla fornisce (`check_imports`).
-6. Raggruppare l'elenco per sottosistema e stimare il lavoro.
+   simboli kernel che nulla fornisce (`check_imports`). Fatto il 2026-11-12:
+   91 servizi, pinnati nella lista `OPEN` di `amdgpu.rs`.
+6. Raggruppare l'elenco per sottosistema e stimare il lavoro. Fatto il
+   2026-11-12: sezione seguente.
+
+## Censimento amdgpu: risultati (2026-11-12)
+
+Eseguito sul PC con `cargo build -p stela-driver-gpu --features amdgpu-port`
+(toolchain nel PATH come in «Ambiente di build sul PC»; sei minuti la prima
+volta, con le dipendenze e l'ambiente di `stela-linux`, un minuto e
+tre quarti quando ricompila solo classe DRM, nouveau e amdgpu). La
+feature compila i 376 oggetti di `amdgpu-y` invariati nell'ambiente
+ospitato, sopra l'archivio DRM del port nouveau, e confronta gli import che
+nulla fornisce con la lista `OPEN` di `crates/stela-driver-gpu/build/amdgpu.rs`,
+come `check_imports` fa per nouveau; il dettaglio, con gli oggetti che
+importano ogni servizio, va in `OUT_DIR/amdgpu-open-imports.txt`.
+
+Com'è fatto:
+
+- `build/amdgpu.rs`: la lista dei 376 oggetti è esplicita, ricavata con GNU
+  make dal Makefile di amdgpu con la sola `CONFIG_DRM_AMDGPU` (DC, KFD, ACP,
+  ISP, CIK, SI, ACPI, COMPAT, VGA_SWITCHEROO, HMM_MIRROR, PROC_FS,
+  PERF_EVENTS spenti) e verificata a ogni build contro le 419 parole `.o`
+  dei 15 Makefile di `amdgpu/`, `pm/` e `ras/`: 43 sono escluse con
+  l'opzione che le selezionerebbe. `kbuild.rs` non è stato esteso. La
+  feature `amdgpu-port` dipende da `nouveau-port`; `open_imports` è estratta
+  da `build/nouveau.rs` e serve a entrambi.
+- Due ritocchi per compilare: `-Wno-gnu` nel profilo `upstream_warnings` di
+  `stela-c-build` (Linux lo passa a clang nel Makefile principale;
+  `amdgv_sriovmsg.h` ha una union a dimensione variabile in mezzo a una
+  struct) e `src/compat/linux/stela/amdgpu_census.h`, passato con
+  `-include` al solo censimento, che dichiara le cinque funzioni che gli
+  header di Linux dichiarano solo con opzioni che Stela non imposta
+  (`irq_domain_create_linear`, `irq_domain_remove`, `irq_create_mapping`,
+  `generic_handle_domain_irq` con `CONFIG_IRQ_DOMAIN`; `pfn_to_nid` con un
+  modello di memoria), così contano come import aperti.
+- Tutti i 376 oggetti compilano con il profilo di warning di Linux e
+  `-Werror`. Nessun header `asm/` manca: quelli x86 di amdgpu sono sotto
+  guardie `CONFIG_X86*`.
+
+Risultato: 91 servizi kernel aperti, di cui 11 trap che l'ambiente definisce
+senza servire e 7 raggiunti solo attraverso oggetti dell'ambiente. Nove sono
+gli stessi già aperti per nouveau; 82 sono propri di amdgpu.
+
+| Gruppo | Servizi | Approccio |
+|---|---|---|
+| PCI e PCIe | 21 | adattatori in `compat/kernel/pci.c` |
+| Sorgenti upstream fuori dalla classe DRM | 17 | compilare invariati |
+| Libreria che l'ambiente non compila | 17 | compilare invariati, allargando lo sparse |
+| Modello dei device | 11 | stub e adattatori |
+| Interrupt | 8 | 2 adattatori, 6 trap |
+| Memoria | 5 | adattatori, in parte trap |
+| Tempo | 3 | adattatori |
+| Stampa e riavvio | 2 | adattatori |
+| Trap già noti a nouveau | 7 | nulla |
+
+Nel dettaglio, con gli oggetti che li importano:
+
+1. PCI e PCIe (21). Vettori MSI: `pci_alloc_irq_vectors`, `pci_irq_vector`,
+   `pci_free_irq_vectors` (`amdgpu_irq`). Capability:
+   `pci_find_ext_capability`, `pcie_capability_read_word`, `pcie_get_mps`,
+   `pcie_get_speed_cap`, `pcie_get_width_cap`,
+   `pci_enable_atomic_ops_to_root`. Resizable BAR: `pci_rebar_get_max_size`,
+   `pci_rebar_bytes_to_size`, `pci_resize_resource`, `pci_bus_resource_n`
+   (`amdgpu_device_resize_fb_bar`, che su questo PC allarga BAR0 da 256 MB a
+   16 GB; amdgpu prosegue se il resize fallisce). Reset e sospensione:
+   `pci_reset_function`, `pci_store_saved_state`, `pci_load_saved_state`,
+   `pci_restore_msi_state`, `pci_clear_master`. `pci_get_class`
+   (`smu_v14_0_0_ppt`, APU). `pci_wait_for_pending_transaction` e
+   `pci_wake_from_d3` sono trap già definiti. In Linux:
+   `drivers/pci/{pci,search,setup-res}.c` e `drivers/pci/msi/api.c`, nessuno
+   nello sparse: sono adattatori di Stela sul suo PCI.
+2. Sorgenti upstream fuori dalla classe DRM (17). Il buddy allocator per
+   `amdgpu_vram_mgr`: `gpu_buddy_*` (6, `drivers/gpu/buddy.c`,
+   `CONFIG_GPU_BUDDY`) e `drm_buddy_print` (`drm_buddy.c`); il
+   sub-allocatore per `amdgpu_sa`: `drm_suballoc_*` (4, `drm_suballoc.c`);
+   il client DRM per `amdgpu_amdkfd`: `drm_client_*` (3, `drm_client.c`); il
+   modulo compagno di `amdgpu_xcp`: `amdgpu_xcp_*` (3,
+   `amd/amdxcp/amdgpu_xcp_drv.c`). Da aggiungere a `DRM_SOURCES` in
+   `build/native.rs`; `drivers/gpu/buddy.c` anche allo sparse.
+3. Libreria che l'ambiente non compila (17). kfifo (5, `lib/kfifo.c`:
+   `ras_core`, `ras_process`); mempool (6, `mm/mempool.c`: `ras_log_ring`);
+   `down` e `up` (`kernel/locking/semaphore.c`: `amdgpu_device`); `gcd`
+   (`lib/math/gcd.c`: `amdgpu_afmt`, `amdgpu_pll`); `bitmap_zalloc` e
+   `bitmap_free` (`lib/bitmap-alloc.c`, nello sparse ma non compilato:
+   `amdgpu_mes`); `sscanf` (`amdgpu_psp`, `amdgpu_gfx`; il `vsprintf.c` di
+   Stela non lo fornisce). Dei file, solo `bitmap-alloc.c` è nello sparse.
+4. Modello dei device (11). `device_create_file` e `device_remove_file`
+   (10 oggetti: attributi sysfs di `amdgpu_pm`, `amdgpu_gmc`, `amdgpu_xgmi`,
+   `amdgpu_gfx`, `amdgpu_sdma`, `amdgpu_vcn`, `amdgpu_jpeg`, `amdgpu_vpe`,
+   `amdgpu_preempt_mgr`, `df_v3_6`), `devm_device_add_group`
+   (`amdgpu_device`, `amdgpu_atombios`, `amdgpu_pm`), `devm_i2c_add_adapter`
+   (9 oggetti: `amdgpu_i2c`, `smu_v11_0_i2c` e gli i2c dei `*_ppt`),
+   `device_link_del` (`smu_v14_0_0_ppt`), `hwmon_device_register_with_groups`
+   e `hwmon_device_unregister` (`amdgpu_pm`), `backlight_device_register` e
+   `backlight_device_unregister` (`atombios_encoders`, DCE legacy),
+   `device_link_add` e `platform_device_unregister` (trap, come per nouveau).
+   Stela non ha sysfs né hwmon: stub che riescono; `devm_i2c_add_adapter`
+   sopra l'`i2c.c` esistente.
+5. Interrupt (8). `disable_irq` (`amdgpu_fence`) ed `enable_irq`
+   (`amdgpu_irq`) sono adattatori in `irq.c`. Il dominio
+   (`irq_domain_create_linear`, `irq_domain_remove`, `irq_create_mapping`,
+   `generic_handle_domain_irq`, `handle_simple_irq`,
+   `irq_set_chip_and_handler_name`, tutti da `amdgpu_irq`) lo creano solo
+   `iceland_ih`, `tonga_ih`, `cz_ih` e `ih_v6_1`, non l'`ih_v7_0` di Navi
+   48: trap.
+6. Memoria (5). `page_is_ram` e `pfn_to_nid` (`gmc_v9_0`, flag di coerenza
+   delle APU GFX9); `dma_map_resource` e `dma_unmap_resource`
+   (`amdgpu_ttm`, `amdgpu_vram_mgr`: mapping P2P di VRAM altrui);
+   `dma_addressing_limited` (`amdgpu_ttm`). Adattatori in `dma.c` e
+   `page.c`; i primi quattro probabilmente trap per la 9070.
+7. Tempo (3). `ktime_get_mono_fast_ns` (`amdgpu_device`),
+   `ktime_get_real_seconds` (`amdgpu_ras_eeprom`, `amdgpu_umc`,
+   `amdgpu_cper`, `amdgpu_ras_sys`, `ras_eeprom_fw`), `time64_to_tm`
+   (`amdgpu_cper`). In Linux `kernel/time/{timekeeping,timeconv}.c`;
+   adattatori in `timekeeping.c` e `time.c` di Stela.
+8. Stampa e riavvio (2). `__printk_ratelimit` (`gmc_v7_0` … `gmc_v12_1`;
+   `kernel/printk/printk.c`), `emergency_restart` (`amdgpu_device`;
+   `kernel/reboot.c`).
+9. Trap già noti a nouveau (7): `folio_clear_dirty_for_io`,
+   `mm_get_unmapped_area`, `shmem_read_folio_gfp`,
+   `shmem_read_mapping_page_gfp`, `shmem_truncate_range`, `shmem_writeout`,
+   `stela_linux_reopen_unowned_path`.
+
+Cosa dice sul lavoro kernel. L'incognita principale è misurata: 82 funzioni,
+non sottosistemi interi. Nessun sottosistema grosso risulta necessario:
+debugfs, perf, HMM e KFD sono fuori per configurazione, pm_runtime e il
+firmware loader li fornisce già l'ambiente di nouveau, come workqueue,
+timer, kthread, TTM, scheduler e dma-buf. Circa 34 servizi (gruppi 2 e 3)
+si chiudono compilando una decina di file upstream invariati; una ventina
+sono stub o trap; restano gli adattatori veri, concentrati su PCI (vettori
+MSI, capability, Resizable BAR, reset) e sul modello dei device. Il
+censimento misura solo gli import di link: la semantica a runtime
+dell'ambiente di Stela (un proprietario alla volta, niente preemption) vale
+per amdgpu quanto per nouveau e non è stata ancora provata con la 9070.
+
+Prossimo passo proposto, in ordine:
+
+1. Gruppi 2 e 3: allargare `third_party/linux.sparse` e `DRM_SOURCES`,
+   compilare i file invariati, far scendere `OPEN`.
+2. Adattatori PCI in `compat/kernel/pci.c`, con `pci_resize_resource` e
+   `pci_rebar_get_max_size` che rifiutano (BAR0 resta a 256 MB finché Stela
+   non sa riallocare).
+3. Stub e adattatori dei gruppi 4–8; trap per i gruppi 5 (dominio) e 6.
+4. Poi `autoconf.h` con `CONFIG_DRM_AMDGPU`, le ricette firmware (strato 2) e
+   il boot (strato 3), verso la tappa 2 del piano.
 
 ## Controlli sul PC (Linux)
 
@@ -224,6 +428,11 @@ Nel primo cercare: gli ID dei due dispositivi, `FLReset+` o `FLReset-` in
 `DevCap`, le dimensioni dei BAR, MSI e MSI-X. Nel secondo: le versioni degli
 IP e i firmware caricati. Annotare anche dove è collegato il monitor e
 l'impostazione del BIOS per la grafica integrata.
+
+Eseguiti il 2026-11-12 senza `sudo` (chiede la password): `lspci -nn`,
+sysfs (`reset_method`, `ip_discovery`, `fw_version`, `resource`, stato dei
+connettori DRM) e `journalctl -k`. I risultati sono in «Verificato sul PC».
+Manca solo `DevCap` (bit `FLReset`), che `lspci` mostra soltanto da root.
 
 ## Regole del repository osservate
 
@@ -256,9 +465,58 @@ git checkout FETCH_HEAD
 Lo stesso per Mesa da `https://gitlab.freedesktop.org/mesa/mesa.git` al
 commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
 
+## Ambiente di build sul PC (2026-11-12)
+
+- Rust: `rustup` (snap, `/snap/bin/rustup`) ha installato la 1.99.1 di
+  `rust-toolchain.toml` con `x86_64-unknown-linux-musl`,
+  `x86_64-unknown-uefi`, rustfmt, clippy e llvm-tools. Nel PATH però `cargo`
+  e `rustc` sono i pacchetti Ubuntu 1.93.1 in `/usr/bin`, che ignorano
+  `rust-toolchain.toml`; i proxy di rustup stanno in `/snap/bin`, dopo
+  `/usr/bin`, e `~/.cargo/bin` non li ha. Dentro `rustup run 1.99.1` il
+  comando `which rustc` dà ancora `/usr/bin/rustc`, e `Toolchain::discover`
+  cerca `rustc` nel PATH. Ogni comando va quindi lanciato con il toolchain
+  davanti nel PATH:
+
+  ```sh
+  export PATH="$HOME/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin:$PATH"
+  cargo xtask gpu fetch
+  ```
+
+- Clang 21.0.0 (build swiftlang in `~/.local/share/swiftly/bin`: `clang`,
+  `clang++`, `clang-21`, `ld.lld`).
+- Python 3.14.4 di sistema; il fetch crea il venv in `.tools/gpu/generators`
+  con meson, ninja, pkgconf, Mako, packaging e PyYAML pinnati, e installa
+  bindgen-cli e cbindgen in `.tools/gpu/rust`.
+- Prima del fetch i submodule `third_party/{linux,mesa,llvm,libdrm,xnu}`
+  erano vuoti.
+
 ## Stato
 
-- Nessuna build è stata eseguita e nessun test è stato lanciato.
-- Nessun file del progetto è stato modificato, a parte questo documento.
-- Decisione in sospeso: partire dal censimento amdgpu (consigliato) oppure
-  sentire prima l'upstream.
+- 2026-11-12, sessione cloud: nessuna build eseguita, nessun test lanciato,
+  nessun file modificato a parte questo documento.
+- 2026-11-12, sessione locale sul PC:
+  - branch `claude/amd-radeon-rx9070-rdna4-y12vd2` creato in locale da
+    `origin`; è `main` più questo documento;
+  - controlli hardware eseguiti (vedi «Verificato sul PC»);
+  - toolchain Rust 1.99.1 installata da rustup (vedi «Ambiente di build»);
+  - `/drivers/gpu/drm/amd/` aggiunto a `third_party/linux.sparse` (passo 3
+    del censimento) prima del primo fetch, così il fetch è uno solo;
+  - `cargo xtask gpu fetch` riuscito in due minuti e mezzo: i cinque
+    submodule sono sul branch `stela` al loro pin, Linux con le 200 patch
+    applicate e Mesa con le 26; `third_party/linux/drivers/gpu/drm/amd/` è
+    nel checkout (2756 file `.c` e `.h`, 538 MB, `asic_reg` compreso);
+    `.tools/gpu` ha il venv dei generatori e bindgen/cbindgen. `third_party`
+    pesa 1 GB;
+  - censimento amdgpu eseguito, vedi «Censimento amdgpu: risultati». File
+    nuovi: `crates/stela-driver-gpu/build/amdgpu.rs` e
+    `crates/stela-driver-gpu/src/compat/linux/stela/amdgpu_census.h`.
+    Modificati: `crates/stela-driver-gpu/Cargo.toml` (feature `amdgpu-port`),
+    `build.rs`, `build/nouveau.rs` (`open_imports` condivisa),
+    `crates/stela-c-build/src/linux_build.rs` (`-Wno-gnu`),
+    `third_party/linux.sparse`. `cargo fmt --check` e clippy puliti sulla
+    lane host (`amdgpu-port`) e sulla lane UEFI (`metal-linked,nouveau-port`).
+    La lane host di `cargo xtask check` usa `--all-features`, quindi ora
+    compila anche amdgpu (meno di due minuti in più). Nulla è committato.
+- Decisione presa il 2026-11-12: censimento prima dell'upstream. Resta da
+  decidere se iniziare a fornire i servizi (ordine in «Prossimo passo
+  proposto») o sentire prima l'upstream, ora con numeri alla mano.
