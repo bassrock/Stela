@@ -232,7 +232,8 @@ Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
      spenti DC, KFD, ACP, ISP, CIK, SI e USERPTR.
    - Fornire i servizi kernel mancanti in `crates/stela-linux/src/compat/kernel`
      e `crates/stela-driver-gpu/src/compat/linux/kernel`. Misurati il
-     2026-11-12: 82 propri di amdgpu, vedi «Censimento amdgpu: risultati».
+     2026-11-12: 82 propri di amdgpu, 55 dopo il passo 1, vedi «Censimento
+     amdgpu: risultati».
 2. **Firmware**: ricette linux-firmware per i blob amdgpu, sul modello GSP in
    `recipes.rs`, e selezione per IP invece che per chipset.
 3. **Boot**: generalizzare `claim`, `claim_all` e `cold.rs` oltre NVIDIA.
@@ -406,14 +407,49 @@ censimento misura solo gli import di link: la semantica a runtime
 dell'ambiente di Stela (un proprietario alla volta, niente preemption) vale
 per amdgpu quanto per nouveau e non è stata ancora provata con la 9070.
 
+Passo 1, fatto il 2026-11-12: i gruppi 2 e 3 chiusi per quanto si compila
+invariato. `third_party/linux.sparse` ha in più `drivers/gpu/buddy.c` (con
+il `Makefile` di `drivers/gpu`, che lo compila come `buddy.o`),
+`lib/kfifo.c`, `lib/math/gcd.c`, `kernel/locking/semaphore.c` e
+`mm/mempool.c`; `autoconf.h` ha `CONFIG_DRM_BUDDY`, `CONFIG_GPU_BUDDY` e
+`CONFIG_DRM_SUBALLOC_HELPER`, che amdgpu seleziona; l'ambiente comune di
+`stela-linux` (`build/native.rs`) compila `kfifo.c`, `mempool.c`,
+`semaphore.c`, `gcd.c` e `bitmap-alloc.c`; la classe DRM del crate GPU
+(`build/native.rs`) compila `drm_buddy.c`, `drm_suballoc.c` e
+`drivers/gpu/buddy.c`, quest'ultimo come unità di registrazione catturata
+(`DRM_UNITS`, gruppo `gpubuddy`, ordinale 8: il suo `module_init` crea la
+kmem_cache dei blocchi), con l'unità di nouveau spostata all'ordinale 9. Un
+terzo flag nel profilo upstream, `-Wno-microsoft-anon-tag`, come
+`CC_FLAGS_DIALECT` del Makefile di Linux: `mm/slab.h` include `struct
+freelist_counters` come membro anonimo di `struct slab`. Nessun import nuovo
+è arrivato attraverso i file aggiunti: `OPEN` è sceso da 91 a 64 (55 propri
+di amdgpu). Dei 34 previsti ne restano 7, rimandati al passo 3 come
+adattatore e trap: `sscanf` (serve un `vsscanf` nel `vsprintf.c` di Stela),
+`drm_client_init`, `drm_client_register` e `drm_client_release` (raggiunti
+solo con KFD) e i tre `amdgpu_xcp_*` (`amdxcp` è un platform driver con
+initcall, per GPU a più partizioni).
+
+| Gruppo | Aperti dopo il passo 1 |
+|---|---|
+| PCI e PCIe | 21 |
+| Modello dei device | 11 |
+| Interrupt | 8 |
+| DRM client (solo con KFD) e amdxcp | 6 |
+| Memoria | 5 |
+| Tempo | 3 |
+| Stampa e riavvio | 2 |
+| `sscanf` | 1 |
+| Trap già noti a nouveau | 7 |
+
 Prossimo passo proposto, in ordine:
 
 1. Gruppi 2 e 3: allargare `third_party/linux.sparse` e `DRM_SOURCES`,
-   compilare i file invariati, far scendere `OPEN`.
+   compilare i file invariati, far scendere `OPEN`. Fatto il 2026-11-12.
 2. Adattatori PCI in `compat/kernel/pci.c`, con `pci_resize_resource` e
    `pci_rebar_get_max_size` che rifiutano (BAR0 resta a 256 MB finché Stela
    non sa riallocare).
-3. Stub e adattatori dei gruppi 4–8; trap per i gruppi 5 (dominio) e 6.
+3. Stub e adattatori dei gruppi 4–8; trap per i gruppi 5 (dominio) e 6, per
+   `drm_client` e `amdxcp`; `vsscanf` in `vsprintf.c`.
 4. Poi `autoconf.h` con `CONFIG_DRM_AMDGPU`, le ricette firmware (strato 2) e
    il boot (strato 3), verso la tappa 2 del piano.
 
@@ -516,7 +552,18 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
     `third_party/linux.sparse`. `cargo fmt --check` e clippy puliti sulla
     lane host (`amdgpu-port`) e sulla lane UEFI (`metal-linked,nouveau-port`).
     La lane host di `cargo xtask check` usa `--all-features`, quindi ora
-    compila anche amdgpu (meno di due minuti in più). Nulla è committato.
-- Decisione presa il 2026-11-12: censimento prima dell'upstream. Resta da
-  decidere se iniziare a fornire i servizi (ordine in «Prossimo passo
-  proposto») o sentire prima l'upstream, ora con numeri alla mano.
+    compila anche amdgpu (meno di due minuti in più). Committato in tre
+    commit;
+  - passo 1 eseguito (vedi «Censimento amdgpu: risultati»): `OPEN` a 64.
+    Modificati `third_party/linux.sparse`,
+    `crates/stela-linux/src/compat/generated/autoconf.h`,
+    `crates/stela-linux/build/native.rs`,
+    `crates/stela-driver-gpu/build/{native,nouveau,amdgpu}.rs` e
+    `crates/stela-c-build/src/linux_build.rs`. Build con `amdgpu-port`
+    riuscita, clippy pulito sulla lane host e su quella UEFI;
+    `cargo test -p stela-linux -p stela-driver-gpu --all-features`: 735
+    test superati, nessuno fallito. Committato in tre commit.
+- Decisione presa il 2026-11-12: censimento prima dell'upstream, poi il
+  passo 1. Il prossimo è il passo 2, gli adattatori PCI; sentire l'upstream
+  resta consigliato prima degli strati che costano mesi (RADV, Metal,
+  display).
