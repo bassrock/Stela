@@ -49,7 +49,11 @@ pub fn upstream_warnings(build: &mut cc::Build) {
         .flag("-Wno-unused-parameter")
         // Linux's top-level Makefile builds every file with -Wno-pointer-sign:
         // mutex.c passes its unsigned owner word to the long atomic helpers.
-        .flag("-Wno-pointer-sign");
+        .flag("-Wno-pointer-sign")
+        // Linux builds with -std=gnu11, so clang's GNU extension warnings are
+        // off (-Wno-gnu in the top-level Makefile): amdgpu's SR-IOV message
+        // header puts a variably sized union before the end of a struct.
+        .flag("-Wno-gnu");
     // The rest of scripts/Makefile.warn's default (no W=) clang profile.
     for warning in [
         "format-security",
