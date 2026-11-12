@@ -38,9 +38,9 @@ pub struct Linux {
     pub captured: Vec<Captured>,
     pub hosted: Vec<PathBuf>,
 }
-/// DRM's core and the helpers nouveau selects, as Linux's `drm-y`,
-/// `drm_kms_helper-y`, `ttm-y`, `gpu-sched-y` and `drm_display_helper-y`
-/// compose them under Stela's Kconfig.
+/// DRM's core and the helpers nouveau and amdgpu select, as Linux's `drm-y`,
+/// `drm_kms_helper-y`, `ttm-y`, `gpu-sched-y`, `drm_display_helper-y`,
+/// `drm_buddy` and `drm_suballoc_helper-y` compose them under Stela's Kconfig.
 #[cfg(feature = "nouveau-port")]
 const DRM_SOURCES: &[&str] = &[
     "drm_atomic",
@@ -83,6 +83,8 @@ const DRM_SOURCES: &[&str] = &[
     "drm_writeback",
     "drm_exec",
     "drm_gpuvm",
+    "drm_buddy",
+    "drm_suballoc",
     "drm_gem_ttm_helper",
     "drm_atomic_helper",
     "drm_atomic_state_helper",
@@ -163,6 +165,19 @@ const DRM_UNITS: &[UnitSpec] = &[
         module: "drm_display_helper",
         file: "drivers/gpu/drm/display/drm_display_helper",
     },
+    // The buddy allocator's block cache, which its `module_init` creates.
+    UnitSpec {
+        scope: stela_c_build::linux_capture::Scope {
+            slice: "gpu",
+            group: "gpubuddy",
+            group_ordinal: 8,
+            unit_ordinal: 1,
+            global_ordinal: 8,
+        },
+        source: "drivers/gpu/buddy",
+        module: "buddy",
+        file: "drivers/gpu/buddy",
+    },
 ];
 
 /// Reviewed common-first/DRM-next prefix, used again by the final class image.
@@ -201,6 +216,9 @@ impl Linux {
                 .iter()
                 .map(|source| PathBuf::from(format!("{DRM}/{source}.c"))),
         );
+        // The buddy allocator's core, which DRM's buddy helper selects.
+        #[cfg(feature = "nouveau-port")]
+        upstream.push(PathBuf::from(format!("{LINUX}/drivers/gpu/buddy.c")));
         let hosted_upstream = upstream[..4].to_vec();
         let mut build = stela_c_build::native::configure();
         environment.apply(&mut build, None, &[], None);
