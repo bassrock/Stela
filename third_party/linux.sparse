@@ -5,6 +5,8 @@
 /drivers/base/map.c
 /drivers/base/property.c
 /drivers/gpu/drm/nouveau/
+# amdgpu, for the AMD port's census of the kernel services it imports.
+/drivers/gpu/drm/amd/
 /drivers/gpu/drm/display/
 /drivers/gpu/drm/ttm/
 /drivers/gpu/drm/scheduler/
