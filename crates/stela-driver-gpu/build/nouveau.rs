@@ -194,7 +194,23 @@ pub fn port(linux: &mut Linux) {
 /// Compare the services the composites reach when linked, directly or through
 /// the environment's objects, and that nothing supplies, with [`OPEN`].
 fn check_imports(port: &Path, environment: &[&Path]) {
-    let port = members(port);
+    let mut open = open_imports(&members(port), environment);
+    let mut stale = Vec::new();
+    for symbol in OPEN.iter().flat_map(|(_, symbols)| symbols.iter()) {
+        if !open.remove(*symbol) {
+            stale.push(*symbol);
+        }
+    }
+    assert!(
+        open.is_empty() && stale.is_empty(),
+        "nouveau's imports changed: newly open {open:?}; now supplied {stale:?}"
+    );
+}
+
+/// The services `port`'s members reach when linked, directly or through the
+/// `environment` archives' objects, that nothing supplies: what no archive
+/// defines, and what the environment defines only as a trap.
+pub(super) fn open_imports(port: &[Member], environment: &[&Path]) -> BTreeSet<String> {
     let environment = environment
         .iter()
         .flat_map(|archive| members(archive))
@@ -235,25 +251,19 @@ fn check_imports(port: &Path, environment: &[&Path]) {
             }
         }
     }
-    let mut stale = Vec::new();
-    for symbol in OPEN.iter().flat_map(|(_, symbols)| symbols.iter()) {
-        if !open.remove(*symbol) {
-            stale.push(*symbol);
-        }
-    }
-    assert!(
-        open.is_empty() && stale.is_empty(),
-        "nouveau's imports changed: newly open {open:?}; now supplied {stale:?}"
-    );
+    open
 }
 
 /// What one archive member defines and imports.
-struct Member {
-    defined: BTreeSet<String>,
-    imported: BTreeSet<String>,
+pub(super) struct Member {
+    /// The member's name in its archive: its object file's.
+    #[cfg_attr(not(feature = "amdgpu-port"), allow(dead_code))]
+    pub(super) name: String,
+    pub(super) defined: BTreeSet<String>,
+    pub(super) imported: BTreeSet<String>,
 }
 
-fn members(archive: &Path) -> Vec<Member> {
+pub(super) fn members(archive: &Path) -> Vec<Member> {
     let data = fs::read(archive).unwrap_or_else(|error| panic!("{}: {error}", archive.display()));
     let archive = ArchiveFile::parse(&*data).expect("an archive");
     archive
@@ -273,7 +283,11 @@ fn members(archive: &Path) -> Vec<Member> {
                     defined.insert(name.to_owned());
                 }
             }
-            Member { defined, imported }
+            Member {
+                name: String::from_utf8_lossy(member.name()).into_owned(),
+                defined,
+                imported,
+            }
         })
         .collect()
 }
@@ -281,7 +295,7 @@ fn members(archive: &Path) -> Vec<Member> {
 /// What the environment defines without serving: functions that trap
 /// (`STELA_UNSUPPORTED`), placeholder objects (`STELA_UNSUPPORTED_OBJECT`)
 /// and functions that report themselves unsupported and fail.
-fn traps() -> BTreeSet<String> {
+pub(super) fn traps() -> BTreeSet<String> {
     let mut traps = BTreeSet::new();
     for source in stela_c_build::linux_build::sources(KERNEL)
         .into_iter()

@@ -1,3 +1,6 @@
+#[cfg(feature = "amdgpu-port")]
+#[path = "build/amdgpu.rs"]
+mod amdgpu;
 #[cfg(feature = "nouveau-port")]
 #[path = "build/kbuild.rs"]
 mod kbuild;
@@ -34,6 +37,8 @@ fn main() {
     let mut linux = linux;
     #[cfg(feature = "nouveau-port")]
     nouveau::port(&mut linux);
+    #[cfg(feature = "amdgpu-port")]
+    amdgpu::census(&linux);
     #[cfg(feature = "linux-kernel")]
     tests.write();
 }
