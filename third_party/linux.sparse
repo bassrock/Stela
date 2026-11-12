@@ -7,6 +7,9 @@
 /drivers/gpu/drm/nouveau/
 # amdgpu, for the AMD port's census of the kernel services it imports.
 /drivers/gpu/drm/amd/
+# The buddy allocator amdgpu's VRAM manager selects (CONFIG_GPU_BUDDY).
+/drivers/gpu/buddy.c
+/drivers/gpu/Makefile
 /drivers/gpu/drm/display/
 /drivers/gpu/drm/ttm/
 /drivers/gpu/drm/scheduler/
@@ -22,6 +25,7 @@
 /lib/lockref.c
 /lib/is_single_threaded.c
 /lib/rhashtable.c
+/lib/kfifo.c
 /lib/kobject.c
 /lib/plist.c
 /lib/kobject_uevent.c
@@ -52,6 +56,7 @@
 /lib/scatterlist*.c
 /lib/Makefile
 /lib/math/div64.c
+/lib/math/gcd.c
 /lib/crypto/blake2s.c
 /include/
 !/include/**/netfilter/
@@ -63,6 +68,7 @@
 /README
 /Makefile
 /kernel/locking/mutex.c
+/kernel/locking/semaphore.c
 /kernel/locking/percpu-rwsem.c
 /kernel/locking/mutex.h
 /kernel/locking/ww_mutex.h
@@ -224,6 +230,7 @@
 /mm/writeback_domain.h
 /mm/init-mm.c
 /mm/slab_common.c
+/mm/mempool.c
 /mm/slab.h
 /mm/kvfree_rcu.c
 /kernel/user.c
