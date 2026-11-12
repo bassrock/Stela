@@ -537,11 +537,10 @@ const EXCLUDED: &[(&str, &[&str])] = &[
 
 /// The kernel services the composite imports that Stela's Linux environment
 /// lacks, or defines only as a trap, by service: the census of 2026-11-12 at
-/// Linux 7.2.12. Building fails when the imports change, so each supplied
-/// service leaves this list with its change.
+/// Linux 7.2.12, less what the environment has supplied since. Building fails
+/// when the imports change, so each supplied service leaves this list with
+/// its change.
 const OPEN: &[(&str, &[&str])] = &[
-    // PCI and PCIe: MSI vectors, capabilities, Resizable BAR, reset and
-    // saved state.
     (
         "PCI and PCIe: MSI vectors, capabilities, Resizable BAR, reset and saved state",
         &[
@@ -568,22 +567,9 @@ const OPEN: &[(&str, &[&str])] = &[
             "pcie_get_width_cap",
         ],
     ),
-    // Upstream sources outside the DRM class: the buddy allocator, the
-    // sub-allocator, the DRM client and amdxcp.
     (
-        "upstream sources outside the DRM class: the buddy allocator, the sub-allocator, the DRM client and amdxcp",
+        "upstream sources outside the DRM class: the DRM client, reached only with KFD, and amdxcp",
         &[
-            "drm_buddy_print",
-            "gpu_buddy_alloc_blocks",
-            "gpu_buddy_block_trim",
-            "gpu_buddy_fini",
-            "gpu_buddy_free_list",
-            "gpu_buddy_init",
-            "gpu_buddy_reset_clear",
-            "drm_suballoc_free",
-            "drm_suballoc_manager_fini",
-            "drm_suballoc_manager_init",
-            "drm_suballoc_new",
             "drm_client_init",
             "drm_client_register",
             "drm_client_release",
@@ -592,32 +578,10 @@ const OPEN: &[(&str, &[&str])] = &[
             "amdgpu_xcp_drv_release",
         ],
     ),
-    // Library code the environment does not compile: kfifo, mempool,
-    // semaphores, gcd, bitmap allocation, sscanf.
     (
-        "library code the environment does not compile: kfifo, mempool, semaphores, gcd, bitmap allocation, sscanf",
-        &[
-            "__kfifo_alloc_node",
-            "__kfifo_free",
-            "__kfifo_in",
-            "__kfifo_out",
-            "__kfifo_out_peek",
-            "mempool_alloc_preallocated",
-            "mempool_create_node_noprof",
-            "mempool_destroy",
-            "mempool_free",
-            "mempool_kfree",
-            "mempool_kmalloc",
-            "down",
-            "up",
-            "gcd",
-            "bitmap_free",
-            "bitmap_zalloc",
-            "sscanf",
-        ],
+        "formatted input, which Stela's vsprintf.c lacks",
+        &["sscanf"],
     ),
-    // Interrupts: line control, and the interrupt domain of the VI-era and
-    // IH 6.1 handlers.
     (
         "interrupts: line control, and the interrupt domain of the VI-era and IH 6.1 handlers",
         &[
@@ -631,8 +595,6 @@ const OPEN: &[(&str, &[&str])] = &[
             "irq_set_chip_and_handler_name",
         ],
     ),
-    // Device model: sysfs attributes, device links, managed I2C adapters,
-    // hwmon, backlight and HDMI audio.
     (
         "device model: sysfs attributes, device links, managed I2C adapters, hwmon, backlight and HDMI audio",
         &[
@@ -649,7 +611,6 @@ const OPEN: &[(&str, &[&str])] = &[
             "platform_device_unregister",
         ],
     ),
-    // Time: the fast monotonic and real clocks, calendar conversion.
     (
         "time: the fast monotonic and real clocks, calendar conversion",
         &[
@@ -658,8 +619,6 @@ const OPEN: &[(&str, &[&str])] = &[
             "time64_to_tm",
         ],
     ),
-    // Memory: RAM ranges, page nodes, peer resource mapping, addressing
-    // limits.
     (
         "memory: RAM ranges, page nodes, peer resource mapping, addressing limits",
         &[
@@ -670,13 +629,10 @@ const OPEN: &[(&str, &[&str])] = &[
             "dma_addressing_limited",
         ],
     ),
-    // Rate-limited printing and emergency restart.
     (
         "rate-limited printing and emergency restart",
         &["__printk_ratelimit", "emergency_restart"],
     ),
-    // Traps nothing amdgpu runs reaches, as for nouveau: shmem-backed pages
-    // and reopening a file without a VFS path.
     (
         "traps nothing amdgpu runs reaches, as for nouveau: shmem-backed pages and reopening a file without a VFS path",
         &[
