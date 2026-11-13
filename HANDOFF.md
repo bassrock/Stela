@@ -14,7 +14,8 @@ segue è marcato come **verificato** (letto nei sorgenti) o **da verificare**
   il fork coincide con l'upstream (`f39ffb3`).
 - Aggiornato il 2026-11-12 dalla sessione locale sul PC con l'hardware:
   sezioni «Verificato sul PC», «Ambiente di build sul PC» e «Stato».
-- Aggiornato il 2026-11-13 con il passo 4 e «Prova sul PC (tappa 2)».
+- Aggiornato il 2026-11-13 con il passo 4 e «Prova sul PC (tappa 2)», poi con
+  la preparazione di disco e chiavetta per la prova.
 
 ## Obiettivo
 
@@ -659,47 +660,91 @@ sulla 9070 non è ancora stato eseguito niente.
 ## Prova sul PC (tappa 2)
 
 Scopo: vedere nel log di Stela il primo probe di amdgpu sulla 9070. Questa
-immagine non dà a macOS un device Metal, quindi macOS va avviato in
-single-user: quell'avvio passa comunque dal claim della GPU. Serve una
-chiavetta Stela già preparata, con macOS installato.
+immagine non dà a macOS un device Metal (`gpu::no_metal_device`), quindi
+l'avvio normale di macOS si ferma prima di partire, e macOS va avviato in
+single-user: quell'avvio passa comunque dal claim della GPU. macOS va
+installato su una partizione del disco interno; la chiavetta serve ad
+avviare Stela e all'installazione. Procedura concordata con l'utente il
+2026-11-13, non ancora eseguita.
 
-1. Monitor sulle uscite della scheda madre, cioè sulla iGPU. Nel BIOS la
-   prima uscita video va sulla grafica integrata, di solito «Settings → IO
-   Ports → Initial Display Output → IGD Video» sulle Gigabyte AM5, con la
-   grafica integrata attiva. Se lo schermo del firmware resta sulla 9070,
-   il claim la rifiuta.
-2. L'immagine:
+Prima di toccare le partizioni serve un backup. Il disco del PC
+(`nvme0n1`, 1,8 TB, letto il 2026-11-13) non ha spazio non partizionato:
+`p1` Ubuntu ext4 da 1000 GiB, `p2` ESP, `p3` riservata Microsoft, `p4`
+Windows NTFS da 861,6 GiB, `p5` ripristino di Windows. I «125 GB liberi» di
+«Verificato sul PC» sono spazio libero dentro `p1`.
+
+1. **Spazio da Windows.** In Gestione disco: clic destro su C:, «Riduci
+   volume», 200 GB lasciati non allocati. Setup vuole almeno 60 GB per
+   macOS (`DEFAULT_MIN_APPLE_BYTES`), più 16,8 MB in coda per lo stato della
+   macchina; l'utente può liberarne fino a 300.
+2. **Partizione senza file system**, da Ubuntu, nello spazio liberato:
+
+   ```sh
+   sudo sgdisk -n 0:0:0 -c 0:"Stela macOS" /dev/nvme0n1
+   ```
+
+   `lsblk` dice il nome che prende, quasi certamente `nvme0n1p6`. Se non
+   compare, si riavvia.
+3. **Monitor e BIOS.** Monitor sulle uscite della scheda madre, cioè sulla
+   iGPU. Nel BIOS la prima uscita video va sulla grafica integrata, di
+   solito «Settings → IO Ports → Initial Display Output → IGD Video» sulle
+   Gigabyte AM5, con la grafica integrata attiva. Se lo schermo del firmware
+   resta sulla 9070, il claim la rifiuta.
+4. **Immagine e CLI** di questo branch:
 
    ```sh
    export PATH="$HOME/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin:$PATH"
    cargo xtask boot build --release --amdgpu
+   cargo build --release -p stela-cli
    ```
 
-   Stampa il percorso di `stela-deploy.efi`.
-3. La CLI di questo branch: `cargo build --release -p stela-cli` dà
-   `target/release/stela`. Il suo bundle comprende gli 11 file di amdgpu.
-4. Si installa l'immagine sulla chiavetta, dove `USB` è la partizione EFI
-   della chiavetta montata. L'aggiornamento completa anche il bundle, quindi
-   scarica e copia i file di amdgpu:
+   Il primo comando stampa il percorso di `stela-deploy.efi`. Il `stela`
+   costruito così non contiene un'immagine, che solo `cargo xtask dist`
+   incorpora (con NVK), quindi setup la prende da `--efi`. Il suo bundle
+   comprende gli 11 file di amdgpu. Provato il 2026-11-13 su questo PC: il
+   build dell'immagine dura 5 min 50 s e `stela-deploy.efi` pesa 30 MB, che
+   stanno nella partizione EFI da 200 MiB della chiavetta.
+5. **Chiavetta**, da almeno 32 GB, che setup cancella:
 
    ```sh
-   target/release/stela setup update stela --usb USB --efi target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+   sudo target/release/stela setup --efi target/boot/x86_64-unknown-uefi/release/stela-deploy.efi --target /dev/nvme0n1p6 --erase-target
    ```
 
-   `stela setup status --usb USB` dice se il bundle è completo, e
-   `stela setup host-firmware fetch --usb USB` lo completa da solo.
-
-5. In `EFI/stela/choices.cfg` della chiavetta si duplica la riga della
-   scelta macOS (nome, tab, opzioni) e si aggiunge `--single-user` in fondo
-   alla copia. All'avvio di Stela si sceglie quella voce.
-6. Dopo l'avvio si legge il log con
-   `target/release/stela setup boot-log --usb USB`, oppure dal file
-   `EFI/stela/boot.log`. Le righe da cercare:
+   Setup chiede la chiavetta, la versione di macOS e il modello, poi scarica
+   macOS e il bundle dei firmware. Da 32 GB in su l'installer è offline:
+   macOS sta sulla chiavetta e l'installazione non usa la rete. Serve,
+   perché Stela non ha driver per il Wi-Fi RTL8922AE di questo PC
+   (`wifi/unsupported.rs`), e l'Ethernet RTL8125 è nella famiglia Realtek ma
+   è ammessa solo per certe revisioni del chip. `--erase-target` serve
+   perché la partizione nuova contiene probabilmente vecchi dati di
+   Windows, e senza `installed::check` la rifiuta; cancella solo quella
+   partizione.
+6. **Install macOS.** Si riavvia, si preme F12, si sceglie la chiavetta e
+   nel menu di Stela «Install macOS», che scrive macOS nella partizione
+   nuova. Non è un avvio di macOS per `boots_macos`, che vuole `--preboot`,
+   quindi non chiede la GPU. Se il menu non compare si tiene premuto un
+   tasto durante l'avvio, oppure si allunga l'attesa con
+   `stela setup configure --usb USB --chooser-timeout 10`.
+7. **Avvio single-user.** In `EFI/stela/choices.cfg` della chiavetta si
+   duplica la riga della scelta macOS (nome, tab, opzioni) e si aggiunge
+   `--single-user` in fondo alla copia; si può fare già dopo il setup.
+   All'avvio di Stela si sceglie quella voce.
+8. **Log.** Da Ubuntu, `sudo target/release/stela setup boot-log`, che
+   senza `--usb` legge ogni disco, oppure il file `EFI/stela/boot.log` della
+   chiavetta. Le righe da cercare:
    - `HOST FIRMWARE BUNDLE USE amdgpu/…`: gli 11 file letti;
    - `GPU 0000:03:00.0 …`: il claim, o il motivo del rifiuto;
    - `LINUX <n> amdgpu 0000:03:00.0: …`: il probe di amdgpu;
    - `GPU 0000:03:00.0: amdgpu bound it`, oppure `did not bind it`;
    - `GPU START claim_ms=… probe_ms=…`.
+
+Con una chiavetta Stela già fatta e macOS già installato bastano i passi 3,
+4, 7 e 8, con questo comando al posto del 5. `USB` è la partizione EFI della
+chiavetta montata, e l'aggiornamento completa anche il bundle:
+
+```sh
+sudo target/release/stela setup update stela --usb USB --efi target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+```
 
 ## Controlli sul PC (Linux)
 
