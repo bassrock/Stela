@@ -668,6 +668,14 @@ pub fn census(linux: &Linux) {
     // The makefiles' `-Wno-override-init` is clang's `-Wno-initializer-overrides`,
     // already in Linux's profile.
     stela_c_build::linux_build::upstream_warnings(&mut build);
+    // For the image's target clang checks printf formats by Windows' rules,
+    // where the `L` length modifier on an integer conversion is undefined;
+    // Linux, and Stela's vsprintf.c, read it as `ll`, as amdgpu_vm.c and
+    // vcn_v3_0.c use it. The host build keeps checking amdgpu's formats by
+    // Linux's rules.
+    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "uefi") {
+        build.flag("-Wno-format");
+    }
     build
         .flag("-include")
         .flag(CENSUS_HEADER)
