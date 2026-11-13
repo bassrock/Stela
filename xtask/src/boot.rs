@@ -121,6 +121,12 @@ pub enum Command {
         /// Include authored hardware fixtures in the mount.
         #[arg(long)]
         diagnostics: bool,
+        /// Carry amdgpu instead of NVK, for a Radeon RX 9070 (Navi 48):
+        /// amdgpu binds it in the Linux environment, as yet with neither
+        /// display nor Metal device, so only a `--single-user` boot of macOS
+        /// goes on past the GPU.
+        #[arg(long)]
+        amdgpu: bool,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -492,10 +498,16 @@ pub fn run(command: Command) -> Result<ExitCode> {
         Command::Build {
             release,
             diagnostics,
+            amdgpu,
         } => {
             crate::gpu::fetch::fetch(false)?;
-            crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-            println!("{}", build_for_boot(release, diagnostics, true)?.display());
+            let gpu = if amdgpu {
+                Gpu::Amdgpu
+            } else {
+                crate::gpu::build_nvk(crate::gpu::default_jobs())?;
+                Gpu::Nvk
+            };
+            println!("{}", build_for_boot(release, diagnostics, gpu)?.display());
             Ok(ExitCode::SUCCESS)
         }
         Command::Run(arguments) => launch(*arguments),
@@ -504,11 +516,22 @@ pub fn run(command: Command) -> Result<ExitCode> {
 
 pub fn build(release: bool) -> Result<PathBuf> {
     crate::gpu::build_nvk(crate::gpu::default_jobs())?;
-    build_with_diagnostics(release, false, true)
+    build_with_diagnostics(release, false, Gpu::Nvk)
 }
 
-fn build_for_boot(release: bool, diagnostics: bool, nvk: bool) -> Result<PathBuf> {
-    let built = build_with_diagnostics(release, diagnostics, nvk)?;
+/// The GPU drivers a `stela.efi` carries beyond its Linux environment.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gpu {
+    /// None: nouveau binds nothing without NVK.
+    None,
+    /// NVK, NIR and NAK over nouveau, from `cargo xtask gpu nvk`.
+    Nvk,
+    /// amdgpu, without NVK.
+    Amdgpu,
+}
+
+fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
+    let built = build_with_diagnostics(release, diagnostics, gpu)?;
     if !release {
         return Ok(built);
     }
@@ -536,15 +559,21 @@ pub(crate) fn deploy_image(built: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
-fn build_with_diagnostics(release: bool, diagnostics: bool, nvk: bool) -> Result<PathBuf> {
+fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
     let mut command = cargo();
     command.args(["build", "--locked", "--manifest-path", BOOT_MANIFEST]);
     command.args(["--target", BOOT_TARGET, "--target-dir", BOOT_TARGET_DIR]);
     if diagnostics {
         command.args(["--features", "diagnostics"]);
     }
-    if nvk {
-        command.args(["--features", "nvk"]);
+    match gpu {
+        Gpu::None => {}
+        Gpu::Nvk => {
+            command.args(["--features", "nvk"]);
+        }
+        Gpu::Amdgpu => {
+            command.args(["--features", "amdgpu"]);
+        }
     }
     if release {
         command.arg("--release");
@@ -713,7 +742,7 @@ fn launch(arguments: Run) -> Result<ExitCode> {
     let attached = storage_disks(&arguments.storage_disk, &arguments.storage_serial)?;
     let image = match &arguments.image {
         Some(image) => image.clone(),
-        None => build_for_boot(true, true, false)?,
+        None => build_for_boot(true, true, Gpu::None)?,
     };
     let paths = storage::Paths::new(arguments.output.clone());
     if paths.output.exists() {
