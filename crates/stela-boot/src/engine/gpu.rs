@@ -1566,7 +1566,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
         result: Ok(()),
     };
     // SAFETY: entered, on a task.
-    job.result = unsafe { gpu::nouveau::start() };
+    job.result = unsafe { gpu::linux::start() };
     if job.result.is_err() {
         // No source-specific device return was acknowledged.
         core::mem::forget(claimed);
