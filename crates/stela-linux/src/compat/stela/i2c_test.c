@@ -5,6 +5,7 @@
 #include <linux/i2c.h>
 #include <linux/jiffies.h>
 #include <linux/string.h>
+#include <stela/device.h>
 #include <stela/test.h>
 
 void stela_linux_i2c_test(void);
@@ -29,6 +30,12 @@ static u32 functionality(struct i2c_adapter *adapter)
 static const struct i2c_algorithm algorithm = {.xfer = transfer, .functionality = functionality};
 
 static struct i2c_adapter adapter = {.algo = &algorithm, .retries = 1, .name = "test"};
+static struct i2c_adapter managed = {.algo = &algorithm, .name = "managed"};
+
+static void parent_released(struct device *dev)
+{
+	(void)dev;
+}
 
 void stela_linux_i2c_test(void)
 {
@@ -60,4 +67,13 @@ void stela_linux_i2c_test(void)
 	assert(IS_ERR(i2c_new_client_device(&adapter, &info)));
 
 	i2c_del_adapter(&adapter);
+
+	/* A managed adapter goes away with its device's managed actions, which
+	 * wait for its release. */
+	struct device parent = {.release = parent_released};
+	device_initialize(&parent);
+	assert(!devm_i2c_add_adapter(&parent, &managed));
+	assert(!strcmp(dev_name(&managed.dev), "i2c-1"));
+	stela_linux_devres_release(&parent);
+	put_device(&parent);
 }

@@ -261,6 +261,7 @@ impl Linux {
             PathBuf::from(format!("{LINUX}/lib/timerqueue.c")),
             PathBuf::from(format!("{LINUX}/kernel/time/timer_round.c")),
             PathBuf::from(format!("{LINUX}/kernel/time/clock_ticks.c")),
+            PathBuf::from(format!("{LINUX}/kernel/time/timeconv.c")),
             PathBuf::from(format!("{LINUX}/lib/kobject.c")),
             PathBuf::from(format!("{LINUX}/lib/plist.c")),
             PathBuf::from(format!("{LINUX}/lib/kobject_uevent.c")),
@@ -592,7 +593,13 @@ impl Linux {
             ("linux_uuid", "uuid.c", "STELA_LINUX_UUID_TEST"),
             ("linux_kstrtox", "kstrtox.c", "STELA_LINUX_KSTRTOX_TEST"),
             ("linux_jiffies", "jiffies.c", "STELA_LINUX_JIFFIES_TEST"),
+            (
+                "linux_timekeeping",
+                "timekeeping.c",
+                "STELA_LINUX_TIMEKEEPING_TEST",
+            ),
             ("linux_device", "device.c", "STELA_LINUX_DEVICE_TEST"),
+            ("linux_hwmon", "hwmon.c", "STELA_LINUX_HWMON_TEST"),
             (
                 "linux_device_catalogue",
                 "catalogue.c",

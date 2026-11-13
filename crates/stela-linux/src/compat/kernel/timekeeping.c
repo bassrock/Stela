@@ -94,3 +94,74 @@ ktime_t ktime_get_with_offset(enum tk_offsets offs)
 		stela_linux_fatal("invalid Linux clock offset");
 	}
 }
+
+/* The NMI-safe CLOCK_MONOTONIC accessor. Linux code here runs in one context
+ * at a time, so the ordinary read serves it. */
+u64 notrace ktime_get_mono_fast_ns(void)
+{
+	return (u64)ktime_get();
+}
+
+/* CLOCK_REALTIME's seconds, the epoch's when the owner has no UTC source. */
+time64_t ktime_get_real_seconds(void)
+{
+	struct timespec64 ts;
+
+	ktime_get_real_ts64(&ts);
+	return ts.tv_sec;
+}
+
+#ifdef STELA_LINUX_TIMEKEEPING_TEST
+#include <stela/test.h>
+
+static s64 now = 1234567890;
+static bool utc = true;
+static unsigned int unavailable;
+
+static s64 test_now(void *context)
+{
+	(void)context;
+	return now;
+}
+
+static bool test_realtime(void *context, s64 now_ns, u32 mode, u32 tick_ns, s64 *seconds,
+			  u32 *nanoseconds)
+{
+	(void)context;
+	assert(now_ns == now && !mode && !tick_ns);
+	if (!utc)
+		return false;
+	*seconds = 1763049600;
+	*nanoseconds = 5;
+	return true;
+}
+
+static void test_unsupported(void *context, const char *operation)
+{
+	(void)context;
+	assert(!strcmp(operation, "realtime clock unavailable"));
+	unavailable++;
+}
+
+int main(void)
+{
+	const struct stela_linux_services services = {
+		.now_ns = test_now,
+		.realtime_at = test_realtime,
+		.unsupported = test_unsupported,
+	};
+	const struct stela_linux_owner owner = {.services = &services};
+	stela_linux_enter(&owner);
+	/* The fast monotonic accessor reads the owner's monotonic clock. */
+	assert(ktime_get_mono_fast_ns() == 1234567890);
+	now += 1000;
+	assert(ktime_get_mono_fast_ns() == 1234568890);
+	/* Wall seconds come from the owner's UTC source, else the epoch's. */
+	assert(ktime_get_real_seconds() == 1763049600 && !unavailable);
+	utc = false;
+	assert(ktime_get_real_seconds() == 0 && unavailable == 1);
+	stela_linux_exit();
+	printf("Linux timekeeping: the fast monotonic clock and wall seconds passed\n");
+	return 0;
+}
+#endif

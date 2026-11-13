@@ -6,6 +6,7 @@
 #include <linux/irqflags.h>
 #include <linux/limits.h>
 #include <linux/printk.h>
+#include <linux/ratelimit.h>
 #include <linux/sprintf.h>
 #include <stela/linux.h>
 
@@ -219,6 +220,15 @@ noinline void dump_stack(void)
 	dump_caller(KERN_DEFAULT, __builtin_extract_return_addr(__builtin_return_address(0)));
 }
 
+/* printk_ratelimit()'s state, following kernel/printk/printk.c: not more
+ * than 10 kernel messages every 5s. */
+DEFINE_RATELIMIT_STATE(printk_ratelimit_state, 5 * HZ, 10);
+
+int __printk_ratelimit(const char *func)
+{
+	return ___ratelimit(&printk_ratelimit_state, func);
+}
+
 #ifdef STELA_LINUX_PRINTK_TEST
 #include <linux/string.h>
 #include <stela/test.h>
@@ -287,6 +297,23 @@ static void outside_owner(void)
 	dump_stack();
 }
 
+/* printk's shared limit: ten calls every five seconds, then a report of the
+ * suppressed ones once the window moves. Like deferred_records, it leaves the
+ * message count where it found it, which test_missing pairs with reports. */
+static void shared_ratelimit(void)
+{
+	for (int i = 0; i < 10; i++)
+		assert(__printk_ratelimit("shared"));
+	assert(!__printk_ratelimit("shared") && !__printk_ratelimit("shared"));
+	unsigned int before = messages;
+	WRITE_ONCE(jiffies_64, jiffies_64 + 5 * HZ + 1);
+	assert(__printk_ratelimit("shared"));
+	stela_linux_printk_flush();
+	assert(messages == before + 1 && observed_level == LOGLEVEL_WARNING);
+	assert(strstr(observed, "shared: 2 callbacks suppressed"));
+	messages = before;
+}
+
 int main(void)
 {
 	const struct stela_linux_services services = {.log = test_log, .unsupported = test_missing};
@@ -301,6 +328,7 @@ int main(void)
 	dump_stack();
 	assert(observed_level == MESSAGE_LOGLEVEL_DEFAULT && missing == 3);
 	deferred_records();
+	shared_ratelimit();
 	stela_linux_exit();
 	assert(stela_test_traps(trapping_trace));
 	assert(stela_test_traps(outside_owner));

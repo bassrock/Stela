@@ -35,10 +35,8 @@ const struct pci_device_id *pci_match_id(const struct pci_device_id *ids, struct
 	return NULL;
 }
 
-/* Managed enabling and wake configuration, which no selected driver uses. */
+/* Managed enabling, which no selected driver uses. */
 STELA_UNSUPPORTED(int, pcim_enable_device, struct pci_dev *)
-STELA_UNSUPPORTED(int, pci_wait_for_pending_transaction, struct pci_dev *)
-STELA_UNSUPPORTED(int, pci_wake_from_d3, struct pci_dev *, bool)
 /* A function reset, which the owner does not offer and amdgpu reaches only
  * through its `pci` reset method; a message's register restore, which only
  * MI300's power table reaches; and the search by class, which only APUs and
@@ -685,6 +683,44 @@ int pci_set_power_state(struct pci_dev *dev, pci_power_t state)
     return 0;
 }
 
+/* The Transactions Pending bit, which drivers/pci/pci.c polls with growing
+ * sleeps before giving up: 1 once it clears, 0 if it never does. A failed
+ * read leaves all ones, as Linux's does. */
+int pci_wait_for_pending(struct pci_dev *dev, int pos, u16 mask)
+{
+	for (unsigned int i = 0; i < 4; i++) {
+		u16 status;
+
+		if (i)
+			msleep((1u << (i - 1)) * 100);
+		pci_read_config_word(dev, pos, &status);
+		if (!(status & mask))
+			return 1;
+	}
+	return 0;
+}
+
+int pci_wait_for_pending_transaction(struct pci_dev *dev)
+{
+	if (!pci_is_pcie(dev))
+		return 1;
+	return pci_wait_for_pending(dev, pci_pcie_cap(dev) + PCI_EXP_DEVSTA,
+				    PCI_EXP_DEVSTA_TRPND);
+}
+
+/* Wake from D3, following drivers/pci/pci.c. A function without a
+ * subordinate bus is power manageable, but nothing here marks a device able
+ * to wake, so enabling is refused as for any device that may not and
+ * disabling finds no wakeup prepared. */
+int pci_wake_from_d3(struct pci_dev *dev, bool enable)
+{
+	if (enable && !device_may_wakeup(&dev->dev))
+		return -EINVAL;
+	if (!!enable == !!dev->wakeup_prepared)
+		return 0;
+	stela_linux_fatal("PCI wakeup without a power management capability");
+}
+
 struct pci_dev *pci_dev_get(struct pci_dev *dev)
 {
 	if (dev)
@@ -1062,6 +1098,10 @@ int main(void)
 	dev.supported_speeds = pcie_get_supported_speeds(&dev);
 	assert(dev.supported_speeds == 0x1e && pcie_get_speed_cap(&dev) == PCIE_SPEED_16_0GT);
 	assert(pcie_get_width_cap(&dev) == PCIE_LNK_X16);
+	/* Transactions Pending clear: no wait. Wake from D3: nothing marked the
+	 * function able to wake. */
+	assert(pci_wait_for_pending_transaction(&dev) == 1);
+	assert(pci_wake_from_d3(&dev, true) == -EINVAL && !pci_wake_from_d3(&dev, false));
 	/* Before r3.0, the speeds the maximum of 5 GT/s implies. */
 	*(u32 *)&config[0x60 + PCI_EXP_LNKCAP2] = 0;
 	*(u32 *)&config[0x60 + PCI_EXP_LNKCAP] = 0x102u;
@@ -1088,6 +1128,7 @@ int main(void)
 	assert(pcie_get_mps(&dev) == 128 && pcie_get_width_cap(&dev) == PCIE_LNK_WIDTH_UNKNOWN);
 	dev.supported_speeds = 0;
 	assert(pcie_get_speed_cap(&dev) == PCI_SPEED_UNKNOWN);
+	assert(pci_wait_for_pending_transaction(&dev) == 1);
 
 	/* The extended space of a PCI Express function: there unless its first
 	 * dword fails or reads as all ones; a conventional one has none. */
