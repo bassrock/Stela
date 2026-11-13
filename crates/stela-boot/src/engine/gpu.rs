@@ -1,5 +1,7 @@
-//! The host's Linux environment and the NVIDIA GPUs nouveau drives in it,
-//! which back the guest's Metal device.
+//! The host's Linux environment and the GPUs its drivers bind there: the
+//! NVIDIA GPUs nouveau drives, which back the guest's Metal device, and, in
+//! an image built with `amdgpu`, an RX 9070 that amdgpu binds, as yet with
+//! neither display nor Metal device.
 //!
 //! It lives on the boot CPU and takes time from the boot PE as Linux steals it
 //! from an interrupted thread. A GPU's MSI targets that CPU, which takes it
@@ -83,6 +85,7 @@ use stela_linux::{
     task::runtime::{ManagedJob, Outcome, TaskRuntime},
     threads::{KernelThreadPlatform, TaskDataBacking},
 };
+use stela_loader::host_firmware::{recipes, requirements::Inventory};
 
 type Environment = LinuxEnvironment<SLOTS>;
 type LinuxKernel = KernelOwner<Host, SLOTS>;
@@ -111,11 +114,37 @@ const SUBSYSTEM_ID: u16 = 0x2c;
 const RESOURCE_MEMORY: u64 = 0x200;
 const RESOURCE_PREFETCHABLE: u64 = 0x2000;
 const RESOURCE_WIDE: u64 = 0x10_0000;
+/// A Linux GPU driver Stela claims functions for, and what its claim needs.
+struct Driver {
+    name: &'static str,
+    vendor: u16,
+    /// The memory BAR whose first page holds the registers.
+    registers: usize,
+    /// The widest DMA address the driver sets on the GPUs Stela claims for
+    /// it. A mapping past it is refused (`function::Mappings`), not
+    /// truncated.
+    dma_limit: u64,
+}
+
 /// Every DMA mask nouveau sets on the GPUs Stela drives holds 47 bits: the
 /// Turing-and-later MMUs' `dma_bits` (`nvkm/subdev/mmu/tu102.c` 47,
-/// `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask. A mapping
-/// past it is refused (`function::Mappings`), not truncated.
-const DMA_LIMIT: u64 = (1 << 47) - 1;
+/// `gh100.c` 52), which `nvkm_device_pci_new` sets as the mask.
+const NOUVEAU: Driver = Driver {
+    name: "nouveau",
+    vendor: 0x10de,
+    registers: 0,
+    dma_limit: (1 << 47) - 1,
+};
+
+/// amdgpu maps its registers from BAR 5 on every GPU from Bonaire on
+/// (`amdgpu_device_init`), and GMC 12 sets a 44-bit mask on GC 12.0
+/// (`gmc_v12_0_sw_init`).
+const AMDGPU: Driver = Driver {
+    name: "amdgpu",
+    vendor: 0x1002,
+    registers: 5,
+    dma_limit: (1 << 44) - 1,
+};
 /// How long the GPUs may take to boot their firmware before the guest starts.
 const START_SECONDS: u64 = 60;
 /// The longest idle wait while they do, which the timeout above is checked at.
@@ -822,7 +851,8 @@ struct GpuViews {
     config: ConfigRetention,
     pci_words: [u32; 8],
     registers: Mapping,
-    boot0: u32,
+    /// The register BAR's first word: NVIDIA's PMC_BOOT_0, AMD's MM_INDEX.
+    first: u32,
 }
 
 fn gpu_pci_words(function: &mut Function<OwnedConfig>) -> Result<[u32; 8], ConfigError> {
@@ -865,7 +895,7 @@ impl GpuViews {
             & 2
             == 0
             || gpu_pci_words(function).map_err(|_| ViewError::RegisterReadback)? != self.pci_words
-            || self.registers.read32(0) != Ok(self.boot0)
+            || self.registers.read32(0) != Ok(self.first)
         {
             return Err(ViewError::RegisterReadback);
         }
@@ -873,20 +903,21 @@ impl GpuViews {
     }
 }
 
-fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, ServiceError> {
-    use stela_loader::host_firmware::{bundle, recipes, requirements::Inventory};
-    let chip = gpu::nouveau_chip::Chip::from_boot0(boot0).ok_or(ServiceError::Refused(
-        "the GPU's PMC chipset is unsupported",
-    ))?;
-    let name = chip.name.to_ascii_lowercase();
+/// The firmware `require` names for the GPU chip `name`, from the USB's
+/// catalogue, bound under the exact names and target its driver asks for.
+fn select_firmware<E>(
+    name: &str,
+    require: impl FnOnce(&mut Inventory) -> Result<(), E>,
+    catalog: Arc<Catalog>,
+) -> Result<PciFirmware, ServiceError> {
+    use stela_loader::host_firmware::bundle;
     let mut inventory = Inventory::default();
-    recipes::require_gsp(&mut inventory, &name)
-        .map_err(|_| ServiceError::Refused("the GPU has no pinned GSP recipe"))?;
+    require(&mut inventory)
+        .map_err(|_| ServiceError::Refused("the GPU has no pinned firmware recipe"))?;
     let mut names = Vec::new();
-    let request = inventory
-        .requests()
-        .first()
-        .ok_or(ServiceError::Refused("the GPU has no pinned GSP recipe"))?;
+    let request = inventory.requests().first().ok_or(ServiceError::Refused(
+        "the GPU has no pinned firmware recipe",
+    ))?;
     let target = FirmwareTarget::new(
         request.target.driver.clone(),
         request.target.hardware.clone(),
@@ -960,7 +991,7 @@ fn select_firmware(boot0: u32, catalog: Arc<Catalog>) -> Result<PciFirmware, Ser
         ));
         return Err(ServiceError::Refused(NO_FIRMWARE));
     }
-    // Each file under the exact name and target nouveau asks for.
+    // Each file under the exact name and target its driver asks for.
     let catalog = Catalog::rebind_all(bindings.iter().map(|(image, request)| {
         let view = request.view();
         (*image, view.name, view.target)
@@ -980,6 +1011,8 @@ pub(super) struct Claimed {
     placement: Placement,
     bars: Vec<Range<u64>>,
     name: String,
+    /// The driver that binds it.
+    driver: &'static str,
     #[cfg(feature = "nvk")]
     drm: client::DrmDevice,
     #[cfg(feature = "nvk")]
@@ -989,6 +1022,7 @@ pub(super) struct Claimed {
 fn claim(
     services: &dyn NativeServices,
     adapter: &gpu::Adapter,
+    driver: &'static Driver,
     line: u32,
     gop: crate::pci_io::ScreenOwner,
     catalog: Arc<Catalog>,
@@ -999,7 +1033,8 @@ fn claim(
     let mut requester = services.prepare_requester(address)?;
     let bus_reset = requester.bus_reset_available();
     let function = requester.function_mut();
-    if (function.vendor, function.device, function.class) != (0x10de, adapter.device, adapter.class)
+    if (function.vendor, function.device, function.class)
+        != (driver.vendor, adapter.device, adapter.class)
     {
         return Err(ServiceError::Refused("the GPU's original identity changed"));
     }
@@ -1025,6 +1060,18 @@ fn claim(
                 }
                 Ok(())
             })?;
+            // amdgpu is built without its display core: it would take the
+            // firmware's screen and put nothing in its place.
+            if driver.vendor == AMDGPU.vendor {
+                output::arguments(format_args!(
+                    "GPU {address}: the firmware's screen is on this AMD GPU, which amdgpu cannot \
+                     display on yet: connect the monitor to the motherboard and make the integrated \
+                     GPU the BIOS's first display\n"
+                ));
+                return Err(ServiceError::Refused(
+                    "the firmware's screen is on an AMD GPU amdgpu cannot display on",
+                ));
+            }
             true
         }
         // A GPU below a bridge that forwards none of the screen cannot hold
@@ -1055,21 +1102,23 @@ fn claim(
         bus: address.bus,
         devfn: address.device << 3 | address.function,
         irq: line,
-        dma_limit: DMA_LIMIT,
+        dma_limit: driver.dma_limit,
         ..Placement::default()
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
     let function_bars = function.bars().map_err(ServiceError::Config)?;
-    if let Err(why) = gpu::cold::register_bar(function_bars[0], PAGE) {
+    if let Err(why) = gpu::cold::register_bar(function_bars[driver.registers], PAGE) {
         output::arguments(format_args!(
-            "GPU {address} register BAR refused: {why:?} BAR0={:?}\n",
-            function_bars[0]
+            "GPU {address} register BAR refused: {why:?} BAR{}={:?}\n",
+            driver.registers,
+            function_bars[driver.registers]
         ));
         return Err(ServiceError::Refused(
-            "the GPU's BAR 0 is not an assigned register window",
+            "the GPU's register BAR is not an assigned register window",
         ));
     }
-    for (region, bar) in placement.regions.iter_mut().zip(function_bars) {
+    let mut register_bar = None;
+    for (index, (region, bar)) in placement.regions.iter_mut().zip(function_bars).enumerate() {
         let Some(
             bar @ Bar::Memory {
                 address: start,
@@ -1088,6 +1137,9 @@ fn claim(
                 "the GPU BAR is translated by the host bridge",
             ));
         }
+        if index == driver.registers {
+            register_bar = Some(resource.clone());
+        }
         resources.push(resource);
         bars.push(start..start + size);
         *region = Region {
@@ -1102,6 +1154,9 @@ fn claim(
                 | if wide { RESOURCE_WIDE } else { 0 },
         };
     }
+    let register_bar = register_bar.ok_or(ServiceError::Refused(
+        "the GPU's register BAR does not decode",
+    ))?;
     // Each memory BAR lies in a host aperture: decode it, as Linux
     // `pci_enable_device` does before the register reads below.
     let decode = gpu::cold::enable_decode(function, timer.as_ref()).map_err(|error| {
@@ -1125,27 +1180,45 @@ fn claim(
     let registers = services
         .authority()?
         .map(
-            resources[0].clone(),
+            register_bar.clone(),
             0,
             PAGE as usize,
             CacheAttribute::Uncached,
             Protection::ReadOnly,
         )
         .map_err(ServiceError::Mapping)?;
-    let endian = registers.read32(4).map_err(ServiceError::Mapping)?;
-    if endian == u32::MAX || endian == 0x01000001 {
-        return Err(ServiceError::Refused(
-            "the GPU register byte order is unavailable",
-        ));
+    if driver.vendor == NOUVEAU.vendor {
+        let endian = registers.read32(4).map_err(ServiceError::Mapping)?;
+        if endian == u32::MAX || endian == 0x01000001 {
+            return Err(ServiceError::Refused(
+                "the GPU register byte order is unavailable",
+            ));
+        }
     }
-    let boot0 = registers.read32(0).map_err(ServiceError::Mapping)?;
-    let firmware = select_firmware(boot0, catalog)?;
-    if let Some(chip) = gpu::nouveau_chip::Chip::from_boot0(boot0) {
-        crate::host_inventory::text(alloc::format!("GPU{line}Chip"), chip.name);
-    }
+    let first = registers.read32(0).map_err(ServiceError::Mapping)?;
+    let (chip, firmware) = if driver.vendor == NOUVEAU.vendor {
+        let chip = gpu::nouveau_chip::Chip::from_boot0(first).ok_or(ServiceError::Refused(
+            "the GPU's PMC chipset is unsupported",
+        ))?;
+        let name = chip.name.to_ascii_lowercase();
+        let require = |inventory: &mut _| recipes::require_gsp(inventory, &name);
+        (chip.name, select_firmware(&name, require, catalog)?)
+    } else {
+        // An AMD GPU whose registers do not decode reads all ones. Its chip
+        // is its device ID's: amdgpu reads the rest from the GPU's IP
+        // discovery table.
+        if first == u32::MAX {
+            return Err(ServiceError::Refused("the GPU's registers do not answer"));
+        }
+        let chip = recipes::amd_chip(adapter.device)
+            .ok_or(ServiceError::Refused("amdgpu runs no such AMD GPU"))?;
+        let require = |inventory: &mut _| recipes::require_amdgpu(inventory, chip);
+        (chip, select_firmware(chip, require, catalog)?)
+    };
+    crate::host_inventory::text(alloc::format!("GPU{line}Chip"), chip);
     crate::host_inventory::text(
         alloc::format!("GPU{line}PCIID"),
-        alloc::format!("10de:{:04x}", adapter.device),
+        alloc::format!("{:04x}:{:04x}", driver.vendor, adapter.device),
     );
     let mut cold = gpu::cold::Cold::new(gpu::cold::Inputs {
         requester,
@@ -1153,7 +1226,7 @@ fn claim(
             config,
             pci_words,
             registers,
-            boot0,
+            first,
         },
         timer,
     });
@@ -1175,13 +1248,21 @@ fn claim(
         .map(|(index, region)| (index, region.size))
         .collect();
     let sizes = stela_boot_core::gpu_status::bar_sizes(&sizes);
-    let reset = ready.reset().is_some();
+    // A driver that resets the GPU itself has not yet: the BARs are firmware's.
+    let reset = matches!(
+        ready.reset(),
+        Some(gpu::cold::Reset::SecondaryBus | gpu::cold::Reset::Function(_))
+    );
     match ready.reset() {
         None => output::arguments(format_args!(
             "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
         )),
         Some(gpu::cold::Reset::SecondaryBus) => output::arguments(format_args!(
             "GPU {address}: no function-local reset; reset through its bridge's secondary bus; kept {sizes}\n"
+        )),
+        Some(gpu::cold::Reset::Driver) => output::arguments(format_args!(
+            "GPU {address}: no reset at claim; {} resets it itself; {sizes}\n",
+            driver.name
         )),
         Some(gpu::cold::Reset::Function(method)) => {
             let name = match method {
@@ -1207,10 +1288,11 @@ fn claim(
     views
         .check(&mut function)
         .map_err(|error| cold_refusal(address, gpu::cold::Error::Views(error)))?;
-    if let Some(chip) =
-        gpu::nouveau_chip::Chip::from_boot0(boot0).filter(|chip| chip.waits_for_firmware_boot())
+    if driver.vendor == NOUVEAU.vendor
+        && let Some(chip) =
+            gpu::nouveau_chip::Chip::from_boot0(first).filter(|chip| chip.waits_for_firmware_boot())
     {
-        wait_for_firmware_boot(services, &resources[0], chip)?;
+        wait_for_firmware_boot(services, &register_bar, chip)?;
     }
     // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
     unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
@@ -1263,6 +1345,7 @@ fn claim(
         placement,
         bars,
         name: format!("{address}"),
+        driver: driver.name,
         #[cfg(feature = "nvk")]
         drm,
         #[cfg(feature = "nvk")]
@@ -1450,9 +1533,10 @@ fn cold_refusal(
 /// Why a GPU was refused when the USB lacks any of its chip's firmware files.
 const NO_FIRMWARE: &str = "no pinned firmware for the observed GPU chipset was loaded";
 
-/// An NVIDIA adapter [`claim_all`] did not claim, for the boot screen
+/// An adapter [`claim_all`] did not claim, for the boot screen
 /// (`stela_boot_core::gpu_status`).
 pub(super) struct Refused {
+    pub(super) vendor: gpu::Vendor,
     pub(super) address: String,
     pub(super) device: u16,
     pub(super) reason: stela_boot_core::gpu_status::Reason,
@@ -1460,8 +1544,24 @@ pub(super) struct Refused {
     pub(super) why: String,
 }
 
-/// Claim every NVIDIA adapter, each reported if it cannot be, and the ones
-/// refused. In a foreground continuation, with probe finished.
+/// The driver in this image that runs `adapter`, if one does: nouveau every
+/// NVIDIA GPU, and amdgpu, in an image built with it, the AMD GPUs whose
+/// files it pins.
+fn driver_of(adapter: &gpu::Adapter) -> Option<&'static Driver> {
+    match adapter.vendor {
+        gpu::Vendor::Nvidia => Some(&NOUVEAU),
+        gpu::Vendor::Amd
+            if cfg!(feature = "amdgpu") && recipes::amd_chip(adapter.device).is_some() =>
+        {
+            Some(&AMDGPU)
+        }
+        _ => None,
+    }
+}
+
+/// Claim every adapter a driver in this image runs, each reported if it
+/// cannot be, and the ones refused. In a foreground continuation, with
+/// probe finished.
 pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
@@ -1470,57 +1570,59 @@ pub(super) fn claim_all(
 ) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::Reason;
     let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
+        vendor: adapter.vendor,
         address: format!("{}", adapter.address),
         device: adapter.device,
         reason,
         why: format!("{why}"),
     };
-    for adapter in adapters
-        .iter()
-        .filter(|adapter| adapter.vendor != gpu::Vendor::Nvidia)
-    {
-        output::arguments(format_args!(
-            "GPU {} vendor={:?} device={:04x} unused: {}\n",
-            adapter.address,
-            adapter.vendor,
-            adapter.device,
-            adapter.unavailable_reason()
-        ));
-    }
-    let nvidia = adapters
-        .iter()
-        .filter(|adapter| adapter.vendor == gpu::Vendor::Nvidia);
-    if !cfg!(feature = "nvk") {
-        let mut refused = Vec::new();
-        for adapter in nvidia {
-            let why = "this image has no GPU driver: build it with `cargo xtask boot build`";
-            output::arguments(format_args!(
-                "GPU {} left with firmware: {why}\n",
-                adapter.address
-            ));
-            refused.push(refused_as(adapter, Reason::Other, &why));
-        }
-        return (Vec::new(), refused);
-    }
     let mut claimed = Vec::new();
     let mut refused = Vec::new();
+    let mut driven = Vec::new();
+    for adapter in adapters {
+        match driver_of(adapter) {
+            None => output::arguments(format_args!(
+                "GPU {} vendor={:?} device={:04x} unused: {}\n",
+                adapter.address,
+                adapter.vendor,
+                adapter.device,
+                adapter.unavailable_reason()
+            )),
+            Some(driver) if driver.vendor == NOUVEAU.vendor && !cfg!(feature = "nvk") => {
+                output::arguments(format_args!(
+                    "GPU {} left with firmware: build the image with `cargo xtask boot build`\n",
+                    adapter.address
+                ));
+                refused.push(refused_as(
+                    adapter,
+                    Reason::Other,
+                    &"this image has no GPU driver: build it with `cargo xtask boot build`",
+                ));
+            }
+            Some(driver) => driven.push((adapter, driver)),
+        }
+    }
+    if driven.is_empty() {
+        return (claimed, refused);
+    }
     let source = match gop {
         Ok(source) => source,
         Err(why) => {
-            for adapter in nvidia {
+            for (adapter, _) in driven {
                 output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
                 refused.push(refused_as(adapter, Reason::Other, &why));
             }
             return (claimed, refused);
         }
     };
-    for adapter in nvidia {
+    for (adapter, driver) in driven {
         let result = catalog
             .ok_or(ServiceError::Refused("no approved GPU firmware catalogue"))
             .and_then(|catalog| {
                 claim(
                     services,
                     adapter,
+                    driver,
                     claimed.len() as u32,
                     source,
                     catalog.clone(),
@@ -1596,9 +1698,12 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
     for claimed in claimed {
         let authority = {
             let mut function = claimed.device.config.0.borrow_mut();
-            // SAFETY: the firmware keys came from the real chipset read on the
-            // exact register BAR and were rechecked after its consumed reset.
-            // Device and catalogue share the original native attachment.
+            // SAFETY: the firmware keys came from the chip this function
+            // reported: NVIDIA's chipset, read on the exact register BAR and
+            // rechecked after its consumed reset, or an AMD GPU's device ID
+            // in the same retained configuration, whose register BAR was
+            // rechecked after the private bind. Device and catalogue share
+            // the original native attachment.
             unsafe {
                 PciAuthority::new(
                     kernel,
@@ -1628,17 +1733,24 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
             Ok(attached) => {
                 // SAFETY: entered.
                 if unsafe { attached.bound() } {
+                    output::arguments(format_args!(
+                        "GPU {}: {} bound it\n",
+                        claimed.name, claimed.driver
+                    ));
+                    // Only nouveau's GPUs back the Metal device.
                     #[cfg(feature = "nvk")]
-                    job.bound.push(Bound {
-                        name: claimed.name,
-                        shows_screen: claimed.shows_screen,
-                        drm: claimed.drm,
-                        link: claimed.link,
-                    });
+                    if claimed.driver == NOUVEAU.name {
+                        job.bound.push(Bound {
+                            name: claimed.name,
+                            shows_screen: claimed.shows_screen,
+                            drm: claimed.drm,
+                            link: claimed.link,
+                        });
+                    }
                 } else {
                     output::arguments(format_args!(
-                        "GPU {}: nouveau did not bind it\n",
-                        claimed.name
+                        "GPU {}: {} did not bind it\n",
+                        claimed.name, claimed.driver
                     ));
                 }
                 job._attached.push(attached);
@@ -1768,8 +1880,9 @@ pub(super) fn serve(
     }
 }
 
-/// Bring Linux up over `claimed`, and return once nouveau has bound them or
-/// failed, as the guest should not start with a half-started GPU beneath it.
+/// Bring Linux up over `claimed`, and return once their drivers have bound
+/// them or failed, as the guest should not start with a half-started GPU
+/// beneath it.
 pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error> {
     // Keep the exact original claims on every partial startup refusal.
     let claimed = ManuallyDrop::new(claimed);
@@ -1784,8 +1897,9 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
     } = machine;
     let image = work.image()?;
     let task_data = work.task_data()?;
+    // Whether nouveau, which backs the Metal device, has GPUs to bind.
     #[cfg(feature = "nvk")]
-    let claiming = !claimed.is_empty();
+    let claiming = claimed.iter().any(|claimed| claimed.driver == NOUVEAU.name);
     let lines = claimed
         .iter()
         .map(|claimed| Line {
@@ -1910,7 +2024,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
     result
 }
 
-/// TSC ticks [`open`] took to start Linux and for nouveau's probe.
+/// TSC ticks [`open`] took to start Linux and for the drivers' probe.
 static START_TICKS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// The ticks the last [`open`] took starting Linux and probing the GPUs.

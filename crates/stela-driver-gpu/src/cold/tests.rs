@@ -187,9 +187,12 @@ unsafe impl Timer for PhysicalTimer {
     }
 }
 fn inputs() -> (Inputs<Peer, OldViews>, Rc<RefCell<State>>) {
+    inputs_for(0x1234_10de)
+}
+fn inputs_for(identity: u32) -> (Inputs<Peer, OldViews>, Rc<RefCell<State>>) {
     let state = Rc::new(RefCell::new(State::default()));
     let mut words = [0; 128];
-    words[0] = 0x1234_10de;
+    words[0] = identity;
     words[1] = 0x0010_0402;
     words[2] = 0x0300_0001;
     words[4] = 0xfe00_0000;
@@ -269,6 +272,36 @@ fn preflight_never_seals_or_resets_an_unsupported_or_foreign_source() {
         drop(failed);
         kept(&state.borrow());
     }
+}
+#[test]
+fn an_amd_gpu_binds_without_the_reset_its_driver_makes_itself() {
+    // An RX 9070 or 6800 XT, which offers no FLR, untranslated and with its
+    // bus reset offered: amdgpu resets it itself, so none happens here.
+    let (mut inputs, state) = inputs_for(0x7550_1002);
+    inputs.requester.function.config().words[0x44 / 4] = 0;
+    state.borrow_mut().bus_reset = true;
+    let candidate = check_candidate(
+        &mut inputs.requester.function,
+        &PhysicalTimer(state.clone()),
+        false,
+        true,
+    );
+    assert_eq!(candidate, Ok(Some(Reset::Driver)));
+    {
+        let ready = Cold::new(inputs)
+            .quiesce_and_bind()
+            .unwrap_or_else(|error| panic!("{:?}", error.error));
+        assert_eq!(ready.reset(), Some(Reset::Driver));
+        assert_eq!(state.borrow().events, ["views-seal", "root-drain", "bind"]);
+    }
+    kept(&state.borrow());
+    // Another vendor's display controller is refused before any effect.
+    let (inputs, state) = inputs_for(0xa780_8086);
+    let failed = failure(Cold::new(inputs).quiesce_and_bind());
+    assert_eq!(failed.error, Error::Identity);
+    drop(failed);
+    assert!(state.borrow().events.is_empty());
+    kept(&state.borrow());
 }
 #[test]
 fn failed_original_cpu_view_retirement_cannot_reset_or_bind() {

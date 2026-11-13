@@ -1,8 +1,8 @@
-//! What the boot screen says when no GPU started: which NVIDIA GPU was
-//! refused and why, in words a user can act on from another computer.
+//! What the boot screen says when no GPU started: which GPU was refused and
+//! why, in words a user can act on from another computer.
 use alloc::{format, string::String, vec::Vec};
 use stela_drivers::gpu::{Adapter, Vendor};
-use stela_loader::host_firmware::recipes::nvidia_chip;
+use stela_loader::host_firmware::recipes::{amd_chip, nvidia_chip};
 
 /// The NVIDIA generations Stela's GPU driver runs (Turing, Ampere, Ada and
 /// Blackwell: every chip `recipes::nvidia_chip` names), as people know them.
@@ -15,7 +15,11 @@ pub const SHOWN_BY_COPY: &str = "No screen is connected to the NVIDIA GPU, so St
     frame of macOS to the screen the PC started on. The picture is slower than on a screen \
     connected to the GPU.";
 
-/// Why an NVIDIA GPU did not start.
+/// The AMD GPUs an image built with `amdgpu` claims (every chip
+/// `recipes::amd_chip` names).
+pub const AMD_SUPPORTED: &str = "an AMD Radeon RX 9070 or 9070 XT";
+
+/// Why a GPU did not start.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
     /// The USB holds no firmware for its chip.
@@ -24,10 +28,29 @@ pub enum Reason {
     Other,
 }
 
-/// The screen line for the NVIDIA GPU `device` at PCI `address` that did
+/// The screen line for the `vendor` GPU `device` at PCI `address` that did
 /// not start for `reason`, `why` the refusal's own words (empty without
 /// any): a screen is often all a report brings.
-pub fn refused(address: &str, device: u16, reason: Reason, why: &str) -> String {
+pub fn refused(vendor: Vendor, address: &str, device: u16, reason: Reason, why: &str) -> String {
+    if vendor == Vendor::Amd {
+        return match (amd_chip(device), reason) {
+            (None, _) => format!(
+                "the AMD GPU at {address} (device {device:04x}) is not supported: Stela's amdgpu \
+                 runs {AMD_SUPPORTED}"
+            ),
+            (Some(chip), Reason::MissingFirmware) => format!(
+                "the USB has no firmware for this PC's AMD {chip} GPU. On another computer, run \
+                 `stela setup host-firmware fetch --usb USB` (USB: this USB's STELA volume)"
+            ),
+            (Some(chip), Reason::Other) if why.is_empty() => format!(
+                "the AMD {chip} GPU at {address} did not start; the boot log on this USB says why"
+            ),
+            (Some(chip), Reason::Other) => format!(
+                "the AMD {chip} GPU at {address} did not start: {why}. The boot log on this USB \
+                 has the rest"
+            ),
+        };
+    }
     match (nvidia_chip(device), reason) {
         (None, _) => format!(
             "the NVIDIA GPU at {address} (device {device:04x}) is not supported: Stela needs \
@@ -47,21 +70,30 @@ pub fn refused(address: &str, device: u16, reason: Reason, why: &str) -> String 
     }
 }
 
-/// The screen line for the NVIDIA GPUs among `adapters` that were claimed
-/// but did not start, `error` naming the step that ended the start.
+/// The screen line for the GPUs among `adapters` that were claimed but did
+/// not start, `error` naming the step that ended the start: the NVIDIA GPUs,
+/// and the AMD ones an image built with `amdgpu` claims.
 pub fn failed(adapters: &[Adapter], error: &str) -> String {
     let named: Vec<String> = adapters
         .iter()
-        .filter(|found| found.vendor == Vendor::Nvidia)
-        .map(|found| match nvidia_chip(found.device) {
-            Some(chip) => format!(
-                "NVIDIA {chip} GPU at {} (device {:04x})",
-                found.address, found.device
-            ),
-            None => format!(
-                "NVIDIA GPU at {} (device {:04x})",
-                found.address, found.device
-            ),
+        .filter_map(|found| match found.vendor {
+            Vendor::Nvidia => Some(match nvidia_chip(found.device) {
+                Some(chip) => format!(
+                    "NVIDIA {chip} GPU at {} (device {:04x})",
+                    found.address, found.device
+                ),
+                None => format!(
+                    "NVIDIA GPU at {} (device {:04x})",
+                    found.address, found.device
+                ),
+            }),
+            Vendor::Amd => amd_chip(found.device).map(|chip| {
+                format!(
+                    "AMD {chip} GPU at {} (device {:04x})",
+                    found.address, found.device
+                )
+            }),
+            _ => None,
         })
         .collect();
     let gpu = match named.is_empty() {
@@ -262,10 +294,16 @@ mod tests {
 
     #[test]
     fn a_refused_gpu_is_named_with_its_fix() {
-        let missing = refused("01:00.0", 0x2484, Reason::MissingFirmware, "");
+        let missing = refused(
+            Vendor::Nvidia,
+            "01:00.0",
+            0x2484,
+            Reason::MissingFirmware,
+            "",
+        );
         assert!(missing.contains("NVIDIA ga104 GPU"), "{missing}");
         assert!(missing.ends_with("run `stela repair`"), "{missing}");
-        let other = refused("03:00.0", 0x2b85, Reason::Other, "");
+        let other = refused(Vendor::Nvidia, "03:00.0", 0x2b85, Reason::Other, "");
         assert_eq!(
             other,
             "the NVIDIA gb202 GPU at 03:00.0 did not start; the boot log on this USB says why"
@@ -273,6 +311,7 @@ mod tests {
         // The refusal's words reach the screen, which is often all a report
         // brings.
         let named = refused(
+            Vendor::Nvidia,
             "01:00.0",
             0x28a0,
             Reason::Other,
@@ -288,13 +327,39 @@ mod tests {
     #[test]
     fn an_older_gpu_or_none_names_what_is_supported() {
         // A GeForce GTX 1080 (Pascal, gp104).
-        let pascal = refused("01:00.0", 0x1b80, Reason::MissingFirmware, "");
+        let pascal = refused(
+            Vendor::Nvidia,
+            "01:00.0",
+            0x1b80,
+            Reason::MissingFirmware,
+            "",
+        );
         assert_eq!(
             pascal,
             "the NVIDIA GPU at 01:00.0 (device 1b80) is not supported: Stela needs an NVIDIA \
              GeForce GTX 16 or RTX 20, 30, 40 or 50 series GPU"
         );
         assert!(none(&[]).starts_with("this PC has no NVIDIA GPU: Stela needs"));
+    }
+
+    #[test]
+    fn a_refused_amd_gpu_is_named_with_its_fix() {
+        assert_eq!(
+            refused(Vendor::Amd, "03:00.0", 0x7550, Reason::Other, ""),
+            "the AMD navi48 GPU at 03:00.0 did not start; the boot log on this USB says why"
+        );
+        let missing = refused(Vendor::Amd, "03:00.0", 0x7550, Reason::MissingFirmware, "");
+        assert!(missing.contains("AMD navi48 GPU"), "{missing}");
+        assert!(
+            missing.contains("`stela setup host-firmware fetch --usb USB`"),
+            "{missing}"
+        );
+        // A Radeon RX 7900 XTX (Navi 31).
+        assert_eq!(
+            refused(Vendor::Amd, "03:00.0", 0x744c, Reason::Other, ""),
+            "the AMD GPU at 03:00.0 (device 744c) is not supported: Stela's amdgpu runs an AMD \
+             Radeon RX 9070 or 9070 XT"
+        );
     }
 
     #[test]
@@ -321,8 +386,12 @@ mod tests {
         );
         assert_eq!(
             unused(&amd),
-            "the AMD display adapter at 0000:03:00.0 (device 744c) is not used: AMDGPU is not \
-             ported to Stela"
+            "the AMD display adapter at 0000:03:00.0 (device 744c) is not used: Stela's amdgpu \
+             runs only the Radeon RX 9070 and 9070 XT (Navi 48)"
+        );
+        assert!(
+            unused(&at(3, Vendor::Amd, 0x7550))
+                .ends_with("an image built with `amdgpu`, as yet with neither display nor Metal"),
         );
         assert!(adapter(&at(1, Vendor::Other(0x1af4), 0x1050)).contains("PCI vendor 1af4"));
     }
@@ -430,5 +499,12 @@ mod tests {
              exceeded its deadline. macOS starts without it; the boot log on this USB says why"
         );
         assert!(failed(&[], "x").starts_with("the NVIDIA GPU could not start: x."));
+        // An RX 9070 beside a Ryzen's integrated GPU.
+        let found = [at(18, Vendor::Amd, 0x164e), at(3, Vendor::Amd, 0x7550)];
+        assert!(
+            failed(&found, "x").starts_with(
+                "the AMD navi48 GPU at 0000:03:00.0 (device 7550) could not start: x."
+            )
+        );
     }
 }
