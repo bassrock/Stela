@@ -22,8 +22,9 @@ linux-kernel = ["dep:cc", "dep:stela-c-build", "stela-c-build/linux", "dep:stela
 # no device until the kernel services it imports are supplied.
 nouveau-port = ["linux-kernel", "stela-c-build/linux-registry"]
 # amdgpu's composite under Stela's Kconfig, compiled unchanged over the
-# nouveau port's DRM environment as a census of the kernel services it
-# imports that the environment lacks; it reaches no device and links nothing.
+# nouveau port's DRM environment with its census of the kernel services the
+# environment traps, and linked into the image, where its module_init
+# registers its PCI driver. It binds no device the boot does not claim.
 amdgpu-port = ["nouveau-port"]
 # Stela's Metal device over the internal Vulkan boundary; no Vulkan driver.
 metal = ["dep:stela-contracts"]

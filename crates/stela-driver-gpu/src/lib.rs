@@ -12,7 +12,7 @@ use crate::bus::pci::{Address, ConfigSpace, Function};
 pub mod metal;
 
 #[cfg(feature = "nouveau-port")]
-pub mod nouveau;
+pub mod linux;
 
 pub mod cold;
 pub mod nouveau_chip;

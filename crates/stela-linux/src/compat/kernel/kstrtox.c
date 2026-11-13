@@ -3,9 +3,30 @@
  * optional '+' or, for a signed result, '-', base 0 choosing 16 for "0x", 8 for "0" and else 10, an
  * optional "0x" for base 16, at least one digit, and at most one trailing
  * newline. -EINVAL for anything else, -ERANGE for a value that overflows. */
+#include <linux/ctype.h>
 #include <linux/errno.h>
 #include <linux/kstrtox.h>
 #include <linux/limits.h>
+/* lib/kstrtox.h, beside the include directory. */
+#include <../lib/kstrtox.h>
+
+/* The radix base 0 picks, following lib/kstrtox.c: 16 for "0x" before a hex
+ * digit, 8 for another leading "0", else 10; base 16 skips a "0x". */
+const char *_parse_integer_fixup_radix(const char *s, unsigned int *base)
+{
+	if (*base == 0) {
+		if (s[0] == '0') {
+			if (_tolower(s[1]) == 'x' && isxdigit(s[2]))
+				*base = 16;
+			else
+				*base = 8;
+		} else
+			*base = 10;
+	}
+	if (*base == 16 && s[0] == '0' && _tolower(s[1]) == 'x')
+		s += 2;
+	return s;
+}
 
 static unsigned int digit(char c)
 {
@@ -152,6 +173,7 @@ int kstrtobool(const char *value, bool *result)
 }
 
 #ifdef STELA_LINUX_KSTRTOX_TEST
+#include <linux/string.h>
 #include <stela/test.h>
 
 int main(void)
@@ -187,6 +209,16 @@ int main(void)
 	assert(kstrtobool("o", &boolean) == -EINVAL && boolean);
 	assert(kstrtobool("", &boolean) == -EINVAL && boolean);
 	assert(kstrtobool(NULL, &boolean) == -EINVAL && boolean);
+	unsigned int base = 0;
+	assert(!strcmp(_parse_integer_fixup_radix("0x1f", &base), "1f") && base == 16);
+	base = 0;
+	assert(!strcmp(_parse_integer_fixup_radix("017", &base), "017") && base == 8);
+	base = 0;
+	assert(!strcmp(_parse_integer_fixup_radix("0xg", &base), "0xg") && base == 8);
+	base = 0;
+	assert(!strcmp(_parse_integer_fixup_radix("9", &base), "9") && base == 10);
+	base = 16;
+	assert(!strcmp(_parse_integer_fixup_radix("0XFF", &base), "FF") && base == 16);
 	printf("Linux integer parsing: signs, bases, bounds and trailing newline passed\n");
 	return 0;
 }

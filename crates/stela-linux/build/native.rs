@@ -585,6 +585,7 @@ impl Linux {
             ("linux_printf", "printf.c", "STELA_LINUX_PRINTF_TEST"),
             ("linux_uuid", "uuid.c", "STELA_LINUX_UUID_TEST"),
             ("linux_kstrtox", "kstrtox.c", "STELA_LINUX_KSTRTOX_TEST"),
+            ("linux_vsscanf", "vsscanf.c", "STELA_LINUX_VSSCANF_TEST"),
             ("linux_jiffies", "jiffies.c", "STELA_LINUX_JIFFIES_TEST"),
             (
                 "linux_timekeeping",

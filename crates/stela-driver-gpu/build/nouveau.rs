@@ -1,6 +1,7 @@
 //! nouveau: the `nouveau-y` composite of its own Kbuild, compiled unchanged in
 //! Stela's Linux environment, and the kernel services it imports that the
 //! environment does not yet supply.
+use super::image::{self, Port};
 use super::kbuild::{Config, Kbuild};
 use super::native::{self, Linux};
 use object::{Object, ObjectSymbol, read::archive::ArchiveFile};
@@ -11,7 +12,7 @@ use std::{
     thread,
 };
 use stela_c_build::linux::Module;
-use stela_c_build::linux_capture::{self as initcalls, Projection, Unit, UnitSpec};
+use stela_c_build::linux_capture::{Unit, UnitSpec};
 
 const NOUVEAU: &str = "../../third_party/linux/drivers/gpu/drm/nouveau";
 const AUTOCONF: &str = "../stela-linux/src/compat/generated/autoconf.h";
@@ -77,7 +78,9 @@ fn initcalls_unit() -> Unit {
     INITCALLS.into()
 }
 
-pub fn port(linux: &mut Linux) {
+/// Compile nouveau's composite and its registration unit into its archive,
+/// checked against [`OPEN`], for the image to link.
+pub fn port(linux: &Linux) -> Port {
     let config = Config::parse(&fs::read_to_string(AUTOCONF).expect("read Stela's Kconfig header"))
         .unwrap_or_else(|error| panic!("{AUTOCONF}: {error}"));
     let kbuild =
@@ -137,57 +140,17 @@ pub fn port(linux: &mut Linux) {
             .flat_map(|compiling| compiling.join().expect("a compiling thread"))
             .collect::<Vec<_>>()
     });
-    let mut captured = linux.take_captured();
-    let environment_count = captured.len();
-    let compiler = initcalls::compiler(&build);
-    let placement = initcalls::Placement::new(
-        &initcalls_unit().path(),
-        &stela_c_build::linux_build::out_dir(),
-        &[
-            Path::new("../.."),
-            compiler.parent().expect("compiler root"),
-        ],
-    )
-    .expect("Nouveau source placement");
-    captured.push(initcalls::compile(
-        &build,
-        Path::new("../stela-linux/src/compat/stela/registration.h"),
-        INITCALLS,
-        &placement,
-    ));
-    let mut expected = native::environment_units();
-    expected.push(INITCALLS);
-    let image = initcalls::source(
-        &captured,
-        Projection {
-            symbol: "stela_linux_nouveau_image",
-            expected: &expected,
-            imported_units: environment_count,
-            descriptors_only: false,
-        },
-    );
+    let unit = image::capture(&build, INITCALLS);
     build
         .objects(objects)
-        .objects(
-            captured
-                .iter()
-                .skip(environment_count)
-                .map(|unit| unit.object()),
-        )
-        .file(image)
+        .object(unit.object())
         .compile("stela-nouveau-nvkm");
     let archive = stela_c_build::linux_build::out_dir().join("libstela-nouveau-nvkm.a");
     check_imports(&archive, &[&linux.archive, &linux.common_archive]);
-    let output = stela_c_build::linux_build::out_dir();
-    let digest = initcalls::write(
-        &output.join("captured-units.bin"),
-        &captured[initcalls::COMMON.len()..],
-    );
-    println!("cargo:output={}", output.display());
-    println!("cargo:cohort_sha256={digest}");
-    // Hosted programs test the environment and link no driver.
-    if env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "uefi") {
-        println!("cargo:rustc-link-lib=static=stela-nouveau-nvkm");
+    Port {
+        archive: "stela-nouveau-nvkm",
+        spec: INITCALLS,
+        unit,
     }
 }
 

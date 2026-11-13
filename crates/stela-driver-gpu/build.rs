@@ -2,6 +2,9 @@
 #[path = "build/amdgpu.rs"]
 mod amdgpu;
 #[cfg(feature = "nouveau-port")]
+#[path = "build/image.rs"]
+mod image;
+#[cfg(feature = "nouveau-port")]
 #[path = "build/kbuild.rs"]
 mod kbuild;
 #[cfg(feature = "linux-kernel")]
@@ -34,11 +37,14 @@ fn main() {
     #[cfg(feature = "linux-kernel")]
     linux.tests(&mut tests);
     #[cfg(feature = "nouveau-port")]
-    let mut linux = linux;
-    #[cfg(feature = "nouveau-port")]
-    nouveau::port(&mut linux);
-    #[cfg(feature = "amdgpu-port")]
-    amdgpu::census(&linux);
+    {
+        let mut linux = linux;
+        #[cfg_attr(not(feature = "amdgpu-port"), allow(unused_mut))]
+        let mut ports = vec![nouveau::port(&linux)];
+        #[cfg(feature = "amdgpu-port")]
+        ports.push(amdgpu::port(&linux));
+        image::link(&mut linux, ports);
+    }
     #[cfg(feature = "linux-kernel")]
     tests.write();
 }

@@ -17,8 +17,8 @@ extern FILE *const stderr;
 #define SEEK_END 2
 int printf(const char *format, ...) __attribute__((format(printf, 1, 2)));
 int fprintf(FILE *file, const char *format, ...) __attribute__((format(printf, 2, 3)));
-/* Linux's environment shares the image and has these four names for its own
- * format language. */
+/* Linux's environment shares the image and has these names, labeled here, for
+ * its own format language. */
 int sprintf(char *buffer, const char *format, ...) __asm__("stela_libc_sprintf")
 	__attribute__((format(printf, 2, 3)));
 int snprintf(char *buffer, size_t size, const char *format, ...) __asm__("stela_libc_snprintf")
@@ -30,7 +30,7 @@ int vsprintf(char *buffer, const char *format, va_list arguments) __asm__("stela
 int vsnprintf(char *buffer, size_t size, const char *format, va_list arguments)
 	__asm__("stela_libc_vsnprintf");
 int vasprintf(char **buffer, const char *format, va_list arguments);
-int sscanf(const char *input, const char *format, ...);
+int sscanf(const char *input, const char *format, ...) __asm__("stela_libc_sscanf");
 int puts(const char *text);
 int putchar(int c);
 int fputs(const char *text, FILE *file);

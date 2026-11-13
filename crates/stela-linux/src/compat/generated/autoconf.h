@@ -69,9 +69,10 @@
 #define CONFIG_DRM_DISPLAY_HDMI_HELPER 1
 #define CONFIG_DMA_SHARED_BUFFER 1
 #define CONFIG_SYNC_FILE 1
-/* What amdgpu's Kconfig entry selects beyond nouveau's: the buddy allocator
- * of its VRAM manager and the sub-allocator of its IB pools. nouveau links
- * neither. */
+/* amdgpu, and what its Kconfig entry selects beyond nouveau's: the buddy
+ * allocator of its VRAM manager and the sub-allocator of its IB pools. nouveau
+ * links neither. */
+#define CONFIG_DRM_AMDGPU 1
 #define CONFIG_DRM_BUDDY 1
 #define CONFIG_GPU_BUDDY 1
 #define CONFIG_DRM_SUBALLOC_HELPER 1
