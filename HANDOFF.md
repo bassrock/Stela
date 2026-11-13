@@ -238,7 +238,8 @@ Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
    - Fornire i servizi kernel mancanti in `crates/stela-linux/src/compat/kernel`
      e `crates/stela-driver-gpu/src/compat/linux/kernel`. Misurati il
      2026-11-12: 82 propri di amdgpu, 55 dopo il passo 1, 39 dopo il passo
-     2, vedi «Censimento amdgpu: risultati».
+     2; dopo il passo 3 ogni servizio che la 9070 raggiunge è fornito e gli
+     altri sono trap, tranne `sscanf`, vedi «Censimento amdgpu: risultati».
 2. **Firmware**: ricette linux-firmware per i blob amdgpu, sul modello GSP in
    `recipes.rs`, e selezione per IP invece che per chipset.
 3. **Boot**: generalizzare `claim`, `claim_all` e `cold.rs` oltre NVIDIA.
@@ -493,6 +494,81 @@ fuori dallo sparse):
 | `sscanf` | 1 |
 | Trap già noti a nouveau | 7 |
 
+Passo 3, fatto il 2026-11-13: per ognuno dei 48 servizi il codice di amdgpu
+è stato seguito fino a stabilire se un percorso sulla 9070 lo raggiunge. I
+raggiunti sono forniti, gli altri sono trap che scrivono perché nessun
+percorso sulla 9070 ci arriva. `OPEN` da 48 a 30: 29 trap e `sscanf`.
+
+- Forniti nell'ambiente di `stela-linux` (`compat/kernel/`), ognuno sul testo
+  di Linux al pin:
+  - `pci.c`: `pci_wait_for_pending_transaction` (raggiunto alla rimozione e
+    all'halt) e `pci_wake_from_d3` (raggiunto al probe: il runtime PM via
+    BACO è attivo per la 9070), che sostituiscono due trap. Il wake è
+    rifiutato con `-EINVAL` come per ogni device che non può svegliarsi:
+    Stela non ne marca nessuno così.
+  - `dma.c`: `dma_get_required_mask`, `dma_addressing_limited` (raggiunto
+    in `amdgpu_ttm_init`: falso con i 44 bit di amdgpu, perché senza una
+    maschera richiesta dalle ops vale la predefinita di Linux a 32 bit),
+    `dma_map_resource` e `dma_unmap_resource` (MMIO via `dma_map_phys`).
+  - `timekeeping.c`: `ktime_get_mono_fast_ns` (il monotono del
+    proprietario) e `ktime_get_real_seconds` (la UTC del proprietario, o
+    l'epoca); `time64_to_tm` è `kernel/time/timeconv.c` compilato invariato,
+    aggiunto allo sparse. Test nuovo `linux_timekeeping`.
+  - `printk.c`: `__printk_ratelimit` con lo stato condiviso di Linux (10
+    messaggi ogni 5 s), raggiunto sui page fault della GPU.
+  - `device.c`: `device_create_file`, `device_remove_file` e
+    `devm_device_add_group` secondo `drivers/base/core.c`; senza
+    `CONFIG_SYSFS` le funzioni sysfs sono gli stub inline di Linux, quindi
+    l'attributo viene solo controllato e la rimozione del gruppo gestito
+    registrata tra le azioni del driver.
+  - `i2c.c`: `devm_i2c_add_adapter` (gli adattatori I2C dell'SMU 14).
+  - `hwmon.c`, file nuovo GPL-2.0-only come `drivers/hwmon/hwmon.c`:
+    `hwmon_device_register_with_groups` e `hwmon_device_unregister`; il
+    device è registrato sotto il genitore con gruppi, dati e id da un IDA.
+    Test nuovo `linux_hwmon`.
+  - `irq.c`: `disable_irq` ed `enable_irq` come `kernel/irq/manage.c`, con
+    una profondità per linea: il primo disable maschera la linea e attende
+    i suoi gestori threaded, l'ultimo enable la smaschera; una consegna che
+    trova la linea disabilitata non esegue gestori ed è ritrasmessa da
+    `irq_work` all'enable, come la ritrasmissione software di Linux. Il
+    proprietario dichiara che una consegna già in coda può arrivare dopo la
+    maschera, quindi il controllo sta anche in `stela_linux_irq_run`.
+    `IRQF_NO_AUTOEN` ora parte disabilitata fino a `enable_irq`. Diverso da
+    Linux: `enable_irq` dorme sul mutex della linea, quindi vuole il
+    contesto di processo, e lo verifica. Test nella fixture delle
+    workqueue, che ha task e linee reali.
+- Fornito nel crate GPU (`src/compat/linux/kernel/amdgpu.c`, nuovo):
+  `amdgpu_xcp_drv_release`, che amdgpu chiama all'uscita e che in amdxcp
+  libera i device di partizione allocati, qui nessuno.
+- Trap nuovi, ciascuno con il motivo: `page_is_ram` e `pfn_to_nid` (solo il
+  GMC 9 delle APU), `emergency_restart` (solo Vega20 con firmware vecchio
+  dopo un errore RAS fatale), `backlight_device_register` e `_unregister`
+  (solo gli encoder DCE legacy; i DCN passano da DC), `device_link_del`
+  (solo il link USB-C delle APU), il dominio IRQ (`irq_domain_create_linear`,
+  `irq_domain_remove`, `irq_create_mapping`, `generic_handle_domain_irq`,
+  `handle_simple_irq`, `irq_set_chip_and_handler_name`: solo gli IH di
+  generazione VI e 6.1 lo creano), il DRM client (solo KFD) e
+  `amdgpu_xcp_drm_dev_alloc` e `_free` (solo GPU partizionate: GC 9.4.3 e
+  12.1).
+- `sscanf` resta aperto di proposito. amdgpu lo usa solo in store sysfs e
+  nel parametro `disable_cu`, vuoto di default, ma la libc di compatibilità
+  di Mesa (`stela-driver-gpu/src/compat/libc/stdio.h`) definisce già
+  `sscanf` nella stessa immagine: un `sscanf` dell'ambiente Linux, anche
+  come trap, si scontrerebbe. Quando amdgpu verrà linkato servono la
+  ridenominazione di quello di Mesa in `stela_libc_sscanf`, come già per i
+  quattro nomi printf, e un `vsscanf` nel `vsprintf.c` di Stela.
+
+| Gruppo | Aperti dopo il passo 3 |
+|---|---|
+| Trap PCI | 3 |
+| Trap DRM client e partizioni amdxcp | 5 |
+| Trap dominio IRQ | 6 |
+| Trap del modello dei device | 5 |
+| Trap memoria | 2 |
+| Trap riavvio d'emergenza | 1 |
+| Trap già noti a nouveau | 7 |
+| `sscanf`, aperto di proposito | 1 |
+
 Prossimo passo proposto, in ordine:
 
 1. Gruppi 2 e 3: allargare `third_party/linux.sparse` e `DRM_SOURCES`,
@@ -501,9 +577,13 @@ Prossimo passo proposto, in ordine:
    rifiuta (BAR0 resta a 256 MB finché Stela non sa riallocare). Fatto il
    2026-11-13.
 3. Stub e adattatori dei gruppi 4–8; trap per i gruppi 5 (dominio) e 6, per
-   `drm_client` e `amdxcp`; `vsscanf` in `vsprintf.c`.
-4. Poi `autoconf.h` con `CONFIG_DRM_AMDGPU`, le ricette firmware (strato 2) e
-   il boot (strato 3), verso la tappa 2 del piano.
+   `drm_client` e `amdxcp`. Fatto il 2026-11-13, tranne `vsscanf` (vedi
+   sopra).
+4. Il port vero: `autoconf.h` con `CONFIG_DRM_AMDGPU`, amdgpu linkato in
+   `stela.efi` (con la ridenominazione di `sscanf`), le ricette firmware
+   (strato 2) e il boot (strato 3, `claim` e il reset senza FLR: MODE1 via
+   SMU), verso la tappa 2 del piano. Da qui serve il PC: il primo probe
+   della 9070 si vede solo avviando Stela.
 
 ## Controlli sul PC (Linux)
 
@@ -621,7 +701,9 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
     Modificati `crates/stela-linux/src/compat/kernel/{pci,pci_host}.c`,
     `crates/stela-linux/src/compat/stela/pci.h` e
     `crates/stela-driver-gpu/build/amdgpu.rs`. Build con `amdgpu-port` riuscita sull'host e per il target UEFI (`x86_64-unknown-uefi`), dove il censimento trova gli stessi 48 servizi; clippy pulito sulla lane host e su quella UEFI; `cargo test -p stela-linux -p stela-driver-gpu --all-features`: 735 test superati, nessuno fallito, `linux_pci` e `linux_pci_host` compresi. Committato in tre commit.
+  - passo 3 eseguito (vedi «Censimento amdgpu: risultati»): `OPEN` a 30, 29
+    trap e `sscanf`. Build con `amdgpu-port` riuscita sull'host e per il target UEFI, dove il censimento trova gli stessi 30 servizi; `cargo test -p stela-linux -p stela-driver-gpu --all-features`: 737 test superati, nessuno fallito, compresi i nuovi `linux_hwmon` e `linux_timekeeping` e la fixture delle workqueue con `disable_irq` ed `enable_irq`; clippy pulito sulla lane host e su quella UEFI. Committato in tre commit di codice e uno di documentazione.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
-  passi 1 e 2. Il prossimo è il passo 3, stub, adattatori e trap dei gruppi
-  rimasti; sentire l'upstream resta consigliato prima degli strati che
-  costano mesi (RADV, Metal, display).
+  passi 1, 2 e 3. Il prossimo è il passo 4, il port vero; sentire
+  l'upstream resta consigliato prima degli strati che costano mesi (RADV,
+  Metal, display).
