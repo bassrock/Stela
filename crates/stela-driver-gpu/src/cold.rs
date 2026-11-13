@@ -1,4 +1,6 @@
-//! Function-local GPU reset while the original configuration and DMA root stay owned.
+//! A GPU's handoff from the firmware to its driver: the reset its vendor needs
+//! here, while the original configuration and DMA root stay owned, then its
+//! private DMA domain.
 use alloc::{boxed::Box, rc::Rc};
 use core::mem::ManuallyDrop;
 use stela_driver_base::{
@@ -14,9 +16,37 @@ use stela_driver_base::{
 };
 
 const NVIDIA: u16 = 0x10de;
+const AMD: u16 = 0x1002;
 const DISPLAY: u8 = 3;
 const EXPRESS: u8 = 0x10;
 const FLR: u32 = 1 << 28;
+
+/// The reset a vendor's GPU gets here before its driver binds it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Reset {
+    /// A function-level reset, after which nouveau takes an NVIDIA GPU.
+    Function,
+    /// None. An AMD GPU offers no FLR: the RX 9070 offers only its bus's
+    /// secondary reset, which would take its HDMI audio function along.
+    /// amdgpu resets the GPU itself on init, MODE1 through the SMU, when
+    /// the PSP's secure OS still runs from an earlier driver
+    /// (`soc24_need_reset_on_init`), and otherwise takes it as the firmware
+    /// left it, as Linux does at every boot. The gated function issues no
+    /// request until amdgpu sets its master bit, and from then on the
+    /// private domain bounds what anything the firmware left running in
+    /// the GPU can reach.
+    Driver,
+}
+
+impl Reset {
+    fn of(vendor: u16) -> Option<Self> {
+        match vendor {
+            NVIDIA => Some(Self::Function),
+            AMD => Some(Self::Driver),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ViewError {
@@ -77,9 +107,11 @@ pub unsafe trait Preparation: 'static {
     type Failure;
     fn function_mut(&mut self) -> &mut Function<Self::Config>;
     /// # Safety
-    /// A supported function-local FLR and readiness/containment revalidation
-    /// completed with CPU views sealed and all old owners still kept. Nothing
-    /// can rearm the function before the original root drain and private bind.
+    /// The reset its vendor gets here ([`Reset`]: a function-local FLR, or
+    /// none for a driver that resets the GPU itself) and readiness/containment
+    /// revalidation completed with CPU views sealed and all old owners still
+    /// kept. Nothing can rearm the function before the original root drain
+    /// and private bind.
     unsafe fn finalize(self) -> Result<Self::Bound, (preparation::Error, Self::Failure)>;
 }
 
@@ -93,7 +125,8 @@ unsafe impl Preparation for PreparingRequester {
         self.function_mut()
     }
     unsafe fn finalize(self) -> Result<Self::Bound, (preparation::Error, Self::Failure)> {
-        // SAFETY: Cold established FLR stop and sealed the original CPU views.
+        // SAFETY: Cold revalidated the stopped function after its vendor's
+        // reset (an FLR, or none for amdgpu) and sealed the original CPU views.
         unsafe { self.acknowledge_quiescence() }
             .finalize()
             .map_err(|failure| (failure.error, failure))
@@ -144,11 +177,14 @@ impl<B, V> Ready<B, V> {
     }
 }
 
-fn preflight<C: ConfigSpace>(function: &mut Function<C>, timer: &dyn Timer) -> Result<(), Error> {
+fn preflight<C: ConfigSpace>(
+    function: &mut Function<C>,
+    timer: &dyn Timer,
+) -> Result<Reset, Error> {
     timer.check().map_err(Error::Clock)?;
-    if function.vendor != NVIDIA || function.class[0] != DISPLAY {
-        return Err(Error::Identity);
-    }
+    let reset = Reset::of(function.vendor)
+        .filter(|_| function.class[0] == DISPLAY)
+        .ok_or(Error::Identity)?;
     requester::validate_stopped(function).map_err(Error::Claim)?;
     let mut express = None;
     for entry in capability::capabilities(function.config()) {
@@ -156,6 +192,9 @@ fn preflight<C: ConfigSpace>(function: &mut Function<C>, timer: &dyn Timer) -> R
         if entry.id == EXPRESS && express.replace(entry.offset).is_some() {
             return Err(Error::Identity);
         }
+    }
+    if reset == Reset::Driver {
+        return Ok(reset);
     }
     let express = express.ok_or(Error::FlrUnavailable)?;
     let offset = express + 4;
@@ -171,7 +210,7 @@ fn preflight<C: ConfigSpace>(function: &mut Function<C>, timer: &dyn Timer) -> R
     if flags & FLR == 0 {
         return Err(Error::FlrUnavailable);
     }
-    Ok(())
+    Ok(reset)
 }
 
 /// Read-only early qualification before native BAR probing/mapping. Success
@@ -180,7 +219,7 @@ fn preflight<C: ConfigSpace>(function: &mut Function<C>, timer: &dyn Timer) -> R
 pub fn check_candidate<C: ConfigSpace>(
     function: &mut Function<C>,
     timer: &dyn Timer,
-) -> Result<(), Error> {
+) -> Result<Reset, Error> {
     preflight(function, timer)
 }
 impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
@@ -198,15 +237,16 @@ impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
         let attempt = &mut **self.kept;
         let requester = attempt.requester.as_mut().expect("original cold requester");
         let result = (|| {
-            preflight(requester.function_mut(), attempt.timer.as_ref())?;
+            let reset = preflight(requester.function_mut(), attempt.timer.as_ref())?;
             attempt
                 .views
                 .seal(requester.function_mut())
                 .map_err(Error::Views)?;
             let function = requester.function_mut();
-            if !function
-                .function_level_reset(attempt.timer.as_ref())
-                .map_err(Error::Reset)?
+            if reset == Reset::Function
+                && !function
+                    .function_level_reset(attempt.timer.as_ref())
+                    .map_err(Error::Reset)?
             {
                 return Err(Error::FlrUnavailable);
             }
@@ -221,7 +261,8 @@ impl<P: Preparation, V: Views<P::Config>> Cold<P, V> {
         }
 
         let requester = attempt.requester.take().expect("original cold requester");
-        // SAFETY: this exact function completed FLR and stopped revalidation.
+        // SAFETY: this exact function completed its vendor's reset and
+        // stopped revalidation.
         // The original CPU views remain parked through the root drain and bind.
         match unsafe { requester.finalize() } {
             Ok(bound) => {

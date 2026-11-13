@@ -1367,12 +1367,14 @@ fn open_gpus(
                 None => crate::status::warn(&gpu_status::none(&found)),
                 Some((first, rest)) => {
                     crate::status::warn(&gpu_status::refused(
+                        first.vendor,
                         &first.address,
                         first.device,
                         first.reason,
                     ));
                     for gpu in rest {
                         crate::status::info(&gpu_status::refused(
+                            gpu.vendor,
                             &gpu.address,
                             gpu.device,
                             gpu.reason,
@@ -1380,11 +1382,14 @@ fn open_gpus(
                     }
                 }
             }
-            // The display adapters Stela's GPU driver does not run, and why.
-            for adapter in found
-                .iter()
-                .filter(|adapter| adapter.vendor != stela_drivers::gpu::Vendor::Nvidia)
-            {
+            // The display adapters no driver here runs, and why: the
+            // refused ones were named above.
+            for adapter in found.iter().filter(|adapter| {
+                adapter.vendor != stela_drivers::gpu::Vendor::Nvidia
+                    && !refused
+                        .iter()
+                        .any(|gpu| gpu.address == format!("{}", adapter.address))
+            }) {
                 crate::status::info(&gpu_status::unused(adapter));
             }
             return false;
@@ -1412,8 +1417,8 @@ fn open_gpus(
     let opening = host::rdtsc();
     let opened = gpu::open(machine, claimed);
     // `GPU START claim_ms=… linux_ms=… probe_ms=… total_ms=…`: claiming the
-    // functions, starting Linux, and nouveau's probe, which boots the GSP
-    // and binds DRM.
+    // functions, starting Linux, and the drivers' probe: nouveau's boots the
+    // GSP and binds DRM.
     let ms = |ticks: u64| ticks / (tsc_hz / 1000).max(1);
     let (linux, probe) = gpu::start_times();
     output::arguments(format_args!(
