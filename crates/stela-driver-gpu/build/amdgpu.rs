@@ -537,9 +537,10 @@ const EXCLUDED: &[(&str, &[&str])] = &[
 
 /// The kernel services the composite imports that Stela's Linux environment
 /// lacks, or defines only as a trap, by service: the census of 2026-11-12 at
-/// Linux 7.2.12, less what the environment has supplied since. Building fails
-/// when the imports change, so each supplied service leaves this list with
-/// its change.
+/// Linux 7.2.12, less what the environment has supplied since. All but sscanf
+/// are traps whose definitions say why nothing on a Navi 48 board reaches
+/// them. Building fails when the imports change, so each supplied service
+/// leaves this list with its change.
 const OPEN: &[(&str, &[&str])] = &[
     (
         "PCI traps: a function reset Navi 48 never chooses, a message restore only MI300 makes and a search by class only APUs make",
@@ -550,14 +551,13 @@ const OPEN: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "upstream sources outside the DRM class: the DRM client, reached only with KFD, and amdxcp",
+        "traps: the DRM client, which only KFD sets up, and amdxcp's partition devices, which only partitioned GPUs allocate",
         &[
             "drm_client_init",
             "drm_client_register",
             "drm_client_release",
             "amdgpu_xcp_drm_dev_alloc",
             "amdgpu_xcp_drm_dev_free",
-            "amdgpu_xcp_drv_release",
         ],
     ),
     (
@@ -565,7 +565,7 @@ const OPEN: &[(&str, &[&str])] = &[
         &["sscanf"],
     ),
     (
-        "interrupts: the domain only amdgpu's VI-era and IH 6.1 handlers create, and only ACP and ISP map into",
+        "interrupt domain traps: only amdgpu's VI-era and IH 6.1 handlers create one, and only ACP and ISP map into it",
         &[
             "generic_handle_domain_irq",
             "handle_simple_irq",
@@ -576,7 +576,7 @@ const OPEN: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "device model: links, which only HDMI audio adds and only APUs' USB-C power link removes, legacy DCE encoders' backlights, and platform devices, as for nouveau",
+        "device model traps: links, which only HDMI audio adds and only APUs' USB-C power link removes, legacy DCE encoders' backlights, and platform devices, as for nouveau",
         &[
             "device_link_add",
             "device_link_del",
@@ -586,11 +586,11 @@ const OPEN: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "memory: System RAM and page nodes, which only GFX9 APUs' coherence flags look up",
+        "memory traps: System RAM and page nodes, which only GFX9 APUs' coherence flags look up",
         &["page_is_ram", "pfn_to_nid"],
     ),
     (
-        "emergency restart, which only a Vega20 with early firmware requests after a fatal RAS error",
+        "trap: an emergency restart, which only a Vega20 with early firmware requests after a fatal RAS error",
         &["emergency_restart"],
     ),
     (
