@@ -23,6 +23,9 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     assert_eq!(count + 2, recipes().count());
     // The recipes' recorded lengths: 79 files, 115.8 MiB.
     assert_eq!((count, bytes), (79, 121_450_256), "{count} {bytes}");
+    assert_eq!(count, recipes().count(), "no two recipes share a file yet");
+    // The recipes' recorded lengths: 75 files, 118.4 MiB.
+    assert_eq!((count, bytes), (75, 124_174_880), "{count} {bytes}");
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 63_571_696);
     let manifest = manifest(&complete()).unwrap();
@@ -145,6 +148,18 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     ]);
     expected.sort_unstable();
     assert_eq!(members(&ax210), expected);
+    // An RX 9070 (Navi 48) and its audio function beside a Ryzen 7900X's
+    // integrated GPU: amdgpu's files, and nothing for the others.
+    let navi48 = select(&[
+        pci(0x1002, 0x7550, 0x03),
+        pci(0x1002, 0xab40, 0x04),
+        pci(0x1002, 0x164e, 0x03),
+    ]);
+    let mut expected: Vec<&str> = BLUETOOTH.to_vec();
+    expected.extend(recipes::AMDGPU.iter().map(|recipe| recipe.image.member));
+    expected.sort_unstable();
+    assert_eq!(members(&navi48), expected);
+    assert!(navi48.unknown.is_empty());
     // An NVIDIA display chip no recipe covers is named once.
     let old = select(&[pci(0x10de, 0x1b80, 0x03), pci(0x10de, 0x1b80, 0x03)]);
     assert_eq!(old.unknown, ["pci 10de:1b80"]);
