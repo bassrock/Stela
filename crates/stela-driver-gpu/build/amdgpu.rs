@@ -565,10 +565,8 @@ const OPEN: &[(&str, &[&str])] = &[
         &["sscanf"],
     ),
     (
-        "interrupts: line control, and the interrupt domain of the VI-era and IH 6.1 handlers",
+        "interrupts: the domain only amdgpu's VI-era and IH 6.1 handlers create, and only ACP and ISP map into",
         &[
-            "disable_irq",
-            "enable_irq",
             "generic_handle_domain_irq",
             "handle_simple_irq",
             "irq_create_mapping",

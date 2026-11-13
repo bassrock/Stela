@@ -304,6 +304,79 @@ static void oneshot_sharers_hold_the_line_masked(void)
 	free_irq(7, &sharer_b);
 }
 
+/* disable_irq and enable_irq: the first disable masks the line and waits for
+ * its threaded handler, a nested one does nothing more, a delivery while
+ * disabled runs no handler and is resent once the last enable unmasks it. */
+static unsigned int depth_hard_runs, depth_thread_runs;
+static DECLARE_COMPLETION(depth_thread_entered);
+static DECLARE_COMPLETION(depth_thread_gate);
+static DECLARE_COMPLETION(depth_thread_done);
+
+static irqreturn_t depth_primary(int irq, void *dev_id)
+{
+	assert(irq == 7 && dev_id == &depth_hard_runs && in_hardirq());
+	depth_hard_runs++;
+	return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t depth_thread(int irq, void *dev_id)
+{
+	assert(irq == 7 && dev_id == &depth_hard_runs && !in_interrupt());
+	complete(&depth_thread_entered);
+	wait_for_completion(&depth_thread_gate);
+	depth_thread_runs++;
+	complete(&depth_thread_done);
+	return IRQ_HANDLED;
+}
+
+static void open_depth_gate(struct work_struct *work)
+{
+	(void)work;
+	complete_all(&depth_thread_gate);
+}
+static DECLARE_DELAYED_WORK(depth_gate_opener, open_depth_gate);
+
+static irqreturn_t noautoen_handler(int irq, void *dev_id)
+{
+	(void)irq;
+	(void)dev_id;
+	return IRQ_HANDLED;
+}
+
+static void disable_and_enable_nest(void)
+{
+	line_enables = line_disables = 0;
+	assert(!request_threaded_irq(7, depth_primary, depth_thread, 0, "depth", &depth_hard_runs));
+	assert(line_enables == 1 && !line_masked);
+	stela_linux_irq_run(7);
+	wait_for_completion(&depth_thread_entered);
+	/* The gate opens only after disable_irq has started waiting. */
+	schedule_delayed_work(&depth_gate_opener, 2);
+	disable_irq(7);
+	assert(depth_thread_runs == 1 && line_disables == 1 && line_masked);
+	disable_irq(7);
+	assert(line_disables == 1);
+	stela_linux_irq_run(7);
+	assert(depth_hard_runs == 1);
+	enable_irq(7);
+	assert(line_enables == 1 && line_masked);
+	reinit_completion(&depth_thread_done);
+	enable_irq(7);
+	assert(line_enables == 2 && !line_masked);
+	wait_for_completion(&depth_thread_done);
+	assert(depth_hard_runs == 2 && depth_thread_runs == 2);
+	assert(!strcmp(free_irq(7, &depth_hard_runs), "depth") && line_disables == 2);
+
+	/* IRQF_NO_AUTOEN: requested disabled, unmasked by enable_irq. */
+	line_enables = line_disables = 0;
+	assert(!request_irq(7, noautoen_handler, IRQF_NO_AUTOEN, "noautoen", &line_enables));
+	assert(!line_enables);
+	enable_irq(7);
+	assert(line_enables == 1 && !line_masked);
+	free_irq(7, &line_enables);
+	line_enables = line_disables = 0;
+}
+
 void stela_linux_workqueue_test_main(void)
 {
 	/* PID1 publishes the writeback queue only after the original workqueue
@@ -381,6 +454,7 @@ void stela_linux_workqueue_test_main(void)
 	assert(!strcmp(free_irq(7, &hard_runs), "threaded") && line_disables == 1);
 	assert(!strcmp(free_irq(7, &forced), "other") && line_disables == 2);
 	oneshot_sharers_hold_the_line_masked();
+	disable_and_enable_nest();
 	stela_linux_i2c_test();
 	dedicated_identity_and_join();
 	stela_linux_sync_test();

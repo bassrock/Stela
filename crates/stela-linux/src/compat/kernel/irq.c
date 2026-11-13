@@ -4,8 +4,12 @@
  * ISR runs no Linux code: it raises the line on the owner's service, which
  * calls stela_linux_irq_run in process context, and the handlers run in a
  * hard-IRQ scope there. Threaded handlers run as work, which may sleep as an
- * IRQ thread does. The owner routes each line (irq_enable, irq_disable). */
+ * IRQ thread does. The owner routes each line (irq_enable, irq_disable).
+ * disable_irq and enable_irq nest as a descriptor's depth does; a delivery
+ * that finds the line disabled runs no handler and is resent from irq_work
+ * once the line is enabled, as Linux's software resend is. */
 #include <linux/interrupt.h>
+#include <linux/irq_work.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
 #include <linux/workqueue.h>
@@ -33,9 +37,15 @@ struct irq_line {
 	unsigned int irq;
 	struct mutex request_mutex;
 	bool oneshot_masked;
+	/* disable_irq's nesting; the line stays masked while it is nonzero. */
+	unsigned int depth;
+	/* A delivery that found the line disabled, resent once it is enabled. */
+	bool pending;
+	struct irq_work resend;
 };
 static LIST_HEAD(lines);
 static DEFINE_MUTEX(lines_mutex);
+static void resend_line(struct irq_work *work);
 static struct irq_line *line_owner(unsigned int irq, bool create)
 {
 	struct irq_line *line;
@@ -49,6 +59,7 @@ static struct irq_line *line_owner(unsigned int irq, bool create)
 	if (line) {
 		line->irq = irq;
 		mutex_init(&line->request_mutex);
+		init_irq_work(&line->resend, resend_line);
 		list_add_tail(&line->node, &lines);
 	}
 	mutex_unlock(&lines_mutex);
@@ -87,6 +98,16 @@ static void retire_line(unsigned int irq)
 		stela_linux_fatal("IRQ action retirement unavailable; request retained");
 }
 
+/* Whether the line has an action that is not being freed. */
+static bool line_live(const struct irq_line *line)
+{
+	struct requested *request;
+	list_for_each_entry(request, &requests, node)
+		if (request->action.irq == line->irq && !READ_ONCE(request->closing))
+			return true;
+	return false;
+}
+
 /* Checked by the exact native service epoch join, after free_irq canceled
  * each closing action's real work. A mask/root fence alone never sets this. */
 bool stela_linux_irq_actions_joined(unsigned int irq)
@@ -121,6 +142,12 @@ static void maybe_rearm(struct irq_line *line)
 			return;
 	}
 	if (live) {
+		/* A disabled line stays masked; enable_irq unmasks it, as Linux's
+		 * oneshot finalization leaves a disabled line alone. */
+		if (READ_ONCE(line->depth)) {
+			WRITE_ONCE(line->oneshot_masked, false);
+			return;
+		}
 		bool unexposed = false;
 		if (enable_line(line->irq, &unexposed))
 			stela_linux_fatal("IRQ oneshot rearm unavailable; action retained");
@@ -181,6 +208,12 @@ static int request_irq_locked(struct irq_line *line, unsigned int irq, irq_handl
 		.name = name,
 	};
 	INIT_WORK(&request->thread, run_thread);
+	/* As __setup_irq: the first action starts the line, which IRQF_NO_AUTOEN
+	 * leaves disabled until enable_irq. */
+	if (first) {
+		WRITE_ONCE(line->depth, (flags & IRQF_NO_AUTOEN) ? 1 : 0);
+		WRITE_ONCE(line->pending, false);
+	}
 	/* Publish the fully initialized action before enable can deliver a
 	 * synchronous notification or yield to this owner's real service task. */
 	list_add_tail(&request->node, &requests);
@@ -245,10 +278,14 @@ static const void *free_irq_locked(unsigned int irq, void *dev_id)
 		struct irq_line *line = request->line;
 		list_del(&request->node);
 		kfree(request);
-		if (last)
+		if (last) {
 			WRITE_ONCE(line->oneshot_masked, false);
-		else
+			/* As irq_shutdown: a shut-down line is disabled. */
+			WRITE_ONCE(line->depth, 1);
+			WRITE_ONCE(line->pending, false);
+		} else {
 			maybe_rearm(line);
+		}
 		return name;
 	}
 	WARN(1, "Trying to free already-free IRQ %u\n", irq);
@@ -277,12 +314,20 @@ const void *free_irq(unsigned int irq, void *dev_id)
 	return name;
 }
 
-void stela_linux_irq_run(unsigned int irq)
+/* The line's primary handlers, in the hard-IRQ scope the caller opened. A
+ * disabled line runs none: the delivery is kept for enable_irq to resend. */
+static void run_actions(unsigned int irq)
 {
-	struct stela_linux_atomic_callback scope;
 	struct requested *request;
 
-	stela_linux_atomic_callback_begin(&scope);
+	list_for_each_entry(request, &requests, node)
+		if (request->action.irq == irq) {
+			if (READ_ONCE(request->line->depth)) {
+				WRITE_ONCE(request->line->pending, true);
+				return;
+			}
+			break;
+		}
 	list_for_each_entry(request, &requests, node) {
 		struct irqaction *action = &request->action;
 		if (action->irq != irq || READ_ONCE(request->closing) ||
@@ -298,5 +343,77 @@ void stela_linux_irq_run(unsigned int irq)
 		WRITE_ONCE(request->thread_active, true);
 		queue_work(system_highpri_wq, &request->thread);
 	}
+}
+
+void stela_linux_irq_run(unsigned int irq)
+{
+	struct stela_linux_atomic_callback scope;
+
+	stela_linux_atomic_callback_begin(&scope);
+	run_actions(irq);
 	stela_linux_atomic_callback_end(&scope);
+}
+
+/* irq_work opens the hard-IRQ scope the resent delivery runs in. */
+static void resend_line(struct irq_work *work)
+{
+	run_actions(container_of(work, struct irq_line, resend)->irq);
+}
+
+/* Following kernel/irq/manage.c: the first disable masks the line, and a
+ * disable waits for the line's handlers. No primary handler runs beside this
+ * process context, so that is its threaded handlers. A line no live action
+ * routes is not masked, as a shut-down line is not. */
+void disable_irq(unsigned int irq)
+{
+	struct requested *request;
+
+	if (in_interrupt())
+		stela_linux_fatal("disable_irq in interrupt context");
+	struct irq_line *line = line_owner(irq, false);
+	if (!line)
+		return;
+	mutex_lock(&line->request_mutex);
+	if (!line->depth++ && line_live(line) && !READ_ONCE(line->oneshot_masked))
+		disable_line(irq);
+	list_for_each_entry(request, &requests, node) {
+		if (request->action.irq != irq)
+			continue;
+		if (current_work() == &request->thread)
+			stela_linux_fatal("disable_irq from its own IRQ thread");
+		flush_work(&request->thread);
+	}
+	mutex_unlock(&line->request_mutex);
+}
+
+/* The last enable unmasks the line, unless a oneshot thread still holds it,
+ * and resends a delivery it missed. Unlike Linux's, this one sleeps on the
+ * line's request mutex, so it takes process context. */
+void enable_irq(unsigned int irq)
+{
+	if (in_interrupt())
+		stela_linux_fatal("enable_irq in interrupt context");
+	struct irq_line *line = line_owner(irq, false);
+	if (WARN(!line || !line_live(line), "enable_irq before setup/request_irq: irq %u\n", irq))
+		return;
+	mutex_lock(&line->request_mutex);
+	switch (line->depth) {
+	case 0:
+		WARN(1, KERN_WARNING "Unbalanced enable for IRQ %u\n", irq);
+		break;
+	case 1: {
+		WRITE_ONCE(line->depth, 0);
+		bool unexposed = false;
+		if (!READ_ONCE(line->oneshot_masked) && enable_line(irq, &unexposed))
+			stela_linux_fatal("IRQ enable unavailable; line retained disabled");
+		if (READ_ONCE(line->pending)) {
+			WRITE_ONCE(line->pending, false);
+			irq_work_queue(&line->resend);
+		}
+		break;
+	}
+	default:
+		WRITE_ONCE(line->depth, line->depth - 1);
+	}
+	mutex_unlock(&line->request_mutex);
 }
