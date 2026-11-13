@@ -210,8 +210,13 @@ Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
 - Il bit `FLReset` in `DevCap` della 9070 (`sudo lspci -nnvv -s 03:00.0`).
   sysfs dice già che il kernel non trova FLR; se `DevCap` lo conferma,
   `cold.rs` ha bisogno di un'altra via: reset del bus secondario sul
-  downstream port `02:00.0`, oppure il reset interno di amdgpu (il metodo
-  che `amdgpu_asic_reset` sceglie per SOC24 è da leggere nei sorgenti).
+  downstream port `02:00.0`, oppure il reset interno di amdgpu. Letto il
+  2026-11-13: `soc24_asic_reset_method` sceglie MODE1 (reset via SMU) per
+  MP1 14.0.2 e 14.0.3, quindi per la 9070, e non sceglie mai il reset PCI.
+- Se il BIOS («Re-Size BAR Support», con «Above 4G Decoding») fa assegnare
+  al firmware un BAR0 da 16 GB. Oggi il firmware lo lascia a 256 MB e su
+  Linux è amdgpu ad allargarlo; in Stela il resize è rifiutato (vedi il
+  passo 2), quindi amdgpu userebbe 256 MB di VRAM visibile alla CPU.
 - Quale ramo di `gmc_v12_0.c` (maschera DMA a 44 o 52 bit) valga per Navi 48.
 - Se, con la 9070 senza display e il monitor sulla iGPU, il desktop di macOS
   arriva davvero sullo schermo del firmware. Il commento in `gpu/display.rs`
@@ -232,8 +237,8 @@ Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
      spenti DC, KFD, ACP, ISP, CIK, SI e USERPTR.
    - Fornire i servizi kernel mancanti in `crates/stela-linux/src/compat/kernel`
      e `crates/stela-driver-gpu/src/compat/linux/kernel`. Misurati il
-     2026-11-12: 82 propri di amdgpu, 55 dopo il passo 1, vedi «Censimento
-     amdgpu: risultati».
+     2026-11-12: 82 propri di amdgpu, 55 dopo il passo 1, 39 dopo il passo
+     2, vedi «Censimento amdgpu: risultati».
 2. **Firmware**: ricette linux-firmware per i blob amdgpu, sul modello GSP in
    `recipes.rs`, e selezione per IP invece che per chipset.
 3. **Boot**: generalizzare `claim`, `claim_all` e `cold.rs` oltre NVIDIA.
@@ -310,6 +315,16 @@ Com'è fatto:
 - Tutti i 376 oggetti compilano con il profilo di warning di Linux e
   `-Werror`. Nessun header `asm/` manca: quelli x86 di amdgpu sono sotto
   guardie `CONFIG_X86*`.
+- Per il target UEFI (il triple cygwin con cui Stela compila il C di
+  `stela.efi`) clang controlla i formati printf con le regole di Windows,
+  dove `L` su una conversione intera è indefinito; amdgpu lo usa (`%010Lx`
+  in `amdgpu_vm.c`, `%08Lx` in `vcn_v3_0.c`), nouveau e la classe DRM no. Il
+  `vsprintf.c` di Stela lo legge come `ll`, come Linux. Il censimento su
+  UEFI compila quindi con `-Wno-format`, mentre sull'host i formati restano
+  controllati; il port vero dovrà scegliere tra questo e una patch che porti
+  quei formati a `%ll`. Verificato il 2026-11-13: così i 376 oggetti
+  compilano anche per il target UEFI e il censimento lì trova gli stessi
+  servizi aperti dell'host.
 
 Risultato: 91 servizi kernel aperti, di cui 11 trap che l'ambiente definisce
 senza servire e 7 raggiunti solo attraverso oggetti dell'ambiente. Nove sono
@@ -429,9 +444,46 @@ adattatore e trap: `sscanf` (serve un `vsscanf` nel `vsprintf.c` di Stela),
 solo con KFD) e i tre `amdgpu_xcp_*` (`amdxcp` è un platform driver con
 initcall, per GPU a più partizioni).
 
-| Gruppo | Aperti dopo il passo 1 |
+Passo 2, fatto il 2026-11-13: gli adattatori PCI, 16 servizi forniti e 3
+trap nuovi; `OPEN` da 64 a 48 (39 propri di amdgpu). Ogni funzione segue il
+testo di `drivers/pci/` al pin (letto con `git show` dal checkout parziale,
+fuori dallo sparse):
+
+- `crates/stela-linux/src/compat/kernel/pci.c`: capability estese
+  (`pci_find_ext_capability`), registri PCI Express
+  (`pcie_capability_read_word` e `_dword`, con i registri che il tipo di
+  porta non ha letti come zero e il Presence Detect dei downstream port),
+  `pcie_get_mps`, `pcie_get_speed_cap`, `pcie_get_width_cap`,
+  `pcie_get_supported_speeds`, `pci_cfg_space_size`, le finestre del bus
+  (`pci_bus_resource_n`), la copia dello stato salvato
+  (`pci_store_saved_state`, `pci_load_saved_state`), `pci_clear_master`,
+  `pci_intx`, Resizable BAR (`pci_rebar_bytes_to_size`,
+  `pci_rebar_get_possible_sizes`, `pci_rebar_get_max_size`) e
+  `pci_enable_atomic_ops_to_root`. Trap: `pci_reset_function` (solo il
+  metodo di reset `pci`, che SOC24 non sceglie mai), `pci_restore_msi_state`
+  (solo MI300) e `pci_get_class` (solo APU e ATPX).
+- `crates/stela-linux/src/compat/kernel/pci_host.c`: i vettori
+  (`pci_alloc_irq_vectors`, `pci_irq_vector`, `pci_free_irq_vectors`) sul
+  messaggio unico del proprietario o sulla linea INTx; l'attach ora imposta
+  come il probe di Linux `pcie_flags_reg`, `cfg_size`, `supported_speeds` e
+  `rebar_cap` (letture di configurazione in più per ogni funzione, anche per
+  le GPU NVIDIA: il registro dei flag PCIe, la prima dword estesa, i due
+  registri di capacità del link e la lista delle capability estese fino a
+  ReBAR) e inizializza la lista delle finestre del bus.
+- Scelte che cambiano il comportamento rispetto a Linux sul PC:
+  `pci_resize_resource` rifiuta con `-ENOTSUPP`, come Linux quando il host
+  bridge deve preservare l'assegnazione del firmware, perché le finestre le
+  piazza il proprietario: BAR0 resta com'è (vedi «Da verificare»).
+  `pci_enable_atomic_ops_to_root` non vede root port, perché il
+  proprietario non presenta bridge: come sotto un hypervisor, le AtomicOp
+  sono accese solo se il firmware le ha accese. Servono a KFD, che è spento,
+  non alla grafica.
+- I test hosted `linux_pci` e `linux_pci_host` coprono ognuna di queste
+  funzioni.
+
+| Gruppo | Aperti dopo il passo 2 |
 |---|---|
-| PCI e PCIe | 21 |
+| Trap PCI (reset, ripristino MSI, ricerca per classe, più due già definiti) | 5 |
 | Modello dei device | 11 |
 | Interrupt | 8 |
 | DRM client (solo con KFD) e amdxcp | 6 |
@@ -445,9 +497,9 @@ Prossimo passo proposto, in ordine:
 
 1. Gruppi 2 e 3: allargare `third_party/linux.sparse` e `DRM_SOURCES`,
    compilare i file invariati, far scendere `OPEN`. Fatto il 2026-11-12.
-2. Adattatori PCI in `compat/kernel/pci.c`, con `pci_resize_resource` e
-   `pci_rebar_get_max_size` che rifiutano (BAR0 resta a 256 MB finché Stela
-   non sa riallocare).
+2. Adattatori PCI in `compat/kernel/pci.c`, con `pci_resize_resource` che
+   rifiuta (BAR0 resta a 256 MB finché Stela non sa riallocare). Fatto il
+   2026-11-13.
 3. Stub e adattatori dei gruppi 4–8; trap per i gruppi 5 (dominio) e 6, per
    `drm_client` e `amdxcp`; `vsscanf` in `vsprintf.c`.
 4. Poi `autoconf.h` con `CONFIG_DRM_AMDGPU`, le ricette firmware (strato 2) e
@@ -563,7 +615,13 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
     riuscita, clippy pulito sulla lane host e su quella UEFI;
     `cargo test -p stela-linux -p stela-driver-gpu --all-features`: 735
     test superati, nessuno fallito. Committato in tre commit.
-- Decisione presa il 2026-11-12: censimento prima dell'upstream, poi il
-  passo 1. Il prossimo è il passo 2, gli adattatori PCI; sentire l'upstream
-  resta consigliato prima degli strati che costano mesi (RADV, Metal,
-  display).
+- 2026-11-13, sessione locale sul PC (riavviato nel mezzo; branch e
+  sorgenti intatti):
+  - passo 2 eseguito (vedi «Censimento amdgpu: risultati»): `OPEN` a 48.
+    Modificati `crates/stela-linux/src/compat/kernel/{pci,pci_host}.c`,
+    `crates/stela-linux/src/compat/stela/pci.h` e
+    `crates/stela-driver-gpu/build/amdgpu.rs`. Build con `amdgpu-port` riuscita sull'host e per il target UEFI (`x86_64-unknown-uefi`), dove il censimento trova gli stessi 48 servizi; clippy pulito sulla lane host e su quella UEFI; `cargo test -p stela-linux -p stela-driver-gpu --all-features`: 735 test superati, nessuno fallito, `linux_pci` e `linux_pci_host` compresi. Committato in tre commit.
+- Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
+  passi 1 e 2. Il prossimo è il passo 3, stub, adattatori e trap dei gruppi
+  rimasti; sentire l'upstream resta consigliato prima degli strati che
+  costano mesi (RADV, Metal, display).
