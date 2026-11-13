@@ -152,6 +152,67 @@ void devm_release_action(struct device *dev, void (*action)(void *), void *data)
 	WARN_ON(1);
 }
 
+/* Attribute files, following drivers/base/core.c. Stela has no sysfs, so a
+ * file or group is only checked and, when managed, its removal recorded for
+ * the driver's detach. */
+int device_create_file(struct device *dev, const struct device_attribute *attr)
+{
+	int error = 0;
+
+	if (dev) {
+		WARN(((attr->attr.mode & S_IWUGO) && !(attr->store || attr->store_const)),
+		     "Attribute %s: write permission without 'store'\n", attr->attr.name);
+		WARN(((attr->attr.mode & S_IRUGO) && !(attr->show || attr->show_const)),
+		     "Attribute %s: read permission without 'show'\n", attr->attr.name);
+		error = sysfs_create_file(&dev->kobj, &attr->attr);
+	}
+	return error;
+}
+
+void device_remove_file(struct device *dev, const struct device_attribute *attr)
+{
+	if (dev)
+		sysfs_remove_file(&dev->kobj, &attr->attr);
+}
+
+struct attr_group_devres {
+	struct device *dev;
+	const struct attribute_group *group;
+};
+
+static void devm_attr_group_remove(void *res)
+{
+	struct attr_group_devres *devres = res;
+
+	dev_dbg(devres->dev, "%s: removing group %p\n", __func__, devres->group);
+	sysfs_remove_group(&devres->dev->kobj, devres->group);
+	kfree(devres);
+}
+
+int devm_device_add_group(struct device *dev, const struct attribute_group *grp)
+{
+	struct attr_group_devres *devres = kmalloc_obj(*devres);
+	int error;
+
+	if (!devres)
+		return -ENOMEM;
+	error = sysfs_create_group(&dev->kobj, grp);
+	if (error) {
+		kfree(devres);
+		return error;
+	}
+	devres->dev = dev;
+	devres->group = grp;
+	/* Linux allocates the record with its removal; here the managed action
+	 * is the allocation that can fail, so a failure undoes the group. */
+	error = __devm_add_action(dev, devm_attr_group_remove, devres, "devm_attr_group_remove");
+	if (error) {
+		sysfs_remove_group(&dev->kobj, grp);
+		kfree(devres);
+	}
+	return error;
+}
+
 void stela_linux_devres_release(struct device *dev)
 {
 	struct managed_action *managed, *next;
@@ -254,6 +315,16 @@ static void undo(void *data)
 	undone[undone_count++] = *(const char *)data;
 }
 
+static ssize_t value_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	(void)dev;
+	(void)attr;
+	return sysfs_emit(buf, "1\n");
+}
+static DEVICE_ATTR_RO(value);
+static struct attribute *test_attrs[] = {&dev_attr_value.attr, NULL};
+static const struct attribute_group test_group = {.attrs = test_attrs};
+
 static bool test_property_bool(const struct fwnode_handle *node, const char *name)
 {
 	return !node->secondary && !strcmp(name, "test-enabled");
@@ -320,6 +391,13 @@ int main(void)
 	assert(!__devm_add_action(&child, undo, (void *)&c, "c"));
 	devm_release_action(&child, undo, (void *)&b);
 	assert(undone_count == 1 && undone[0] == 'b');
+	/* Attribute files do not exist: creating one or a managed group checks
+	 * it, and the group's removal goes with the other managed actions. */
+	assert(!device_create_file(&child, &dev_attr_value));
+	device_remove_file(&child, &dev_attr_value);
+	assert(!device_create_file(NULL, &dev_attr_value));
+	device_remove_file(NULL, &dev_attr_value);
+	assert(!devm_device_add_group(&child, &test_group));
 	device_unregister(&child);
 	assert(!memcmp(undone, "bca", 3));
 	put_device(&child);
@@ -329,7 +407,7 @@ int main(void)
 	assert(!IS_ERR(class) && !strcmp(class->name, "test"));
 	class_destroy(class);
 	stela_linux_exit();
-	printf("Linux device references: the last put releases the device passed\n");
+	printf("Linux device references, managed actions and attribute files passed\n");
 	return 0;
 }
 #endif

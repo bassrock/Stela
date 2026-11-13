@@ -148,6 +148,42 @@ int dma_set_coherent_mask(struct device *dev, u64 mask)
 	return 0;
 }
 
+/* The mask a device needs to reach all memory, following kernel/dma/mapping.c
+ * for a device that maps through its owner's operations, never directly and
+ * never through dma-iommu: the operations' answer or, as Linux defaults for
+ * operations without one, 32 bits. */
+u64 dma_get_required_mask(struct device *dev)
+{
+	const struct dma_map_ops *ops = get_dma_ops(dev);
+
+	if (ops->get_required_mask)
+		return ops->get_required_mask(dev);
+	return DMA_BIT_MASK(32);
+}
+
+/* Whether the device cannot reach all memory: with operations attached, only
+ * a mask or bus limit below the required mask limits it. */
+bool dma_addressing_limited(struct device *dev)
+{
+	if (min_not_zero(dma_get_mask(dev), dev->bus_dma_limit) >= dma_get_required_mask(dev))
+		return false;
+	dev_dbg(dev, "device is DMA addressing limited\n");
+	return true;
+}
+
+/* A device's memory-mapped resource, which maps as MMIO. */
+dma_addr_t dma_map_resource(struct device *dev, phys_addr_t phys_addr, size_t size,
+			    enum dma_data_direction dir, unsigned long attrs)
+{
+	return dma_map_phys(dev, phys_addr, size, dir, attrs | DMA_ATTR_MMIO);
+}
+
+void dma_unmap_resource(struct device *dev, dma_addr_t addr, size_t size,
+			enum dma_data_direction dir, unsigned long attrs)
+{
+	dma_unmap_phys(dev, addr, size, dir, attrs | DMA_ATTR_MMIO);
+}
+
 #ifdef STELA_LINUX_DMA_TEST
 #include <stela/linux.h>
 #include <stela/test.h>
@@ -156,13 +192,14 @@ int dma_set_coherent_mask(struct device *dev, u64 mask)
 
 static unsigned int mapped, freed;
 static gfp_t allocated_gfp;
+static unsigned long last_attrs;
 
 static dma_addr_t map_phys(struct device *dev, phys_addr_t phys, size_t size,
 			   enum dma_data_direction dir, unsigned long attrs)
 {
 	(void)dev;
-	(void)attrs;
 	assert(size == 0x20 && dir == DMA_TO_DEVICE);
+	last_attrs = attrs;
 	mapped++;
 	return BUS + phys;
 }
@@ -173,8 +210,8 @@ static void unmap_phys(struct device *dev, dma_addr_t handle, size_t size,
 	(void)dev;
 	(void)size;
 	(void)dir;
-	(void)attrs;
 	assert(handle >= BUS);
+	last_attrs = attrs;
 	mapped--;
 }
 
@@ -218,6 +255,12 @@ static int mask_supported(struct device *dev, u64 mask)
 	return mask >= DMA_BIT_MASK(32);
 }
 
+static u64 required_mask(struct device *dev)
+{
+	(void)dev;
+	return DMA_BIT_MASK(48);
+}
+
 static const struct dma_map_ops ops = {
 	.map_phys = map_phys,
 	.unmap_phys = unmap_phys,
@@ -254,8 +297,28 @@ int main(void)
 	assert(dma_set_mask(&dev, DMA_BIT_MASK(31)) == -EIO && !mask);
 	assert(!dma_set_mask_and_coherent(&dev, DMA_BIT_MASK(47)));
 	assert(mask == DMA_BIT_MASK(47) && dev.coherent_dma_mask == mask);
+
+	/* Operations without a required mask need 32 bits; a mask or bus limit
+	 * below the required mask limits addressing. */
+	assert(dma_get_required_mask(&dev) == DMA_BIT_MASK(32) && !dma_addressing_limited(&dev));
+	dev.bus_dma_limit = DMA_BIT_MASK(31);
+	assert(dma_addressing_limited(&dev));
+	dev.bus_dma_limit = 0;
+	struct dma_map_ops wide = ops;
+
+	wide.get_required_mask = required_mask;
+	set_dma_ops(&dev, &wide);
+	assert(dma_get_required_mask(&dev) == DMA_BIT_MASK(48) && dma_addressing_limited(&dev));
+	set_dma_ops(&dev, &ops);
+
+	/* A resource maps and unmaps as MMIO. */
+	handle = dma_map_resource(&dev, 0x3000, 0x20, DMA_TO_DEVICE, 0);
+	assert(handle == BUS + 0x3000 && mapped == 1 && (last_attrs & DMA_ATTR_MMIO));
+	last_attrs = 0;
+	dma_unmap_resource(&dev, handle, 0x20, DMA_TO_DEVICE, 0);
+	assert(!mapped && (last_attrs & DMA_ATTR_MMIO));
 	stela_linux_exit();
-	printf("Linux DMA mapping through the owner's dma_map_ops passed\n");
+	printf("Linux DMA mapping, addressing limits and resources through the owner's dma_map_ops passed\n");
 	return 0;
 }
 #endif
