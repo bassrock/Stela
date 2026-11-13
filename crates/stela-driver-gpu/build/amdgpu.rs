@@ -542,29 +542,13 @@ const EXCLUDED: &[(&str, &[&str])] = &[
 /// its change.
 const OPEN: &[(&str, &[&str])] = &[
     (
-        "PCI and PCIe: MSI vectors, capabilities, Resizable BAR, reset and saved state",
+        "PCI traps: a function reset the owner does not offer, a message restore and a search by class only other GPUs reach, and pending transactions and wake from D3, as for nouveau",
         &[
-            "pci_alloc_irq_vectors",
-            "pci_bus_resource_n",
-            "pci_clear_master",
-            "pci_enable_atomic_ops_to_root",
-            "pci_find_ext_capability",
-            "pci_free_irq_vectors",
             "pci_get_class",
-            "pci_irq_vector",
-            "pci_load_saved_state",
-            "pci_rebar_bytes_to_size",
-            "pci_rebar_get_max_size",
             "pci_reset_function",
-            "pci_resize_resource",
             "pci_restore_msi_state",
-            "pci_store_saved_state",
             "pci_wait_for_pending_transaction",
             "pci_wake_from_d3",
-            "pcie_capability_read_word",
-            "pcie_get_mps",
-            "pcie_get_speed_cap",
-            "pcie_get_width_cap",
         ],
     ),
     (
