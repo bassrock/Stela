@@ -542,13 +542,11 @@ const EXCLUDED: &[(&str, &[&str])] = &[
 /// its change.
 const OPEN: &[(&str, &[&str])] = &[
     (
-        "PCI traps: a function reset the owner does not offer, a message restore and a search by class only other GPUs reach, and pending transactions and wake from D3, as for nouveau",
+        "PCI traps: a function reset Navi 48 never chooses, a message restore only MI300 makes and a search by class only APUs make",
         &[
             "pci_get_class",
             "pci_reset_function",
             "pci_restore_msi_state",
-            "pci_wait_for_pending_transaction",
-            "pci_wake_from_d3",
         ],
     ),
     (
@@ -563,7 +561,7 @@ const OPEN: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "formatted input, which Stela's vsprintf.c lacks",
+        "formatted input: Stela's vsprintf.c has no vsscanf, and Mesa's libc compat keeps the sscanf name in the image",
         &["sscanf"],
     ),
     (
@@ -580,42 +578,22 @@ const OPEN: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "device model: sysfs attributes, device links, managed I2C adapters, hwmon, backlight and HDMI audio",
+        "device model: links, which only HDMI audio adds and only APUs' USB-C power link removes, legacy DCE encoders' backlights, and platform devices, as for nouveau",
         &[
-            "device_create_file",
-            "device_remove_file",
-            "devm_device_add_group",
             "device_link_add",
             "device_link_del",
-            "devm_i2c_add_adapter",
-            "hwmon_device_register_with_groups",
-            "hwmon_device_unregister",
             "backlight_device_register",
             "backlight_device_unregister",
             "platform_device_unregister",
         ],
     ),
     (
-        "time: the fast monotonic and real clocks, calendar conversion",
-        &[
-            "ktime_get_mono_fast_ns",
-            "ktime_get_real_seconds",
-            "time64_to_tm",
-        ],
+        "memory: System RAM and page nodes, which only GFX9 APUs' coherence flags look up",
+        &["page_is_ram", "pfn_to_nid"],
     ),
     (
-        "memory: RAM ranges, page nodes, peer resource mapping, addressing limits",
-        &[
-            "page_is_ram",
-            "pfn_to_nid",
-            "dma_map_resource",
-            "dma_unmap_resource",
-            "dma_addressing_limited",
-        ],
-    ),
-    (
-        "rate-limited printing and emergency restart",
-        &["__printk_ratelimit", "emergency_restart"],
+        "emergency restart, which only a Vega20 with early firmware requests after a fatal RAS error",
+        &["emergency_restart"],
     ),
     (
         "traps nothing amdgpu runs reaches, as for nouveau: shmem-backed pages and reopening a file without a VFS path",

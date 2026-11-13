@@ -82,6 +82,21 @@ void i2c_del_adapter(struct i2c_adapter *adapter)
 	wait_for_completion(&adapter->dev_released);
 }
 
+static void devm_i2c_del_adapter(void *adapter)
+{
+	i2c_del_adapter(adapter);
+}
+
+/* An adapter deleted with its device's managed actions. */
+int devm_i2c_add_adapter(struct device *dev, struct i2c_adapter *adapter)
+{
+	int ret = i2c_add_adapter(adapter);
+
+	if (ret)
+		return ret;
+	return devm_add_action_or_reset(dev, devm_i2c_del_adapter, adapter);
+}
+
 /* Arbitration loss retries, within the adapter's limits. */
 int __i2c_transfer(struct i2c_adapter *adapter, struct i2c_msg *msgs, int num)
 {
