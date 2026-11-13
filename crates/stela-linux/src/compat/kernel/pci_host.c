@@ -192,6 +192,43 @@ void pci_disable_msi(struct pci_dev *dev)
 	dev->msi_enabled = 0;
 }
 
+/* Vectors, following drivers/pci/msi/api.c: the owner's one message when a
+ * message kind is allowed and it enables, else the function's line when it
+ * is allowed and one vector is the least asked for. */
+int pci_alloc_irq_vectors(struct pci_dev *dev, unsigned int min_vecs, unsigned int max_vecs,
+			  unsigned int flags)
+{
+	int nvecs = -ENOSPC;
+
+	if (flags & (PCI_IRQ_MSIX | PCI_IRQ_MSI)) {
+		if (max_vecs < min_vecs)
+			nvecs = -ERANGE;
+		else if (min_vecs <= 1) {
+			nvecs = pci_enable_msi(dev);
+			if (!nvecs)
+				return 1;
+		}
+	}
+	if ((flags & PCI_IRQ_INTX) && min_vecs == 1 && dev->irq) {
+		pci_intx(dev, 1);
+		return 1;
+	}
+	return nvecs;
+}
+
+void pci_free_irq_vectors(struct pci_dev *dev)
+{
+	pci_disable_msi(dev);
+}
+
+/* The one vector's irq: the line's name, which a message keeps. */
+int pci_irq_vector(struct pci_dev *dev, unsigned int nr)
+{
+	if (nr)
+		return -EINVAL;
+	return (int)dev->irq;
+}
+
 static void release(struct device *dev)
 {
 	struct host_function *host = container_of(to_pci_dev(dev), struct host_function, dev);
@@ -229,6 +266,8 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 	host->bus.sysdata = &host->function;
 	host->bus.ops = &config_ops;
 	host->bus.number = (unsigned char)function->bus;
+	/* The owner's root bus presents no windows of its own. */
+	INIT_LIST_HEAD(&host->bus.resources);
 	struct pci_dev *dev = &host->dev;
 	u32 class_revision;
 
@@ -251,6 +290,8 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
         error = pci_read_config_dword(dev, PCI_CLASS_REVISION, &class_revision);
     if (!error)
         error = stela_linux_pci_find_capability(dev, PCI_CAP_ID_EXP, &dev->pcie_cap);
+    if (!error && dev->pcie_cap)
+        error = pci_read_config_word(dev, dev->pcie_cap + PCI_EXP_FLAGS, &dev->pcie_flags_reg);
     if (error) {
         /* No original device_initialize/publication or context transfer has
          * occurred. Rust retains exact State/Host/authority on this refusal. */
@@ -261,6 +302,12 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
     }
     dev->revision = (u8)class_revision;
     dev->class = class_revision >> 8;
+	/* As drivers/pci/probe.c sets a function up, ignoring read failures:
+	 * they leave the extended space, link speeds and ReBAR unknown. */
+	dev->cfg_size = pci_cfg_space_size(dev);
+	if (pci_is_pcie(dev))
+		dev->supported_speeds = pcie_get_supported_speeds(dev);
+	dev->rebar_cap = pci_find_ext_capability(dev, PCI_EXT_CAP_ID_REBAR);
 	for (int i = 0; i < PCI_STD_NUM_BARS; i++) {
 		const struct stela_linux_pci_region *region = &function->regions[i];
 
@@ -303,7 +350,7 @@ struct pci_dev *stela_linux_pci_attach(const struct stela_linux_pci_function *fu
 #define BASE 0xc0000000ULL
 #define BUS_OFFSET 0x100000000ULL
 
-static u8 config[256];
+static u8 config[PCI_CFG_SPACE_EXP_SIZE];
 static unsigned int mapped, fail_map_after = ~0U;
 static int msi_error, config_error;
 static bool on_message;
@@ -377,6 +424,15 @@ int main(void)
 	memcpy(&config[PCI_VENDOR_ID], "\xde\x10\x07\x2d", 4);
 	memcpy(&config[PCI_CLASS_REVISION], "\xa1\x00\x00\x03", 4);
 	memcpy(&config[PCI_SUBSYSTEM_VENDOR_ID], "\x43\x10\x21\x87", 4);
+	/* A PCI Express capability at 0x60: version 2, an endpoint. */
+	config[PCI_STATUS] = PCI_STATUS_CAP_LIST;
+	config[PCI_CAPABILITY_LIST] = 0x60;
+	config[0x60] = PCI_CAP_ID_EXP;
+	config[0x62] = 0x02;
+	/* An x16 link up to 32 GT/s, and Resizable BAR at 0x100. */
+	*(u32 *)&config[0x60 + PCI_EXP_LNKCAP] = 0x105u;
+	*(u32 *)&config[0x60 + PCI_EXP_LNKCAP2] = 0x3eu;
+	*(u32 *)&config[0x100] = PCI_EXT_CAP_ID_REBAR | (1u << 16);
 	struct stela_linux_pci_function function = {
 		.context = config, .read_config = test_read, .write_config = test_write,
 		.dma_map = test_map, .dma_unmap = test_unmap,
@@ -397,6 +453,11 @@ int main(void)
 	assert(dev && dev->vendor == 0x10de && dev->device == 0x2d07);
 	assert(dev->subsystem_vendor == 0x1043 && dev->subsystem_device == 0x8721);
 	assert(dev->class == 0x030000 && dev->revision == 0xa1 && dev->irq == 9);
+	assert(dev->pcie_cap == 0x60 && dev->pcie_flags_reg == 0x0002);
+	assert(dev->cfg_size == PCI_CFG_SPACE_EXP_SIZE && dev->rebar_cap == 0x100);
+	assert(dev->supported_speeds == 0x3e && pcie_get_speed_cap(dev) == PCIE_SPEED_32_0GT);
+	assert(pci_pcie_type(dev) == PCI_EXP_TYPE_ENDPOINT);
+	assert(!pci_bus_resource_n(dev->bus, 0) && !pci_bus_resource_n(dev->bus, PCI_BRIDGE_RESOURCE_NUM));
 	assert(pci_resource_start(dev, 0) == BASE && pci_resource_len(dev, 0) == 0x1000000);
 	assert(!pci_resource_len(dev, 1));
 	assert(!strcmp(dev_name(&dev->dev), "0000:03:01.0"));
@@ -461,6 +522,25 @@ int main(void)
 	assert(!pci_enable_msi(dev) && on_message && dev->msi_enabled && dev->irq == 9);
 	pci_disable_msi(dev);
 	assert(!on_message && !dev->msi_enabled);
+
+	/* Vectors: one, as the owner's message when it enables, else the line. */
+	msi_error = -ENOSPC;
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSI | PCI_IRQ_MSIX) == -ENOSPC);
+	assert(!dev->msi_enabled && !on_message);
+	*(u16 *)&config[PCI_COMMAND] |= PCI_COMMAND_INTX_DISABLE;
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_ALL_TYPES) == 1 && !dev->msi_enabled);
+	assert(!(*(u16 *)&config[PCI_COMMAND] & PCI_COMMAND_INTX_DISABLE));
+	assert(pci_irq_vector(dev, 0) == 9 && pci_irq_vector(dev, 1) == -EINVAL);
+	pci_free_irq_vectors(dev);
+	msi_error = 0;
+	assert(pci_alloc_irq_vectors(dev, 2, 4, PCI_IRQ_ALL_TYPES) == -ENOSPC && !on_message);
+	assert(pci_alloc_irq_vectors(dev, 2, 1, PCI_IRQ_ALL_TYPES) == -ERANGE);
+	assert(pci_alloc_irq_vectors(dev, 1, 4, PCI_IRQ_ALL_TYPES) == 1);
+	assert(on_message && dev->msi_enabled && pci_irq_vector(dev, 0) == 9);
+	pci_free_irq_vectors(dev);
+	assert(!on_message && !dev->msi_enabled);
+	assert(pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_INTX) == 1 && !on_message);
+	pci_free_irq_vectors(dev);
 
 	/* Removal owns only registration's reference. An escaped pci_dev keeps
 	 * the copied callback table and its original context until its last put. */
