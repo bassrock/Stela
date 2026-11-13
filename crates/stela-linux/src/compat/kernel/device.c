@@ -293,8 +293,10 @@ void component_del(struct device *dev, const struct component_ops *ops)
 	(void)ops;
 }
 
-/* Runtime power dependencies, which only a bound audio component makes. */
+/* Runtime power dependencies, which only a bound audio component makes and
+ * only an AMD APU's USB-C power link removes. */
 STELA_UNSUPPORTED(struct device_link *, device_link_add, struct device *, struct device *, u32)
+STELA_UNSUPPORTED(void, device_link_del, struct device_link *)
 
 #ifdef STELA_LINUX_DEVICE_TEST
 #include <stela/linux.h>
