@@ -1,7 +1,8 @@
 //! amdgpu: the `amdgpu-y` composite of its makefiles under Stela's Kconfig,
-//! compiled unchanged in Stela's Linux environment as a census of the kernel
-//! services it imports that the environment does not supply. Nothing links
-//! the archive: the census records what the AMD port must still provide.
+//! compiled unchanged in Stela's Linux environment, its `module_init`
+//! captured for the GPU image (`build/image.rs`), which links it on UEFI. The
+//! census of the kernel services it imports that the environment does not
+//! supply, or supplies only as traps, stays: see [`OPEN`].
 //!
 //! [`super::kbuild`] refuses amdgpu's makefiles, which define variables,
 //! continue lines, branch on `ifneq`, add `subdir-ccflags-y` and include the
@@ -12,6 +13,7 @@
 //! pin fails the build until the list follows it. The services the composite
 //! reaches that nothing supplies are pinned in [`OPEN`] and written, with
 //! their importers, to `OUT_DIR/amdgpu-open-imports.txt`.
+use super::image::{self, Port};
 use super::native::{self, Linux};
 use super::nouveau::{Member, members, open_imports, traps};
 use std::{
@@ -21,6 +23,7 @@ use std::{
     thread,
 };
 use stela_c_build::linux::Module;
+use stela_c_build::linux_capture::{Scope, UnitSpec};
 
 const AMD: &str = "../../third_party/linux/drivers/gpu/drm/amd";
 const MODULE: Module<'static> = Module {
@@ -29,6 +32,21 @@ const MODULE: Module<'static> = Module {
 };
 /// The census report, under `OUT_DIR`.
 const REPORT: &str = "amdgpu-open-imports.txt";
+/// The unit of amdgpu's own `module_init`, after nouveau's in the image.
+const INITCALLS: UnitSpec = UnitSpec {
+    scope: Scope {
+        slice: "gpu",
+        group: "amdgpu",
+        group_ordinal: 10,
+        unit_ordinal: 1,
+        global_ordinal: 10,
+    },
+    source: "drivers/gpu/drm/amd/amdgpu/amdgpu_drv",
+    module: MODULE.name,
+    file: MODULE.file,
+};
+/// The registration unit's object, below `AMD`.
+const UNIT: &str = "amdgpu/amdgpu_drv";
 /// Declarations of the services Linux's headers leave undeclared under
 /// Stela's Kconfig, so the census counts them instead of failing to compile.
 const CENSUS_HEADER: &str = "src/compat/linux/stela/amdgpu_census.h";
@@ -537,10 +555,10 @@ const EXCLUDED: &[(&str, &[&str])] = &[
 
 /// The kernel services the composite imports that Stela's Linux environment
 /// lacks, or defines only as a trap, by service: the census of 2026-11-12 at
-/// Linux 7.2.12, less what the environment has supplied since. All but sscanf
-/// are traps whose definitions say why nothing on a Navi 48 board reaches
-/// them. Building fails when the imports change, so each supplied service
-/// leaves this list with its change.
+/// Linux 7.2.12, less what the environment has supplied since. All are traps
+/// whose definitions say why nothing on a Navi 48 board reaches them.
+/// Building fails when the imports change, so each supplied service leaves
+/// this list with its change.
 const OPEN: &[(&str, &[&str])] = &[
     (
         "PCI traps: a function reset Navi 48 never chooses, a message restore only MI300 makes and a search by class only APUs make",
@@ -559,10 +577,6 @@ const OPEN: &[(&str, &[&str])] = &[
             "amdgpu_xcp_drm_dev_alloc",
             "amdgpu_xcp_drm_dev_free",
         ],
-    ),
-    (
-        "formatted input: Stela's vsprintf.c has no vsscanf, and Mesa's libc compat keeps the sscanf name in the image",
-        &["sscanf"],
     ),
     (
         "interrupt domain traps: only amdgpu's VI-era and IH 6.1 handlers create one, and only ACP and ISP map into it",
@@ -607,15 +621,18 @@ const OPEN: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Compiles the composite over the nouveau port's DRM environment, writes the
+/// Compiles the composite over the nouveau port's DRM environment, with its
+/// registration unit, into its archive for the image to link; writes the
 /// services it reaches that nothing supplies to [`REPORT`] with their
 /// importers, and compares them with [`OPEN`].
-pub fn census(linux: &Linux) {
+pub fn port(linux: &Linux) -> Port {
     check_objects();
     let includes = INCLUDES.map(|directory| format!("amd/{directory}"));
     let includes = includes.iter().map(String::as_str).collect::<Vec<_>>();
+    // The registration unit is compiled below, with its registrations captured.
     let sources = OBJECTS
         .iter()
+        .filter(|object| **object != UNIT)
         .map(|object| Path::new(AMD).join(object).with_extension("c"))
         .collect::<Vec<_>>();
     let mut build = stela_c_build::native::configure();
@@ -659,9 +676,13 @@ pub fn census(linux: &Linux) {
             .flat_map(|compiling| compiling.join().expect("a compiling thread"))
             .collect::<Vec<_>>()
     });
-    build.objects(objects).compile("stela-amdgpu-census");
+    let unit = image::capture(&build, INITCALLS);
+    build
+        .objects(objects)
+        .object(unit.object())
+        .compile("stela-amdgpu");
     let output = stela_c_build::linux_build::out_dir();
-    let port = members(&output.join("libstela-amdgpu-census.a"));
+    let port = members(&output.join("libstela-amdgpu.a"));
     let open = open_imports(&port, &[&linux.archive, &linux.common_archive]);
     let report = output.join(REPORT);
     fs::write(&report, report_text(&port, &open)).expect("write the amdgpu census");
@@ -677,6 +698,11 @@ pub fn census(linux: &Linux) {
         open.is_empty() && stale.is_empty(),
         "amdgpu's imports changed: newly open {open:?}; now supplied {stale:?}"
     );
+    Port {
+        archive: "stela-amdgpu",
+        spec: INITCALLS,
+        unit,
+    }
 }
 
 /// Each open service with the composite's members that import it, or

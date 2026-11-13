@@ -1,5 +1,6 @@
-//! nouveau in a Linux environment: the initcalls that register it, DRM and the
-//! subsystems beneath them (`build/initcalls.rs`).
+//! The GPU drivers' Linux environment: the initcalls that register nouveau,
+//! amdgpu where it is built, DRM and the subsystems beneath them
+//! (`build/image.rs`).
 use core::{
     ffi::{c_int, c_void},
     ptr,
@@ -7,7 +8,7 @@ use core::{
 use stela_linux::owner::Errno;
 
 unsafe extern "C" {
-    static stela_linux_nouveau_image: c_void;
+    static stela_linux_gpu_image: c_void;
     fn stela_linux_start(image: *const c_void, registry: *mut *mut c_void) -> c_int;
 }
 
@@ -21,7 +22,7 @@ pub unsafe fn start() -> Result<(), Errno> {
     let mut registry = ptr::null_mut();
     // SAFETY: the caller's contract; the image is the build's, and the
     // registry's state lasts as long as what it started.
-    match unsafe { stela_linux_start(&raw const stela_linux_nouveau_image, &raw mut registry) } {
+    match unsafe { stela_linux_start(&raw const stela_linux_gpu_image, &raw mut registry) } {
         0 => Ok(()),
         error => Err(error),
     }
