@@ -135,6 +135,7 @@ enum Consumer {
     IntelRsa,
     Wifi,
     Nouveau,
+    Amdgpu,
 }
 
 const fn realtek(
@@ -999,6 +1000,142 @@ pub fn require_gsp(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
     }
 }
 
+/// linux-firmware 20261019, its newest tag when the amdgpu recipes were
+/// pinned.
+pub const AMDGPU_REVISION: &str = "a2dcb924f0897368b0b4f305cbf9808cdda90ce0";
+
+const AMDGPU_LICENSE: Artifact = Artifact {
+    source: LINUX_FIRMWARE,
+    revision: AMDGPU_REVISION,
+    member: "LICENSES/LICENSE.amdgpu",
+    length: 2938,
+    sha256: "572872598565dc3513470de971a32bf9db301f47afeef3636345eadae33b2eee",
+};
+
+const fn amdgpu(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: AMDGPU_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license: &AMDGPU_LICENSE,
+        consumer: Consumer::Amdgpu,
+    }
+}
+
+/// The files amdgpu asks for on Navi 48, named by its IP blocks' versions:
+/// GC 12.0.1, PSP and SMU 14.0.3, SDMA 7.0.1 and VCN 5.0.0. MES runs one
+/// image for both its pipes (`amdgpu_uni_mes`, on by default), and the PSP
+/// loads the rest, so GC's table of contents for RLC's backdoor load is not
+/// asked for. Neither is the display's DMCUB, which amdgpu loads only with
+/// its display core, nor the "kicker" images of 1002:7551 rev C8
+/// (`amdgpu_is_kicker_fw`).
+pub const AMDGPU: &[Recipe] = &[
+    amdgpu(
+        "amdgpu/gc_12_0_1_imu.bin",
+        132352,
+        "b3b301fb636efc77b63ce4d2ced0f90c851d03c19681852faa45598e6f5773fd",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_me.bin",
+        267600,
+        "fd5eb0f205a3bb7ec41f42e83a54bdc69151706b02bbee073fa775b8270e4bec",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_mec.bin",
+        259584,
+        "83fe5e7bffe639ec9771219cde5c9809689168f769b147c86dfd5a1ca991c1a2",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_pfp.bin",
+        159616,
+        "490bcd26a62e389b3f58acf5c087d324d2324b3188797ff6a36b7a6cdf1ca9ff",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_rlc.bin",
+        150848,
+        "6ba4459532246a5c415d3cb33c9b1248294e48f67b827e2accb292a8d1a5c0ec",
+    ),
+    amdgpu(
+        "amdgpu/gc_12_0_1_uni_mes.bin",
+        299408,
+        "309d60ad4a0210f8a68e27cae88beddb22b5ae900d70848b1e8ca0eac9d1decd",
+    ),
+    amdgpu(
+        "amdgpu/psp_14_0_3_sos.bin",
+        435632,
+        "28469a0857c813c54a0492423cdf0b0caf757428400036377e19c47e5af62478",
+    ),
+    amdgpu(
+        "amdgpu/psp_14_0_3_ta.bin",
+        291372,
+        "fff8b0b56f21bf1d34c8d1fcf6cc903c2dbb5ef88eb06157c9f08baf95124883",
+    ),
+    amdgpu(
+        "amdgpu/sdma_7_0_1.bin",
+        47104,
+        "73c29e1c1714ebc95d2221ba56e187910902891593010653bf9518937e414a59",
+    ),
+    amdgpu(
+        "amdgpu/smu_14_0_3.bin",
+        333236,
+        "7624724231b0986b59f59705e7c854c482193f6b3b591ebdda58cb62af81c010",
+    ),
+    amdgpu(
+        "amdgpu/vcn_5_0_0.bin",
+        440400,
+        "9a0ab35bf157c835cbbc4a207ba819ea0111e2a65fe7f8c20910ffff3122f903",
+    ),
+];
+
+/// The target amdgpu's requests carry.
+const AMDGPU_TARGET: Target<'static> = Target {
+    driver: "amdgpu",
+    hardware: "amd",
+    revision: "linux-firmware",
+    board: None,
+};
+
+/// The chip of an AMD GPU with PCI device ID `device` that Stela's amdgpu
+/// runs, by AMD's name for it: Navi 48, the Radeon RX 9070 and 9070 XT,
+/// whose 1002:7550 is the one checked on hardware. Navi 48's 1002:7551
+/// boards would need the kicker images.
+pub fn amd_chip(device: u16) -> Option<&'static str> {
+    (device == 0x7550).then_some("navi48")
+}
+
+/// Requires the files amdgpu asks for on `chip`, named as [`amd_chip`] names
+/// chips.
+pub fn require_amdgpu(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
+    if chip != "navi48" {
+        return Err(Error(format!("{chip} is no chip Stela's amdgpu runs")));
+    }
+    for recipe in AMDGPU {
+        inventory.observe(Requirement {
+            name: recipe.image.member,
+            target: AMDGPU_TARGET,
+            minimum_bytes: 1,
+        })?;
+    }
+    Ok(())
+}
+
+/// amdgpu's request for one of its files, whose name is the file's in
+/// linux-firmware.
+fn select_amdgpu(request: &Request) -> Option<&'static Recipe> {
+    if request.target.hardware != AMDGPU_TARGET.hardware
+        || request.target.revision != AMDGPU_TARGET.revision
+    {
+        return None;
+    }
+    AMDGPU
+        .iter()
+        .find(|recipe| recipe.image.member == request.name)
+}
+
 /// Requires what a Wi-Fi adapter with these PCI IDs loads, under the binding
 /// its driver takes when the USB has none for the observed adapter:
 /// - a MediaTek chip's two images under the chip's binding
@@ -1361,6 +1498,7 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "mediatek-bluetooth-usb-mt79xx-v1" => select_mediatek_bluetooth(request),
         "realtek-wifi" => select_realtek_wifi(request),
         "nouveau" => select_gsp(request),
+        "amdgpu" => select_amdgpu(request),
         _ => None,
     }
 }
@@ -1550,6 +1688,35 @@ mod tests {
         for device in stela_driver_net::realtek::PCI_DEVICES {
             assert!(pinned.contains(device) || *device == 0x8169, "{device:04x}");
         }
+    }
+
+    #[test]
+    fn navi48_requires_every_file_amdgpu_asks_for_and_nothing_else() {
+        assert_eq!(amd_chip(0x7550), Some("navi48"));
+        // A Ryzen 7000's integrated Raphael and Navi 44 are not run.
+        assert_eq!(amd_chip(0x164e), None);
+        assert_eq!(amd_chip(0x7590), None);
+        let mut inventory = Inventory::default();
+        require_amdgpu(&mut inventory, "navi48").unwrap();
+        let plan = Plan::select(&inventory).unwrap();
+        assert_eq!(plan.selections().len(), AMDGPU.len());
+        for selection in plan.selections() {
+            assert_eq!(selection.request.name, selection.recipe.image.member);
+            assert_eq!(selection.request.target.driver, "amdgpu");
+            assert!(selection.recipe.image.url().contains(AMDGPU_REVISION));
+            assert_eq!(selection.recipe.license.member, "LICENSES/LICENSE.amdgpu");
+        }
+        // One shared notice beside the eleven images.
+        assert_eq!(plan.artifacts().len(), AMDGPU.len() + 1);
+        let mut other = Inventory::default();
+        assert!(require_amdgpu(&mut other, "navi44").is_err());
+        assert!(other.requests().is_empty());
+        // The same name under another driver's target is no amdgpu request.
+        let request = serde_json::json!({"schema":1,"complete":true,"requirements":[{
+            "name":"amdgpu/gc_12_0_1_me.bin","target":{"driver":"amdgpu","hardware":"nvidia",
+            "revision":"linux-firmware","board":null},"minimum_bytes":1}]});
+        let inventory = Inventory::parse(&serde_json::to_vec(&request).unwrap()).unwrap();
+        assert!(Plan::select(&inventory).is_err());
     }
 
     /// The pinned member answering an r8152 request, if the request is

@@ -34,7 +34,7 @@ pub const TARGET: driver::Target<'static> = driver::Target {
 
 /// Every recipe family, in the order a volume short of room keeps them: the
 /// small network and Bluetooth files first, the GPU's large images last.
-pub const FAMILIES: [(&str, &[Recipe]); 9] = [
+pub const FAMILIES: [(&str, &[Recipe]); 10] = [
     ("Wi-Fi regulatory database", recipes::REGULATORY),
     ("Realtek Ethernet", recipes::REALTEK),
     ("Realtek USB Ethernet", recipes::REALTEK_USB),
@@ -43,6 +43,7 @@ pub const FAMILIES: [(&str, &[Recipe]); 9] = [
     ("Intel Wi-Fi", recipes::INTEL_WIFI),
     ("MediaTek Bluetooth", recipes::MEDIATEK_BLUETOOTH),
     ("Intel Bluetooth", recipes::INTEL_RSA),
+    ("AMD amdgpu", recipes::AMDGPU),
     ("NVIDIA GSP-RM", recipes::GSP),
 ];
 
@@ -363,6 +364,16 @@ pub fn select(functions: &[Pci]) -> Selection {
                         selection.unknown.push(why.clone());
                     }
                 }
+            }
+            continue;
+        }
+        // amdgpu runs Navi 48 only; the PC's other AMD display adapters,
+        // such as a Ryzen's integrated GPU, need nothing from the bundle.
+        if function.vendor == 0x1002 && function.class == 0x03 {
+            if let Some(chip) = recipes::amd_chip(function.device)
+                && recipes::require_amdgpu(&mut inventory, chip).is_ok()
+            {
+                selection.plan(&inventory, &why);
             }
             continue;
         }
