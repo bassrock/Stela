@@ -5,8 +5,11 @@
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
+#include <linux/bits.h>
 #include <linux/io.h>
+#include <linux/log2.h>
 #include <linux/pci.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
 #include <stela/device.h>
 #include <stela/linux.h>
@@ -36,6 +39,13 @@ const struct pci_device_id *pci_match_id(const struct pci_device_id *ids, struct
 STELA_UNSUPPORTED(int, pcim_enable_device, struct pci_dev *)
 STELA_UNSUPPORTED(int, pci_wait_for_pending_transaction, struct pci_dev *)
 STELA_UNSUPPORTED(int, pci_wake_from_d3, struct pci_dev *, bool)
+/* A function reset, which the owner does not offer and amdgpu reaches only
+ * through its `pci` reset method; a message's register restore, which only
+ * MI300's power table reaches; and the search by class, which only APUs and
+ * the ATPX handler use. */
+STELA_UNSUPPORTED(int, pci_reset_function, struct pci_dev *)
+STELA_UNSUPPORTED(void, pci_restore_msi_state, struct pci_dev *)
+STELA_UNSUPPORTED(struct pci_dev *, pci_get_class, unsigned int, struct pci_dev *)
 
 /* Configuration space, through the bus's pci_ops, following
  * drivers/pci/access.c. Linux code runs in one context at a time, so
@@ -134,6 +144,335 @@ u8 pci_find_capability(struct pci_dev *dev, int cap)
     if (stela_linux_pci_find_capability(dev, cap, &found))
         stela_linux_fatal("PCI capability access failed without a result");
     return found;
+}
+
+/* The configuration space's size, following drivers/pci/probe.c for a
+ * function that is no virtual function, without quirks: a host bridge, a
+ * PCI Express function or a PCI-X 266/533 one has the extended space when
+ * its first dword reads as other than an error. */
+static int pci_cfg_space_size_ext(struct pci_dev *dev)
+{
+	u32 status;
+
+	if (pci_read_config_dword(dev, PCI_CFG_SPACE_SIZE, &status) != PCIBIOS_SUCCESSFUL)
+		return PCI_CFG_SPACE_SIZE;
+	if (PCI_POSSIBLE_ERROR(status))
+		return PCI_CFG_SPACE_SIZE;
+	return PCI_CFG_SPACE_EXP_SIZE;
+}
+
+int pci_cfg_space_size(struct pci_dev *dev)
+{
+	u32 status;
+	u8 pos;
+
+	if (dev->bus->bus_flags & PCI_BUS_FLAGS_NO_EXTCFG)
+		return PCI_CFG_SPACE_SIZE;
+	if ((dev->class >> 8) == PCI_CLASS_BRIDGE_HOST || pci_is_pcie(dev))
+		return pci_cfg_space_size_ext(dev);
+	if (stela_linux_pci_find_capability(dev, PCI_CAP_ID_PCIX, &pos) || !pos)
+		return PCI_CFG_SPACE_SIZE;
+	/* A failed read leaves all ones, as Linux's does. */
+	pci_read_config_dword(dev, pos + PCI_X_STATUS, &status);
+	if (status & (PCI_X_STATUS_266MHZ | PCI_X_STATUS_533MHZ))
+		return pci_cfg_space_size_ext(dev);
+	return PCI_CFG_SPACE_SIZE;
+}
+
+/* The extended capability list's entry for cap, or 0, following
+ * drivers/pci/pci.c: none in a space that ends at the standard header; an
+ * empty header ends the list and the bound stops a looped one. */
+u16 pci_find_ext_capability(struct pci_dev *dev, int cap)
+{
+	u16 pos = PCI_CFG_SPACE_SIZE;
+	u32 header;
+
+	if (dev->cfg_size <= PCI_CFG_SPACE_SIZE)
+		return 0;
+	for (int ttl = (PCI_CFG_SPACE_EXP_SIZE - PCI_CFG_SPACE_SIZE) / 8;
+	     ttl-- > 0 && pos >= PCI_CFG_SPACE_SIZE;) {
+		if (pci_read_config_dword(dev, pos, &header) != PCIBIOS_SUCCESSFUL)
+			break;
+		if (header == 0)
+			break;
+		if (PCI_EXT_CAP_ID(header) == (u32)cap)
+			return pos;
+		pos = (u16)PCI_EXT_CAP_NEXT(header);
+	}
+	return 0;
+}
+
+/* PCI Express capability registers, following drivers/pci/access.c: a
+ * register the function's port type or capability version leaves out reads
+ * as zero without an access. The port type and version are the flags the
+ * attach cached. */
+static int pcie_cap_version(const struct pci_dev *dev)
+{
+	return pcie_caps_reg(dev) & PCI_EXP_FLAGS_VERS;
+}
+
+static bool pcie_downstream_port(const struct pci_dev *dev)
+{
+	int type = pci_pcie_type(dev);
+
+	return type == PCI_EXP_TYPE_ROOT_PORT || type == PCI_EXP_TYPE_DOWNSTREAM ||
+	       type == PCI_EXP_TYPE_PCIE_BRIDGE;
+}
+
+static bool pcie_cap_has_lnkctl(const struct pci_dev *dev)
+{
+	int type = pci_pcie_type(dev);
+
+	return type == PCI_EXP_TYPE_ENDPOINT || type == PCI_EXP_TYPE_LEG_END ||
+	       type == PCI_EXP_TYPE_ROOT_PORT || type == PCI_EXP_TYPE_UPSTREAM ||
+	       type == PCI_EXP_TYPE_DOWNSTREAM || type == PCI_EXP_TYPE_PCI_BRIDGE ||
+	       type == PCI_EXP_TYPE_PCIE_BRIDGE;
+}
+
+static bool pcie_cap_has_lnkctl2(const struct pci_dev *dev)
+{
+	return pcie_cap_has_lnkctl(dev) && pcie_cap_version(dev) > 1;
+}
+
+static bool pcie_cap_has_sltctl(const struct pci_dev *dev)
+{
+	return pcie_downstream_port(dev) && (pcie_caps_reg(dev) & PCI_EXP_FLAGS_SLOT);
+}
+
+static bool pcie_cap_has_rtctl(const struct pci_dev *dev)
+{
+	int type = pci_pcie_type(dev);
+
+	return type == PCI_EXP_TYPE_ROOT_PORT || type == PCI_EXP_TYPE_RC_EC;
+}
+
+static bool pcie_capability_reg_implemented(struct pci_dev *dev, int pos)
+{
+	if (!pci_is_pcie(dev))
+		return false;
+	switch (pos) {
+	case PCI_EXP_FLAGS:
+	case PCI_EXP_DEVCAP:
+	case PCI_EXP_DEVCTL:
+	case PCI_EXP_DEVSTA:
+		return true;
+	case PCI_EXP_LNKCAP:
+	case PCI_EXP_LNKCTL:
+	case PCI_EXP_LNKSTA:
+		return pcie_cap_has_lnkctl(dev);
+	case PCI_EXP_SLTCAP:
+	case PCI_EXP_SLTCTL:
+	case PCI_EXP_SLTSTA:
+		return pcie_cap_has_sltctl(dev);
+	case PCI_EXP_RTCTL:
+	case PCI_EXP_RTCAP:
+	case PCI_EXP_RTSTA:
+		return pcie_cap_has_rtctl(dev);
+	case PCI_EXP_DEVCAP2:
+	case PCI_EXP_DEVCTL2:
+		return pcie_cap_version(dev) > 1;
+	case PCI_EXP_LNKCAP2:
+	case PCI_EXP_LNKCTL2:
+	case PCI_EXP_LNKSTA2:
+		return pcie_cap_has_lnkctl2(dev);
+	default:
+		return false;
+	}
+}
+
+/* A downstream port without a slot reads its presence as detected
+ * (PCIe Base Spec 3.0, sec 7.8). */
+static bool pcie_presence_hardwired(struct pci_dev *dev, int pos)
+{
+	return pci_is_pcie(dev) && pcie_downstream_port(dev) && pos == PCI_EXP_SLTSTA;
+}
+
+int pcie_capability_read_word(struct pci_dev *dev, int pos, u16 *val)
+{
+	*val = 0;
+	if (pos & 1)
+		return PCIBIOS_BAD_REGISTER_NUMBER;
+	if (pcie_capability_reg_implemented(dev, pos)) {
+		int error = pci_read_config_word(dev, pci_pcie_cap(dev) + pos, val);
+
+		if (error)
+			*val = 0;
+		return error;
+	}
+	if (pcie_presence_hardwired(dev, pos))
+		*val = PCI_EXP_SLTSTA_PDS;
+	return 0;
+}
+
+int pcie_capability_read_dword(struct pci_dev *dev, int pos, u32 *val)
+{
+	*val = 0;
+	if (pos & 3)
+		return PCIBIOS_BAD_REGISTER_NUMBER;
+	if (pcie_capability_reg_implemented(dev, pos)) {
+		int error = pci_read_config_dword(dev, pci_pcie_cap(dev) + pos, val);
+
+		if (error)
+			*val = 0;
+		return error;
+	}
+	if (pcie_presence_hardwired(dev, pos))
+		*val = PCI_EXP_SLTSTA_PDS;
+	return 0;
+}
+
+/* The payload and link capabilities, following drivers/pci/pci.c. A function
+ * without the registers reports 128 bytes and an unknown link. */
+int pcie_get_mps(struct pci_dev *dev)
+{
+	u16 control;
+
+	pcie_capability_read_word(dev, PCI_EXP_DEVCTL, &control);
+	return 128 << ((control & PCI_EXP_DEVCTL_PAYLOAD) >> 5);
+}
+
+/* The supported link speeds vector, which the attach caches as Linux's probe
+ * does: Link Capabilities 2's speeds up to the Max Link Speed, or before
+ * r3.0 the speeds that maximum implies. */
+u8 pcie_get_supported_speeds(struct pci_dev *dev)
+{
+	u32 lnkcap2, lnkcap;
+	u8 speeds;
+
+	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP2, &lnkcap2);
+	speeds = (u8)(lnkcap2 & PCI_EXP_LNKCAP2_SLS);
+	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP, &lnkcap);
+	speeds = (u8)(speeds & GENMASK(lnkcap & PCI_EXP_LNKCAP_SLS, 0));
+	if (speeds)
+		return speeds;
+	if ((lnkcap & PCI_EXP_LNKCAP_SLS) == PCI_EXP_LNKCAP_SLS_5_0GB)
+		speeds = PCI_EXP_LNKCAP2_SLS_5_0GB | PCI_EXP_LNKCAP2_SLS_2_5GB;
+	else if ((lnkcap & PCI_EXP_LNKCAP_SLS) == PCI_EXP_LNKCAP_SLS_2_5GB)
+		speeds = PCI_EXP_LNKCAP2_SLS_2_5GB;
+	return speeds;
+}
+
+enum pci_bus_speed pcie_get_speed_cap(struct pci_dev *dev)
+{
+	u8 speeds = dev->supported_speeds;
+
+	if (speeds & PCI_EXP_LNKCAP2_SLS_64_0GB)
+		return PCIE_SPEED_64_0GT;
+	if (speeds & PCI_EXP_LNKCAP2_SLS_32_0GB)
+		return PCIE_SPEED_32_0GT;
+	if (speeds & PCI_EXP_LNKCAP2_SLS_16_0GB)
+		return PCIE_SPEED_16_0GT;
+	if (speeds & PCI_EXP_LNKCAP2_SLS_8_0GB)
+		return PCIE_SPEED_8_0GT;
+	if (speeds & PCI_EXP_LNKCAP2_SLS_5_0GB)
+		return PCIE_SPEED_5_0GT;
+	if (speeds & PCI_EXP_LNKCAP2_SLS_2_5GB)
+		return PCIE_SPEED_2_5GT;
+	return PCI_SPEED_UNKNOWN;
+}
+
+enum pcie_link_width pcie_get_width_cap(struct pci_dev *dev)
+{
+	u32 lnkcap;
+
+	pcie_capability_read_dword(dev, PCI_EXP_LNKCAP, &lnkcap);
+	if (lnkcap)
+		return (enum pcie_link_width)((lnkcap & PCI_EXP_LNKCAP_MLW) >> 4);
+	return PCIE_LNK_WIDTH_UNKNOWN;
+}
+
+/* AtomicOp requests, following drivers/pci/pci.c: an endpoint may make them
+ * when its root port completes them and every switch port on the way routes
+ * them. The owner presents no bridge above a function, so no root port is
+ * found and, as under a hypervisor that hides it, requests are on only if
+ * the firmware turned them on. */
+int pci_enable_atomic_ops_to_root(struct pci_dev *dev, u32 cap_mask)
+{
+	u32 ctl2;
+
+	(void)cap_mask;
+	if (dev->is_virtfn || !pci_is_pcie(dev))
+		return -EINVAL;
+	switch (pci_pcie_type(dev)) {
+	case PCI_EXP_TYPE_ENDPOINT:
+	case PCI_EXP_TYPE_LEG_END:
+		break;
+	default:
+		return -EINVAL;
+	}
+	if (pcie_find_root_port(dev))
+		stela_linux_fatal("PCI AtomicOp routing through a presented bridge");
+	pcie_capability_read_dword(dev, PCI_EXP_DEVCTL2, &ctl2);
+	return ctl2 & PCI_EXP_DEVCTL2_ATOMIC_REQ ? 0 : -EINVAL;
+}
+
+/* Resizable BARs, following drivers/pci/rebar.c: a size is a power of two
+ * from 1 MB, encoded as its exponent above that. The capability is read
+ * where the attach found it, as Linux's probe records it. */
+#define PCI_REBAR_MIN_SIZE ((resource_size_t)SZ_1M)
+
+int pci_rebar_bytes_to_size(u64 bytes)
+{
+	int rebar_minsize = ilog2(PCI_REBAR_MIN_SIZE);
+
+	bytes = roundup_pow_of_two(bytes);
+	return max(ilog2(bytes), rebar_minsize) - rebar_minsize;
+}
+
+/* The capability's control register for bar. A failed read leaves all ones,
+ * as Linux's does. */
+static int pci_rebar_find_pos(struct pci_dev *pdev, int bar)
+{
+	unsigned int pos = pdev->rebar_cap, bars;
+	u32 control;
+
+	if (!pos)
+		return -ENOTSUPP;
+	pci_read_config_dword(pdev, (int)pos + PCI_REBAR_CTRL, &control);
+	bars = (control & PCI_REBAR_CTRL_NBAR_MASK) >> PCI_REBAR_CTRL_NBAR_SHIFT;
+	for (unsigned int i = 0; i < bars; i++, pos += 8) {
+		pci_read_config_dword(pdev, (int)pos + PCI_REBAR_CTRL, &control);
+		if ((int)(control & PCI_REBAR_CTRL_BAR_IDX) == bar)
+			return (int)pos;
+	}
+	return -ENOENT;
+}
+
+u64 pci_rebar_get_possible_sizes(struct pci_dev *pdev, int bar)
+{
+	int pos = pci_rebar_find_pos(pdev, bar);
+	u32 cap;
+
+	if (pos < 0)
+		return 0;
+	pci_read_config_dword(pdev, pos + PCI_REBAR_CAP, &cap);
+	cap = (cap & PCI_REBAR_CAP_SIZES) >> 4;
+	/* Sapphire RX 5600 XT Pulse has an invalid cap dword for BAR 0 */
+	if (pdev->vendor == PCI_VENDOR_ID_ATI && pdev->device == 0x731f && bar == 0 &&
+	    cap == 0x700)
+		return 0x3f00;
+	return cap;
+}
+
+int pci_rebar_get_max_size(struct pci_dev *pdev, int bar)
+{
+	u64 sizes = pci_rebar_get_possible_sizes(pdev, bar);
+
+	if (!sizes)
+		return -ENOENT;
+	return (int)__fls(sizes);
+}
+
+/* A resize, which drivers/pci/rebar.c refuses when the host bridge must
+ * preserve the firmware's assignment: the owner placed the function's
+ * windows, and nothing reassigns them. */
+int pci_resize_resource(struct pci_dev *dev, int i, int size, int exclude_bars)
+{
+	(void)dev;
+	(void)i;
+	(void)size;
+	(void)exclude_bars;
+	return -ENOTSUPP;
 }
 
 const struct bus_type pci_bus_type = {.name = "pci"};
@@ -284,6 +623,37 @@ void pci_restore_state(struct pci_dev *dev)
     dev->state_saved = false;
 }
 
+/* A copy of the saved header a driver keeps across resets and frees,
+ * following drivers/pci/pci.c; loading it makes it the state to restore.
+ * pci_save_state above saves no capability state, so the copy is the
+ * header alone. */
+struct pci_saved_state {
+	u32 config_space[16];
+};
+
+struct pci_saved_state *pci_store_saved_state(struct pci_dev *dev)
+{
+	struct pci_saved_state *state;
+
+	if (!dev->state_saved)
+		return NULL;
+	state = kmalloc_obj(*state);
+	if (!state)
+		return NULL;
+	memcpy(state->config_space, dev->saved_config_space, sizeof(state->config_space));
+	return state;
+}
+
+int pci_load_saved_state(struct pci_dev *dev, struct pci_saved_state *state)
+{
+	dev->state_saved = false;
+	if (!state)
+		return 0;
+	memcpy(dev->saved_config_space, state->config_space, sizeof(state->config_space));
+	dev->state_saved = true;
+	return 0;
+}
+
 /* The power management capability's D-state, with the settling time D3hot
  * transitions need. A function without the capability stays in D0. */
 int pci_set_power_state(struct pci_dev *dev, pci_power_t state)
@@ -336,6 +706,26 @@ struct pci_dev *pci_get_domain_bus_and_slot(int domain, unsigned int bus, unsign
 		if (pci_domain_nr(dev->bus) == domain && dev->bus->number == bus &&
 		    dev->devfn == devfn)
 			return pci_dev_get(dev);
+	return NULL;
+}
+
+/* A bus's windows, following drivers/pci/bus.c: its bridge's, then those
+ * added to its list. The owner's root bus has neither. */
+struct pci_bus_resource {
+	struct list_head list;
+	struct resource *res;
+};
+
+struct resource *pci_bus_resource_n(const struct pci_bus *bus, int n)
+{
+	struct pci_bus_resource *bus_res;
+
+	if (n < PCI_BRIDGE_RESOURCE_NUM)
+		return bus->resource[n];
+	n -= PCI_BRIDGE_RESOURCE_NUM;
+	list_for_each_entry(bus_res, &bus->resources, list)
+		if (n-- == 0)
+			return bus_res->res;
 	return NULL;
 }
 
@@ -404,6 +794,34 @@ void pci_set_master(struct pci_dev *dev)
                      command);
     }
     dev->is_busmaster = 1;
+}
+
+void pci_clear_master(struct pci_dev *dev)
+{
+	u16 command;
+
+	if (pci_read_config_word(dev, PCI_COMMAND, &command))
+		stela_linux_fatal("PCI bus-master access failed without completion");
+	if ((command & PCI_COMMAND_MASTER) &&
+	    pci_write_config_word(dev, PCI_COMMAND, command & (u16)~PCI_COMMAND_MASTER))
+		stela_linux_fatal("PCI bus-master access failed without completion");
+	dev->is_busmaster = 0;
+}
+
+/* The function's line, following drivers/pci/pci.c: the command
+ * register's INTx disable bit. */
+void pci_intx(struct pci_dev *pdev, int enable)
+{
+	u16 command, new;
+
+	if (pci_read_config_word(pdev, PCI_COMMAND, &command))
+		stela_linux_fatal("PCI INTx access failed without completion");
+	if (enable)
+		new = command & (u16)~PCI_COMMAND_INTX_DISABLE;
+	else
+		new = command | PCI_COMMAND_INTX_DISABLE;
+	if (new != command && pci_write_config_word(pdev, PCI_COMMAND, new))
+		stela_linux_fatal("PCI INTx access failed without completion");
 }
 
 /* Option ROMs, following drivers/pci/rom.c. The owner assigned the ROM
@@ -498,7 +916,7 @@ void pci_unmap_rom(struct pci_dev *pdev, void __iomem *rom)
 #include <stela/linux.h>
 #include <stela/test.h>
 
-static u8 config[256];
+static u8 config[PCI_CFG_SPACE_EXP_SIZE];
 static int config_error;
 static bool ignore_bus_master_write;
 static unsigned int warnings;
@@ -570,10 +988,17 @@ static void one_image(u8 *image, unsigned int blocks, bool last)
 
 static struct pci_dev dev, absent;
 
+/* An extended capability header: id, version 1, the next entry's offset. */
+static void ext_capability(unsigned int pos, unsigned int id, unsigned int next)
+{
+	*(u32 *)&config[pos] = id | (1u << 16) | (next << 20);
+}
+
 int main(void)
 {
 	stela_linux_enter(&owner);
 	struct pci_bus bus = {.ops = &ops, .number = 3};
+	INIT_LIST_HEAD(&bus.resources);
 	dev.bus = &bus;
 	dev.devfn = PCI_DEVFN(1, 0);
 	dev.hdr_type = PCI_HEADER_TYPE_NORMAL;
@@ -647,8 +1072,140 @@ int main(void)
 	/* No ROM signature: nothing maps and decoding goes back off. */
 	rom_window[0] = 0;
 	assert(!pci_map_rom(&dev, &size) && *(u32 *)&config[PCI_ROM_ADDRESS] == 0xc0000000);
+
+	/* PCI Express registers of a version 2 endpoint at 0x60: a payload of
+	 * 256 bytes, an x16 link whose Max Link Speed of 16 GT/s bounds the
+	 * speeds Link Capabilities 2 lists; the slot registers an endpoint
+	 * lacks read as zero, an odd offset is refused. */
+	dev.pcie_cap = 0x60;
+	dev.pcie_flags_reg = 0x0002;
+	config[0x60 + PCI_EXP_DEVCTL] = 0x20;
+	*(u32 *)&config[0x60 + PCI_EXP_LNKCAP] = 0x104u;
+	*(u32 *)&config[0x60 + PCI_EXP_LNKCAP2] = 0x3eu;
+	u16 word = 0xffff;
+	assert(!pcie_capability_read_word(&dev, PCI_EXP_DEVCTL, &word) && word == 0x20);
+	assert(!pcie_capability_read_word(&dev, PCI_EXP_SLTSTA, &word) && !word);
+	assert(pcie_capability_read_word(&dev, PCI_EXP_DEVCTL + 1, &word) ==
+	       PCIBIOS_BAD_REGISTER_NUMBER);
+	assert(pcie_get_mps(&dev) == 256);
+	dev.supported_speeds = pcie_get_supported_speeds(&dev);
+	assert(dev.supported_speeds == 0x1e && pcie_get_speed_cap(&dev) == PCIE_SPEED_16_0GT);
+	assert(pcie_get_width_cap(&dev) == PCIE_LNK_X16);
+	/* Before r3.0, the speeds the maximum of 5 GT/s implies. */
+	*(u32 *)&config[0x60 + PCI_EXP_LNKCAP2] = 0;
+	*(u32 *)&config[0x60 + PCI_EXP_LNKCAP] = 0x102u;
+	dev.supported_speeds = pcie_get_supported_speeds(&dev);
+	assert(dev.supported_speeds == 0x06 && pcie_get_speed_cap(&dev) == PCIE_SPEED_5_0GT);
+	/* AtomicOps: with no root port presented, on only if the firmware set
+	 * them; never for a port. */
+	const u32 atomics = PCI_EXP_DEVCAP2_ATOMIC_COMP32 | PCI_EXP_DEVCAP2_ATOMIC_COMP64;
+	assert(pci_enable_atomic_ops_to_root(&dev, atomics) == -EINVAL);
+	assert(!config[0x60 + PCI_EXP_DEVCTL2]);
+	config[0x60 + PCI_EXP_DEVCTL2] = PCI_EXP_DEVCTL2_ATOMIC_REQ;
+	assert(!pci_enable_atomic_ops_to_root(&dev, atomics));
+	/* A downstream port without a slot: presence detected, no access. */
+	dev.pcie_flags_reg = 0x0062;
+	assert(pci_enable_atomic_ops_to_root(&dev, atomics) == -EINVAL);
+	assert(!pcie_capability_read_word(&dev, PCI_EXP_SLTSTA, &word) &&
+	       word == PCI_EXP_SLTSTA_PDS);
+	config[0x60 + PCI_EXP_DEVCTL2] = 0;
+	dev.pcie_flags_reg = 0x0002;
+	/* Without the capability, nothing reads: a 128-byte payload, an unknown link. */
+	dev.pcie_cap = 0;
+	dev.pcie_flags_reg = 0;
+	assert(!pcie_capability_read_word(&dev, PCI_EXP_DEVCTL, &word) && !word);
+	assert(pcie_get_mps(&dev) == 128 && pcie_get_width_cap(&dev) == PCIE_LNK_WIDTH_UNKNOWN);
+	dev.supported_speeds = 0;
+	assert(pcie_get_speed_cap(&dev) == PCI_SPEED_UNKNOWN);
+
+	/* The extended space of a PCI Express function: there unless its first
+	 * dword fails or reads as all ones; a conventional one has none. */
+	dev.pcie_cap = 0x60;
+	dev.pcie_flags_reg = 0x0002;
+	assert(pci_cfg_space_size(&dev) == PCI_CFG_SPACE_EXP_SIZE);
+	*(u32 *)&config[0x100] = ~0u;
+	assert(pci_cfg_space_size(&dev) == PCI_CFG_SPACE_SIZE);
+	config_error = PCIBIOS_SET_FAILED;
+	assert(pci_cfg_space_size(&dev) == PCI_CFG_SPACE_SIZE);
+	config_error = 0;
+	dev.cfg_size = PCI_CFG_SPACE_SIZE;
+	assert(!pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_VNDR));
+
+	/* Extended capabilities: vendor-specific at 0x100, Resizable BAR at
+	 * 0x150 with BAR 0 up to 16 GB. An empty first header means none; a
+	 * looped list stops. Nothing resizes. */
+	ext_capability(0x100, PCI_EXT_CAP_ID_VNDR, 0x150);
+	ext_capability(0x150, PCI_EXT_CAP_ID_REBAR, 0);
+	*(u32 *)&config[0x150 + PCI_REBAR_CAP] = 0x7fffu << 4;
+	*(u32 *)&config[0x150 + PCI_REBAR_CTRL] = 1u << PCI_REBAR_CTRL_NBAR_SHIFT;
+	dev.cfg_size = pci_cfg_space_size(&dev);
+	assert(dev.cfg_size == PCI_CFG_SPACE_EXP_SIZE);
+	assert(pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_VNDR) == 0x100);
+	assert(pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_REBAR) == 0x150);
+	assert(!pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_LTR));
+	assert(pci_rebar_bytes_to_size(1) == 0 && pci_rebar_bytes_to_size((256u << 20) + 1) == 9);
+	assert(pci_rebar_bytes_to_size(16ull << 30) == 14);
+	assert(!pci_rebar_get_possible_sizes(&dev, 0));
+	assert(pci_rebar_get_max_size(&dev, 0) == -ENOENT);
+	dev.rebar_cap = pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_REBAR);
+	assert(pci_rebar_get_possible_sizes(&dev, 0) == 0x7fffu);
+	assert(pci_rebar_get_max_size(&dev, 0) == 14 && pci_rebar_get_max_size(&dev, 2) == -ENOENT);
+	assert(pci_resize_resource(&dev, 0, 14, 1 << 5) == -ENOTSUPP);
+	ext_capability(0x100, PCI_EXT_CAP_ID_VNDR, 0x100);
+	assert(!pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_LTR));
+	*(u32 *)&config[0x100] = 0;
+	assert(!pci_find_ext_capability(&dev, PCI_EXT_CAP_ID_VNDR));
+	dev.rebar_cap = 0;
+	dev.pcie_cap = 0;
+	dev.pcie_flags_reg = 0;
+
+	/* The saved header is stored and loaded; nothing saved stores nothing. */
+	dev.state_saved = false;
+	assert(!pci_store_saved_state(&dev));
+	assert(!pci_save_state(&dev));
+	struct pci_saved_state *saved = pci_store_saved_state(&dev);
+
+	assert(saved && !memcmp(saved->config_space, dev.saved_config_space,
+				sizeof(saved->config_space)));
+	dev.saved_config_space[1] = 0xdeadbeef;
+	dev.state_saved = false;
+	assert(!pci_load_saved_state(&dev, saved) && dev.state_saved);
+	assert(dev.saved_config_space[1] == saved->config_space[1]);
+	assert(!pci_load_saved_state(&dev, NULL) && !dev.state_saved);
+	kfree(saved);
+
+	/* A bus's windows: its bridge's, then its list; this root has none. */
+	struct resource *res;
+	unsigned int i;
+
+	pci_bus_for_each_resource(&bus, res, i)
+		assert(!res);
+	assert(i == PCI_BRIDGE_RESOURCE_NUM && !res);
+	struct resource window = {.start = 0x200000000ull, .end = 0x2ffffffffull,
+				  .flags = IORESOURCE_MEM | IORESOURCE_MEM_64};
+	struct pci_bus_resource extra = {.res = &window};
+
+	bus.resource[1] = &window;
+	list_add_tail(&extra.list, &bus.resources);
+	assert(pci_bus_resource_n(&bus, 1) == &window && !pci_bus_resource_n(&bus, 2));
+	assert(pci_bus_resource_n(&bus, PCI_BRIDGE_RESOURCE_NUM) == &window);
+	assert(!pci_bus_resource_n(&bus, PCI_BRIDGE_RESOURCE_NUM + 1));
+	bus.resource[1] = NULL;
+	list_del(&extra.list);
+
+	/* Bus mastering off: the command bit and the device's record. */
+	pci_set_master(&dev);
+	assert(dev.is_busmaster && (config[PCI_COMMAND] & PCI_COMMAND_MASTER));
+	pci_clear_master(&dev);
+	assert(!dev.is_busmaster && !(config[PCI_COMMAND] & PCI_COMMAND_MASTER));
+
+	/* The line: the INTx disable bit, cleared to enable and set to disable. */
+	pci_intx(&dev, 0);
+	assert(*(u16 *)&config[PCI_COMMAND] & PCI_COMMAND_INTX_DISABLE);
+	pci_intx(&dev, 1);
+	assert(!(*(u16 *)&config[PCI_COMMAND] & PCI_COMMAND_INTX_DISABLE));
 	stela_linux_exit();
-	printf("Linux PCI configuration, enabling and option ROMs passed\n");
+	printf("Linux PCI configuration, enabling, option ROMs, PCI Express registers, Resizable BARs and saved state passed\n");
 	return 0;
 }
 #endif

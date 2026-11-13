@@ -11,6 +11,9 @@ bool stela_linux_pci_devices_present(void);
  * from a successful absent capability (*found == 0). No context ownership moves. */
 int stela_linux_pci_find_capability(struct pci_dev *dev, int cap, u8 *found);
 bool stela_linux_pci_bound(const struct pci_dev *device);
+/* drivers/pci/pci.h's, which only Linux's PCI core includes: the supported
+ * link speeds vector the attach caches as Linux's probe does. */
+u8 pcie_get_supported_speeds(struct pci_dev *dev);
 void stela_linux_pci_shutdown(struct pci_dev *dev);
 void stela_linux_pci_remove_device(struct pci_dev *dev);
 
