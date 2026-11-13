@@ -7,7 +7,9 @@ segue è marcato come **verificato** (letto nei sorgenti) o **da verificare**
 (dedotto o ricordato, non controllato).
 
 - Data dell'analisi: 2026-11-12
-- Branch di lavoro: `claude/amd-radeon-rx9070-rdna4-y12vd2`
+- Branch di lavoro: `claude/amd-radeon-rx9070-rdna4-y12vd2`. Dal
+  2026-11-13 è il branch predefinito del fork su GitHub; `main` resta al
+  commit dell'upstream da cui è partito il lavoro (`f39ffb3`).
 - Repository: fork `LBNM-ONE/Stela` di `tylertms/Stela`. Alla data dell'analisi
   il fork coincide con l'upstream (`f39ffb3`).
 - Aggiornato il 2026-11-12 dalla sessione locale sul PC con l'hardware:
