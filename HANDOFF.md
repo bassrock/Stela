@@ -1,9 +1,10 @@
 # Handoff: supporto AMD Radeon RX 9070 (RDNA4) in Stela
 
 Documento di passaggio da una sessione cloud di analisi a una sessione locale.
-Nessun codice è stato scritto: finora c'è solo l'analisi di fattibilità. Tutto
-ciò che segue è marcato come **verificato** (letto nei sorgenti) o **da
-verificare** (dedotto o ricordato, non controllato).
+All'analisi di fattibilità sono seguiti, sul PC, il censimento e i passi 1–4
+del port (vedi «Censimento amdgpu: risultati» e «Stato»). Tutto ciò che
+segue è marcato come **verificato** (letto nei sorgenti) o **da verificare**
+(dedotto o ricordato, non controllato).
 
 - Data dell'analisi: 2026-11-12
 - Branch di lavoro: `claude/amd-radeon-rx9070-rdna4-y12vd2`
@@ -11,6 +12,7 @@ verificare** (dedotto o ricordato, non controllato).
   il fork coincide con l'upstream (`f39ffb3`).
 - Aggiornato il 2026-11-12 dalla sessione locale sul PC con l'hardware:
   sezioni «Verificato sul PC», «Ambiente di build sul PC» e «Stato».
+- Aggiornato il 2026-11-13 con il passo 4 e «Prova sul PC (tappa 2)».
 
 ## Obiettivo
 
@@ -213,11 +215,21 @@ Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
   downstream port `02:00.0`, oppure il reset interno di amdgpu. Letto il
   2026-11-13: `soc24_asic_reset_method` sceglie MODE1 (reset via SMU) per
   MP1 14.0.2 e 14.0.3, quindi per la 9070, e non sceglie mai il reset PCI.
+  Deciso nel passo 4: per AMD `cold.rs` non resetta (`Reset::Driver`) e
+  lascia il reset ad amdgpu. Il bit dice solo se un FLR sarebbe possibile.
 - Se il BIOS («Re-Size BAR Support», con «Above 4G Decoding») fa assegnare
   al firmware un BAR0 da 16 GB. Oggi il firmware lo lascia a 256 MB e su
   Linux è amdgpu ad allargarlo; in Stela il resize è rifiutato (vedi il
   passo 2), quindi amdgpu userebbe 256 MB di VRAM visibile alla CPU.
-- Quale ramo di `gmc_v12_0.c` (maschera DMA a 44 o 52 bit) valga per Navi 48.
+- Il primo probe di amdgpu sulla 9070 in Stela: niente è stato eseguito
+  sull'hardware (vedi «Prova sul PC (tappa 2)»). Gli 11 file firmware sono
+  quelli che amdgpu chiede di default, letti nei sorgenti. Se il log dice
+  che ne manca uno, va aggiunto a `AMDGPU` in `recipes.rs`.
+- Come amdgpu trova il VBIOS. Stela non gli dà né ACPI (VFCT) né il BAR
+  della ROM, quindi resta la lettura della ROM via MMIO
+  (`amdgpu_read_bios_from_rom`). Con la iGPU come prima uscita, il firmware
+  potrebbe non inizializzare la 9070: in quel caso amdgpu la inizializza
+  dal VBIOS (`amdgpu_device_need_post`).
 - Se, con la 9070 senza display e il monitor sulla iGPU, il desktop di macOS
   arriva davvero sullo schermo del firmware. Il commento in `gpu/display.rs`
   lo suggerisce, ma il percorso dal DCP modellato allo scanout del firmware
@@ -240,9 +252,12 @@ Letto sul PC da `lspci -nn`, sysfs e `journalctl -k`, senza `sudo`.
      2026-11-12: 82 propri di amdgpu, 55 dopo il passo 1, 39 dopo il passo
      2; dopo il passo 3 ogni servizio che la 9070 raggiunge è fornito e gli
      altri sono trap, tranne `sscanf`, vedi «Censimento amdgpu: risultati».
-2. **Firmware**: ricette linux-firmware per i blob amdgpu, sul modello GSP in
-   `recipes.rs`, e selezione per IP invece che per chipset.
-3. **Boot**: generalizzare `claim`, `claim_all` e `cold.rs` oltre NVIDIA.
+   - Passo 4: amdgpu è linkato in `stela.efi`, `sscanf` è fornito e i 29
+     servizi aperti sono tutti trap.
+2. **Firmware**: fatto nel passo 4 per Navi 48: 11 file e la licenza in
+   `recipes.rs` (`AMDGPU`), scelti per ID PCI, nel bundle della chiavetta.
+3. **Boot**: fatto nel passo 4: `claim` e `claim_all` per vendor, e
+   `cold.rs` senza reset per AMD.
 4. **Vulkan**: una lane RADV accanto a `xtask/src/gpu/nvk.rs`
    (`-Dvulkan-drivers=amd`), con ACO in C++ contro la libc++ già costruita per
    LLVM, il compat `libdrm_amdgpu` e l'aggancio NIR.
@@ -583,7 +598,106 @@ Prossimo passo proposto, in ordine:
    `stela.efi` (con la ridenominazione di `sscanf`), le ricette firmware
    (strato 2) e il boot (strato 3, `claim` e il reset senza FLR: MODE1 via
    SMU), verso la tappa 2 del piano. Da qui serve il PC: il primo probe
-   della 9070 si vede solo avviando Stela.
+   della 9070 si vede solo avviando Stela. Fatto il 2026-11-13, vedi sotto;
+   il probe resta da vedere sul PC.
+
+Passo 4, fatto il 2026-11-13 in due parti: compilato e testato qui, ma
+sulla 9070 non è ancora stato eseguito niente.
+
+- **4a, amdgpu linkato in `stela.efi`** (commit `1086695b2`).
+  - `crates/stela-driver-gpu/build/image.rs` compone l'immagine di
+    registrazione `stela_linux_gpu_image`: la coorte comune, le unità DRM e
+    l'unità di registrazione di ogni port, in ordine globale. nouveau resta
+    all'ordinale 9 e `amdgpu_drv` prende il 10, quindi `amdgpu_init`
+    registra il driver PCI dopo quello di nouveau. Ogni port tiene la sua
+    unità nel proprio archivio (`stela-nouveau-nvkm`, `stela-amdgpu`), e su
+    UEFI gli archivi si linkano accanto all'immagine. La avvia
+    `gpu::linux::start`, che prima era `gpu::nouveau::start`.
+  - Feature: `amdgpu-port` di `stela-driver-gpu` linka amdgpu,
+    `stela-drivers` la inoltra e la nuova `amdgpu` di `stela-boot` la
+    accende. `autoconf.h` definisce `CONFIG_DRM_AMDGPU`.
+  - `sscanf`: c'è il nuovo `compat/kernel/vsscanf.c`, sul testo di
+    `lib/vsprintf.c`, con il test `linux_vsscanf`, e `kstrtox.c` ha il
+    fixup della base di `lib/kstrtox.c`. La libc di Mesa dichiara il suo
+    `sscanf` come `stela_libc_sscanf`, verificato con `nm`. `OPEN` passa da
+    30 a 29 servizi, tutti trap.
+  - `stela.efi` di debug: 281 MB con amdgpu, che ne contiene le stringhe, e
+    157 MB senza, come prima.
+- **4b, claim e firmware della 9070** (commit `7725e30bf` e `ea7a34286`).
+  - `cold.rs`: il reset al claim dipende dal vendor. NVIDIA ha
+    `Reset::Function`, cioè l'FLR di prima. AMD ha `Reset::Driver`, cioè
+    nessun reset al claim. amdgpu resetta da sé (MODE1 via SMU) quando il
+    sOS del PSP è già vivo (`soc24_need_reset_on_init`); altrimenti prende
+    la scheda come l'ha lasciata il firmware, come fa Linux a ogni avvio.
+    Il bus master resta spento finché amdgpu non lo accende, e da lì il
+    dominio DMA privato limita ciò che la GPU raggiunge.
+  - `crates/stela-boot/src/engine/gpu.rs` ha una `Driver` per vendor. Per
+    amdgpu i registri stanno al BAR 5 (`amdgpu_device_init`) e il limite
+    DMA è a 44 bit: GC 12.0.1 prende quel ramo di `gmc_v12_0_sw_init`. Il
+    chip viene dall'ID PCI (`1002:7550` è `navi48`), non da un registro,
+    perché amdgpu legge il resto dalla tabella IP discovery.
+  - Se lo schermo del firmware sta sulla 9070, il claim la rifiuta e il log
+    dice di spostare il monitor sulla scheda madre. amdgpu è compilato
+    senza DC e lascerebbe lo schermo nero.
+  - Il log scrive `GPU <indirizzo>: amdgpu bound it` oppure
+    `did not bind it`. Solo le GPU di nouveau vanno al device Metal, quindi
+    un'immagine con `nvk` e `amdgpu` insieme non scambia la 9070 per una
+    NVIDIA mancata.
+  - Firmware (`crates/stela-loader/src/host_firmware/recipes.rs`, `AMDGPU`):
+    11 file da linux-firmware `20261019` (`a2dcb924…`) per GC 12.0.1, PSP e
+    SMU 14.0.3, SDMA 7.0.1 e VCN 5.0.0, più `LICENSES/LICENSE.amdgpu`, in
+    tutto 2,8 MB. MES usa l'immagine unica, perché `amdgpu_uni_mes` è
+    attivo di default. TOC, DMCUB e le versioni "kicker" (solo `1002:7551`
+    rev C8) non vengono chieste. Il bundle della chiavetta passa da 64 a 75
+    file. Le funzioni sono `amd_chip` e `require_amdgpu`, e la schermata di
+    boot ha i messaggi per AMD.
+  - xtask: `cargo xtask boot build --release --amdgpu` costruisce
+    l'immagine con amdgpu e senza NVK.
+
+## Prova sul PC (tappa 2)
+
+Scopo: vedere nel log di Stela il primo probe di amdgpu sulla 9070. Questa
+immagine non dà a macOS un device Metal, quindi macOS va avviato in
+single-user: quell'avvio passa comunque dal claim della GPU. Serve una
+chiavetta Stela già preparata, con macOS installato.
+
+1. Monitor sulle uscite della scheda madre, cioè sulla iGPU. Nel BIOS la
+   prima uscita video va sulla grafica integrata, di solito «Settings → IO
+   Ports → Initial Display Output → IGD Video» sulle Gigabyte AM5, con la
+   grafica integrata attiva. Se lo schermo del firmware resta sulla 9070,
+   il claim la rifiuta.
+2. L'immagine:
+
+   ```sh
+   export PATH="$HOME/.rustup/toolchains/1.99.1-x86_64-unknown-linux-gnu/bin:$PATH"
+   cargo xtask boot build --release --amdgpu
+   ```
+
+   Stampa il percorso di `stela-deploy.efi`.
+3. La CLI di questo branch: `cargo build --release -p stela-cli` dà
+   `target/release/stela`. Il suo bundle comprende gli 11 file di amdgpu.
+4. Si installa l'immagine sulla chiavetta, dove `USB` è la partizione EFI
+   della chiavetta montata. L'aggiornamento completa anche il bundle, quindi
+   scarica e copia i file di amdgpu:
+
+   ```sh
+   target/release/stela setup update stela --usb USB --efi target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+   ```
+
+   `stela setup status --usb USB` dice se il bundle è completo, e
+   `stela setup host-firmware fetch --usb USB` lo completa da solo.
+
+5. In `EFI/stela/choices.cfg` della chiavetta si duplica la riga della
+   scelta macOS (nome, tab, opzioni) e si aggiunge `--single-user` in fondo
+   alla copia. All'avvio di Stela si sceglie quella voce.
+6. Dopo l'avvio si legge il log con
+   `target/release/stela setup boot-log --usb USB`, oppure dal file
+   `EFI/stela/boot.log`. Le righe da cercare:
+   - `HOST FIRMWARE BUNDLE USE amdgpu/…`: gli 11 file letti;
+   - `GPU 0000:03:00.0 …`: il claim, o il motivo del rifiuto;
+   - `LINUX <n> amdgpu 0000:03:00.0: …`: il probe di amdgpu;
+   - `GPU 0000:03:00.0: amdgpu bound it`, oppure `did not bind it`;
+   - `GPU START claim_ms=… probe_ms=…`.
 
 ## Controlli sul PC (Linux)
 
@@ -703,7 +817,19 @@ commit `ddaf85e353442d9d7f192fdcf1823e652e3f2ee3`, con `/src/amd/`.
     `crates/stela-driver-gpu/build/amdgpu.rs`. Build con `amdgpu-port` riuscita sull'host e per il target UEFI (`x86_64-unknown-uefi`), dove il censimento trova gli stessi 48 servizi; clippy pulito sulla lane host e su quella UEFI; `cargo test -p stela-linux -p stela-driver-gpu --all-features`: 735 test superati, nessuno fallito, `linux_pci` e `linux_pci_host` compresi. Committato in tre commit.
   - passo 3 eseguito (vedi «Censimento amdgpu: risultati»): `OPEN` a 30, 29
     trap e `sscanf`. Build con `amdgpu-port` riuscita sull'host e per il target UEFI, dove il censimento trova gli stessi 30 servizi; `cargo test -p stela-linux -p stela-driver-gpu --all-features`: 737 test superati, nessuno fallito, compresi i nuovi `linux_hwmon` e `linux_timekeeping` e la fixture delle workqueue con `disable_irq` ed `enable_irq`; clippy pulito sulla lane host e su quella UEFI. Committato in tre commit di codice e uno di documentazione.
+  - passo 4 eseguito (vedi «Censimento amdgpu: risultati»), in due parti:
+    amdgpu linkato in `stela.efi` (4a), poi il claim della 9070 e le sue
+    ricette firmware (4b). Test host superati: 738 su `stela-linux` e
+    `stela-driver-gpu` dopo 4a; dopo 4b, 604 su `stela-driver-gpu`, 642
+    su `stela-boot-core`, 342 su `stela-loader` e 250 su `stela-cli`, più
+    quelli di xtask, `stela-dev` e `stela-gpu-maintenance`. Clippy pulito
+    sull'immagine UEFI con e senza `amdgpu`, sulle lane UEFI di
+    `stela-boot-core` e `stela-driver-gpu` e sui crate host toccati. Le
+    due immagini UEFI linkano. La lane `nvk` non è stata compilata, perché
+    su questo PC Mesa non è costruito (`cargo xtask gpu nvk`): il codice
+    che solo lei compila è stato riletto, non compilato. Committato in tre
+    commit di codice e uno di documentazione.
 - Decisione presa il 2026-11-12: censimento prima dell'upstream, poi i
-  passi 1, 2 e 3. Il prossimo è il passo 4, il port vero; sentire
-  l'upstream resta consigliato prima degli strati che costano mesi (RADV,
-  Metal, display).
+  passi 1, 2 e 3. Il passo 4 è fatto; il prossimo è la prova sul PC
+  (vedi «Prova sul PC (tappa 2)»). Sentire l'upstream resta consigliato
+  prima degli strati che costano mesi (RADV, Metal, display).
