@@ -144,7 +144,7 @@ const AMDGPU: Driver = Driver {
     dma_limit: (1 << 44) - 1,
 };
 /// How long the GPUs may take to boot their firmware before the guest starts.
-const START_SECONDS: u64 = 60;
+const START_SECONDS: u64 = 600;
 /// The longest idle wait while they do, which the timeout above is checked at.
 const WAIT_MICROS: u64 = 10_000;
 /// The longest one pump runs Linux between the boot PE's slices. What is
