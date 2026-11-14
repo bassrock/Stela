@@ -1,7 +1,8 @@
 //! The host's Linux environment and the GPUs its drivers bind there: the
-//! NVIDIA GPUs nouveau drives, which back the guest's Metal device, and, in
-//! an image built with `amdgpu`, an RX 9070 that amdgpu binds, as yet with
-//! neither display nor Metal device.
+//! NVIDIA GPUs nouveau drives, which back the guest's Metal device in an
+//! image built with `nvk`, and, in an image built with `amdgpu`, the AMD GPUs
+//! amdgpu binds, without display, which back the Metal device in an image
+//! built with `radv`.
 //!
 //! It lives on the boot CPU and takes time from the boot PE as Linux steals it
 //! from an interrupted thread. A GPU's MSI targets that CPU, which takes it
@@ -12,25 +13,25 @@
 //! ([`pump_due`]), so other PEs do not spin on a lock while Linux runs and
 //! GPU completions are not starved. Nothing reserves a core, and a Linux
 //! environment with nothing to do costs the boot PE one comparison a slice.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub(super) mod client;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub(super) mod display;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 mod file;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub(super) mod gate;
 /// `xtask guest`'s objects of the StelaGPU kext.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 mod kext {
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../target/guest/StelaGPU.kext.rs"
     ));
 }
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 mod stack;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 mod waiter;
 
 use super::{
@@ -53,7 +54,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 use stela_boot_core::page_window::{self, Cache};
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 use stela_drivers::gpu::metal::nvidia::PcieLink;
 use stela_drivers::{
     bus::{
@@ -99,14 +100,14 @@ const ENOMEM: Errno = -12;
 const EOPNOTSUPP: Errno = -95;
 
 const MSI_CAPABILITY: u8 = 5;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 const PCIE_CAPABILITY: u8 = 0x10;
 /// `PCI_EXP_LNKSTA`, in the PCIe capability.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 const LINK_STATUS: u16 = 0x12;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 const REVISION: u16 = 0x08;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 const SUBSYSTEM_ID: u16 = 0x2c;
 /// Linux's `IORESOURCE_*` bits of a memory BAR.
 const RESOURCE_MEMORY: u64 = 0x200;
@@ -143,6 +144,13 @@ const AMDGPU: Driver = Driver {
     registers: 5,
     dma_limit: (1 << 44) - 1,
 };
+/// The driver whose GPUs back the Metal device: nouveau's under NVK, or
+/// amdgpu's under RADV.
+#[cfg(feature = "nvk")]
+const METAL_DRIVER: &Driver = &NOUVEAU;
+#[cfg(feature = "radv")]
+const METAL_DRIVER: &Driver = &AMDGPU;
+
 /// How long the GPUs may take to boot their firmware before the guest starts.
 const START_SECONDS: u64 = 600;
 /// The longest idle wait while they do, which the timeout above is checked at.
@@ -156,7 +164,7 @@ const PUMP_NS: u64 = 2_000_000;
 static HUB: AtomicPtr<Hub> = AtomicPtr::new(ptr::null_mut());
 static BOOT_PE: AtomicUsize = AtomicUsize::new(0);
 /// The processor the environment runs on.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 static BOOT_CPU: AtomicU32 = AtomicU32::new(0);
 
 /// End the boot PE's slices for Linux, through `hub`.
@@ -964,9 +972,9 @@ pub(super) struct Claimed {
     name: String,
     /// The driver that binds it.
     driver: &'static str,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     drm: client::DrmDevice,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     link: Option<PcieLink>,
 }
 
@@ -1171,7 +1179,7 @@ fn claim(
         .iter()
         .find(|(_, id)| *id == MSI_CAPABILITY)
         .map(|(offset, _)| Msi::at(u16::from(*offset)));
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     let drm = {
         let config = function.config();
         let subsystem = config.read32(SUBSYSTEM_ID).map_err(ServiceError::Config)?;
@@ -1188,7 +1196,7 @@ fn claim(
             revision,
         }
     };
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     let link = capabilities
         .iter()
         .find(|(_, id)| *id == PCIE_CAPABILITY)
@@ -1213,9 +1221,9 @@ fn claim(
         bars,
         name: format!("{address}"),
         driver: driver.name,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         drm,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         link,
     })
 }
@@ -1448,8 +1456,8 @@ pub(super) fn claim_all(
     (claimed, refused)
 }
 
-/// A GPU nouveau bound.
-#[cfg(feature = "nvk")]
+/// A GPU the Metal device's driver ([`METAL_DRIVER`]) bound.
+#[cfg(feature = "metal-device")]
 struct Bound {
     name: String,
     drm: client::DrmDevice,
@@ -1465,7 +1473,7 @@ struct Start {
 
 struct Started {
     _attached: Vec<Attached<Device>>,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     bound: Vec<Bound>,
     result: Result<(), Errno>,
 }
@@ -1482,11 +1490,11 @@ unsafe impl ManagedJob for Start {
 }
 
 fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     stela_boot_core::heap::set_peak_hook(gate::peak_passed);
     let mut job = Started {
         _attached: Vec::new(),
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         bound: Vec::new(),
         result: Ok(()),
     };
@@ -1543,9 +1551,9 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
                         "GPU {}: {} bound it\n",
                         claimed.name, claimed.driver
                     ));
-                    // Only nouveau's GPUs back the Metal device.
-                    #[cfg(feature = "nvk")]
-                    if claimed.driver == NOUVEAU.name {
+                    // Only the Metal device's driver's GPUs back it.
+                    #[cfg(feature = "metal-device")]
+                    if claimed.driver == METAL_DRIVER.name {
                         job.bound.push(Bound {
                             name: claimed.name,
                             drm: claimed.drm,
@@ -1571,7 +1579,7 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
 
 /// The running environment.
 #[cfg_attr(
-    not(feature = "nvk"),
+    not(feature = "metal-device"),
     allow(
         dead_code,
         reason = "held for the boot; only Mesa's client reads these"
@@ -1585,20 +1593,20 @@ struct Installed {
     /// When the service is next due, as a TSC value: the clock reads only
     /// in the Linux environment's root, and the boot loop asks outside it.
     next: AtomicU64,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     window: &'static Window,
     tsc_hz: u64,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     libc_clock: client::LibcClock,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     heap_bytes: u64,
     /// Clients' mappings with their sizes in pages, by address. For tasks.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     mappings: RefCell<BTreeMap<u64, (stela_linux::client::Mapping, usize)>>,
     /// Mesa's running threads, by the bottom of their stacks. On the boot CPU.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     mesa_threads: RefCell<BTreeMap<u64, client::Running>>,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     service: client::Service,
     owner: &'static Arc<LinuxKernel>,
     threads: &'static LinuxThreads,
@@ -1632,7 +1640,7 @@ pub(super) struct Machine {
     pub tsc_hz: u64,
     pub wall: Option<RtcReading>,
     /// The host heap capacity reported to the linked graphics runtime.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     pub heap_bytes: u64,
 }
 
@@ -1644,33 +1652,37 @@ fn environment_error(error: WorkError) -> kernel_work::Error {
 /// aborts without one and watchdogd
 /// then panics the system, so a boot of macOS stops here instead.
 pub(super) fn no_metal_device() -> Option<&'static str> {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     return gate::shared()
         .is_empty()
         .then_some("no GPU started; the lines above say why");
-    #[cfg(not(feature = "nvk"))]
-    Some("this stela.efi was built without GPU drivers (the `nvk` feature)")
+    #[cfg(not(feature = "metal-device"))]
+    Some(
+        "this stela.efi was built without a Metal device's GPU driver (the `nvk` or `radv` \
+         feature)",
+    )
 }
 
-/// The kexts a boot that gives the GPUs to nouveau links into its system.
+/// The kexts a boot that gives its GPUs to the Metal device links into its
+/// system.
 pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     return alloc::vec![stela_loader::aux_kc::Kext {
         info: kext::INFO,
         objects: kext::OBJECTS.to_vec(),
         bundle_path: "/Library/Extensions/StelaGPU.kext".into(),
         trusted_code: kext::TRUSTED_CODE.to_vec(),
     }];
-    #[cfg(not(feature = "nvk"))]
+    #[cfg(not(feature = "metal-device"))]
     Vec::new()
 }
 
 /// Takes the display for the GPUs [`open`] bound, in the firmware's `screen`
 /// size if it can, and opens their Metal services.
 pub(super) fn serve(
-    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: (usize, usize),
+    #[cfg_attr(not(feature = "metal-device"), allow(unused_variables))] screen: (usize, usize),
 ) {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     {
         display::take(screen);
         gate::open_service();
@@ -1691,14 +1703,16 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         random,
         tsc_hz,
         wall,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         heap_bytes,
     } = machine;
     let image = work.image()?;
     let task_data = work.task_data()?;
-    // Whether nouveau, which backs the Metal device, has GPUs to bind.
-    #[cfg(feature = "nvk")]
-    let claiming = claimed.iter().any(|claimed| claimed.driver == NOUVEAU.name);
+    // Whether the driver that backs the Metal device has GPUs to bind.
+    #[cfg(feature = "metal-device")]
+    let claiming = claimed
+        .iter()
+        .any(|claimed| claimed.driver == METAL_DRIVER.name);
     let lines = claimed
         .iter()
         .map(|claimed| Line {
@@ -1715,7 +1729,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         .collect();
     let clock = work.service_clock().map_err(environment_error)?;
     let epoch = clock.epoch().map_err(environment_error)?;
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     let libc_clock = client::LibcClock::anchor(|| epoch.now_ns()).map_err(environment_error)?;
     let time = clock.clock();
     let events = Arc::new(Events {
@@ -1772,7 +1786,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         stela_linux::image::register(image).map_err(|_| kernel_work::Error::Inventory)?;
         stela_linux::heap::register(allocate_zeroed).map_err(|_| kernel_work::Error::Inventory)?;
     }
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     BOOT_CPU.store(host::processor(), Ordering::Relaxed);
     output::arguments(format_args!("GPU Linux: dispatching\n"));
     super::store_log_held();
@@ -1787,7 +1801,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         ))
     })??;
     let result = job.result.map_err(Error::Init);
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     let result = result.and_then(|()| {
         if claiming && job.bound.is_empty() {
             Err(Error::NoDevices)
@@ -1802,18 +1816,18 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         domain,
         // Due at once: the first pump finds Linux's own deadline.
         next: AtomicU64::new(0),
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         window,
         tsc_hz,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         libc_clock,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         heap_bytes,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         mappings: RefCell::new(BTreeMap::new()),
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         mesa_threads: RefCell::new(BTreeMap::new()),
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         service: client::Service::default(),
         owner,
         threads,
@@ -1982,7 +1996,7 @@ pub(super) enum Error {
     Child(Outcome),
     Init(Errno),
     Timeout,
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     NoDevices,
 }
 
@@ -2007,8 +2021,8 @@ impl core::fmt::Display for Error {
             Self::Timeout => {
                 f.write_str("GPU startup exceeded its deadline; native owners remain held")
             }
-            #[cfg(feature = "nvk")]
-            Self::NoDevices => f.write_str("nouveau bound no NVIDIA GPUs"),
+            #[cfg(feature = "metal-device")]
+            Self::NoDevices => write!(f, "{} bound none of its GPUs", METAL_DRIVER.name),
         }
     }
 }
@@ -2123,9 +2137,9 @@ static UNMAPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 pub(super) enum Unmapped {
     Device,
     Pages,
-    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    #[cfg_attr(not(feature = "metal-device"), allow(dead_code))]
     Files,
-    #[cfg_attr(not(feature = "nvk"), allow(dead_code))]
+    #[cfg_attr(not(feature = "metal-device"), allow(dead_code))]
     Stacks,
 }
 
@@ -2157,13 +2171,13 @@ static PUMPS: PumpCounts = PumpCounts {
 };
 
 /// Ticks the boot CPU spent in posted pumps ([`pump_posted`]).
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 static POSTED_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// The ticks this processor spent in posted pumps so far: the boot CPU's
 /// total, and nothing on another processor, which runs none.
 pub(super) fn posted_ticks_here() -> u64 {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     if host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
         return POSTED_TICKS.load(Ordering::Relaxed);
     }
@@ -2172,9 +2186,9 @@ pub(super) fn posted_ticks_here() -> u64 {
 
 /// The shootdowns counted so far, for a difference across a step.
 fn shootdowns() -> u64 {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     return crate::native_mmio::shootdown::count();
-    #[cfg(not(feature = "nvk"))]
+    #[cfg(not(feature = "metal-device"))]
     0
 }
 
@@ -2294,18 +2308,18 @@ pub(super) fn pump() {
             }
             // Tasks retire and calls arrive only through steps and posts:
             // a pump's first pass looks only if something may have.
-            #[cfg(feature = "nvk")]
+            #[cfg(feature = "metal-device")]
             if !first || client::start_due() {
                 gpu.advance_children();
                 client::start(gpu)?;
             }
-            #[cfg(not(feature = "nvk"))]
+            #[cfg(not(feature = "metal-device"))]
             gpu.advance_children();
             first = false;
             lap(PumpPart::Children);
-            #[cfg(feature = "nvk")]
+            #[cfg(feature = "metal-device")]
             let serving = client::serving();
-            #[cfg(not(feature = "nvk"))]
+            #[cfg(not(feature = "metal-device"))]
             let serving = [0; 4];
             let (step_started, shot) = (host::rdtsc(), shootdowns());
             let stepped = runtime.step()?;
@@ -2351,7 +2365,7 @@ pub(super) fn pump() {
         PUMPS.idle.fetch_add(1, Ordering::Relaxed);
     }
     PUMPS.steps.fetch_add(u64::from(steps), Ordering::Relaxed);
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     match look_due(gpu) {
         Look::Device => {
             gate::interrupted();
@@ -2363,7 +2377,7 @@ pub(super) fn pump() {
     lap(PumpPart::Look);
     // The pipelines the device added go to the store's file, queued a
     // piece at a time.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     super::pipelines::step();
     let took = host::rdtsc().wrapping_sub(started);
     PUMPS.ticks.fetch_add(took, Ordering::Relaxed);
@@ -2375,7 +2389,7 @@ pub(super) fn pump() {
 /// polls): an AP waiting for a DRM call waits for the boot CPU, not for that
 /// work. Nothing runs elsewhere, or with no call posted.
 pub(super) fn pump_posted() {
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     if client::posted_waiting() && host::processor() == BOOT_CPU.load(Ordering::Relaxed) {
         PUMPS.posted.fetch_add(1, Ordering::Relaxed);
         let started = host::rdtsc();
@@ -2386,7 +2400,7 @@ pub(super) fn pump_posted() {
 
 /// A pump from a wait for the service's turn on the boot CPU, which runs no
 /// guest code meanwhile.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 fn pump_waiting() {
     if installed().is_some_and(|gpu| ready_since(gpu, host::rdtsc()).is_some()) {
         PUMPS.relaxed.fetch_add(1, Ordering::Relaxed);
@@ -2433,9 +2447,9 @@ pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
         serving.push('-');
     }
     let [device, pages, files, stacks] = UNMAPS.each_ref().map(take);
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     let nvkm = nvkm_report();
-    #[cfg(not(feature = "nvk"))]
+    #[cfg(not(feature = "metal-device"))]
     let nvkm = String::new();
     let pumps = format!(
         "GPU PUMP runs={runs} quiet={} unmasked={} forced={} relaxed={} posted={} by_event={by_event} \
@@ -2581,7 +2595,7 @@ fn linux_report(steps: u64, tsc_hz: u64) -> String {
 /// (`include/nvkm/core/counts.h`), for kinds that ran, then
 /// `\nGPU NVKM SIZES kind:count/total_kib/largest_kib …` for its page-table
 /// references by page size and its sparse references. Empty when none ran.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 fn nvkm_report() -> String {
     /// `enum nvkm_count`'s kinds, in order.
     const KINDS: [&str; 12] = [
@@ -2659,24 +2673,24 @@ fn next_timer() -> String {
     format!("+{:#x}", function.wrapping_sub(base))
 }
 
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 /// The GPU interrupts taken when the Metal services last looked for
 /// completed work.
 static LOOKED: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 /// A service a call held asked to look again.
 static LOOK: AtomicBool = AtomicBool::new(false);
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 /// When a pump next looks though nothing asked, as a TSC value.
 static NEXT_LOOK: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 /// How long a pump goes without looking when the GPU has not interrupted: a
 /// fence Linux signals outside its interrupt, as a submission or a job's
 /// timeout may, is seen within this.
 const LOOK_FALLBACK_NS: u64 = 10_000_000;
 
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 /// What a pump looks at after its steps ([`look_due`]).
 enum Look {
     /// Each GPU's completion, which enters the driver, and the devices'
@@ -2687,7 +2701,7 @@ enum Look {
     No,
 }
 
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 /// What this pump looks at: each look asks the driver for each GPU's
 /// completion, which only an interrupt or a waiter's point makes likely to
 /// have moved. Most pumps run for a call a PE posted or a Linux timer. The
@@ -2718,7 +2732,7 @@ fn look_due(gpu: &Installed) -> Look {
     }
 }
 
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 /// Pumps the service again soon, from any processor, and has that pump look
 /// for completed work.
 fn look_again() {

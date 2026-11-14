@@ -32,9 +32,15 @@ default = []
 diagnostics = ["stela-drivers/irq-diagnostics"]
 native-profile = ["stela-soc/native-profile", "stela-engine/native-profile"]
 # NVK, NIR and NAK in the image, from `cargo xtask gpu nvk`.
-nvk = ["dep:stela-mesa", "stela-drivers/metal-linked"]
+nvk = ["metal-device", "stela-mesa/nvk"]
 # amdgpu in the image's Linux environment, which registers its PCI driver.
 amdgpu = ["stela-drivers/amdgpu-port"]
+# RADV, NIR and ACO over amdgpu, from `cargo xtask gpu radv`. It and `nvk`
+# share Mesa's runtime and the AIR compiler's units, so an image has one.
+radv = ["metal-device", "amdgpu", "stela-mesa/radv"]
+# The Metal device over the linked Mesa driver, whichever it is: what `nvk`
+# and `radv` have in common. Not chosen on its own.
+metal-device = ["dep:stela-mesa", "stela-drivers/metal-linked"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }

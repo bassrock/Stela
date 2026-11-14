@@ -1,5 +1,6 @@
-//! NVK's process services (`compat/libc/stela/host.h`), from whichever PE runs
-//! it.
+//! The Mesa driver's process services (`compat/libc/stela/host.h`), from
+//! whichever PE runs it: NVK's over nouveau, or RADV's over amdgpu, whose
+//! ioctls and mappings pass to the DRM driver alike.
 //!
 //! Linux's files belong to the environment on the boot CPU, so a PE posts its
 //! call, ends the boot PE's slice and spins: an ioctl costs the caller a
@@ -99,6 +100,7 @@ pub(super) struct DrmDevice {
 }
 
 /// `struct drm_nouveau_getparam`.
+#[cfg(feature = "nvk")]
 #[repr(C)]
 struct GetParam {
     parameter: u64,
@@ -106,8 +108,32 @@ struct GetParam {
 }
 
 /// `DRM_IOCTL_NOUVEAU_GETPARAM`.
+#[cfg(feature = "nvk")]
 const GET_PARAM: u32 = 0xc010_6440;
+#[cfg(feature = "nvk")]
 const CHIPSET_ID: u64 = 11;
+
+/// `struct drm_amdgpu_info`: where the answer goes, the query and its
+/// union of arguments, the largest of which is four words.
+#[cfg(feature = "radv")]
+#[repr(C)]
+struct AmdgpuInfo {
+    return_pointer: u64,
+    return_size: u32,
+    query: u32,
+    arguments: [u32; 4],
+}
+
+/// `DRM_IOCTL_AMDGPU_INFO`: `DRM_IOW(DRM_COMMAND_BASE + 0x05, struct
+/// drm_amdgpu_info)`.
+#[cfg(feature = "radv")]
+const AMDGPU_INFO: u32 = 0x4020_6445;
+/// `AMDGPU_INFO_HW_IP_INFO`, of `AMDGPU_HW_IP_GFX` (0) instance 0.
+#[cfg(feature = "radv")]
+const AMDGPU_INFO_HW_IP_INFO: u32 = 0x02;
+/// `AMDGPU_INFO_VRAM_GTT`.
+#[cfg(feature = "radv")]
+const AMDGPU_INFO_VRAM_GTT: u32 = 0x14;
 /// The first render node's minor.
 pub(super) const RENDER_MINOR: u32 = 128;
 
@@ -1186,6 +1212,7 @@ pub(super) fn map(fd: c_int, offset: u64, size: usize) -> Option<NonNull<u8>> {
 }
 
 /// `NOUVEAU_GETPARAM_CHIPSET_ID` of the bound GPU at `index`.
+#[cfg(feature = "nvk")]
 pub(super) fn chipset(index: u32) -> Option<u16> {
     let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
     if fd < 0 {
@@ -1205,9 +1232,86 @@ pub(super) fn chipset(index: u32) -> Option<u16> {
 }
 
 /// `NOUVEAU_GETPARAM_FB_SIZE`: the VRAM nouveau makes available.
+#[cfg(feature = "nvk")]
 const FB_SIZE: u64 = 8;
 
+/// `AMDGPU_INFO` query `query` with `arguments` on the bound GPU at `index`,
+/// into `answer`, which the kernel fills as far as it knows. Whether it
+/// answered.
+#[cfg(feature = "radv")]
+fn amdgpu_info<T>(index: u32, query: u32, arguments: [u32; 4], answer: &mut T) -> bool {
+    let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
+    if fd < 0 {
+        return false;
+    }
+    let mut info = AmdgpuInfo {
+        return_pointer: ptr::from_mut(answer) as u64,
+        return_size: size_of::<T>() as u32,
+        query,
+        arguments,
+    };
+    let result = submit(Operation::Control {
+        fd,
+        request: AMDGPU_INFO,
+        argument: (&raw mut info).cast(),
+    });
+    close_descriptor(fd);
+    result == 0
+}
+
+/// `struct drm_amdgpu_info_hw_ip`.
+#[cfg(feature = "radv")]
+#[repr(C)]
+#[derive(Default)]
+#[allow(dead_code, reason = "the kernel's layout, of which two words are read")]
+struct HwIp {
+    major: u32,
+    minor: u32,
+    capabilities: u64,
+    ib_start_alignment: u32,
+    ib_size_alignment: u32,
+    available_rings: u32,
+    /// Bits 23:16 major, 15:8 minor and 7:0 revision.
+    ip_discovery_version: u32,
+}
+
+/// The graphics core of the bound GPU at `index`, as amdgpu packs it in
+/// `ip_discovery_version`, with the GFX rings it has.
+#[cfg(feature = "radv")]
+pub(super) fn gc_version(index: u32) -> Option<(u32, u32)> {
+    let mut gfx = HwIp::default();
+    (amdgpu_info(index, AMDGPU_INFO_HW_IP_INFO, [0; 4], &mut gfx) && gfx.ip_discovery_version != 0)
+        .then_some((gfx.ip_discovery_version, gfx.available_rings))
+}
+
+/// `struct drm_amdgpu_info_vram_gtt`: VRAM, the part of it the CPU reaches
+/// through the BAR, and GTT.
+#[cfg(feature = "radv")]
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct VramGtt {
+    pub vram: u64,
+    pub visible: u64,
+    pub gtt: u64,
+}
+
+/// amdgpu's memory sizes of the bound GPU at `index`.
+#[cfg(feature = "radv")]
+pub(super) fn vram_gtt(index: u32) -> Option<VramGtt> {
+    let mut sizes = VramGtt::default();
+    amdgpu_info(index, AMDGPU_INFO_VRAM_GTT, [0; 4], &mut sizes).then_some(sizes)
+}
+
 /// The VRAM bytes of the bound GPU at `index`, for the guest's `StelaHost`.
+#[cfg(feature = "radv")]
+pub(in crate::engine) fn vram_bytes(index: u32) -> Option<u64> {
+    vram_gtt(index)
+        .map(|sizes| sizes.vram)
+        .filter(|&bytes| bytes != 0)
+}
+
+/// The VRAM bytes of the bound GPU at `index`, for the guest's `StelaHost`.
+#[cfg(feature = "nvk")]
 pub(in crate::engine) fn vram_bytes(index: u32) -> Option<u64> {
     let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
     if fd < 0 {

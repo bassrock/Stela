@@ -166,3 +166,9 @@ pub fn build_nvk(jobs: u16) -> Result<()> {
     nvk::build(&nvk::NVK, jobs)?;
     crate::guest::run()
 }
+
+/// [`build_nvk`] for RADV: its archives and the same guest components.
+pub fn build_radv(jobs: u16) -> Result<()> {
+    nvk::build(&radv::RADV, jobs)?;
+    crate::guest::run()
+}

@@ -898,7 +898,7 @@ pub(super) fn run<H: Host>(
             }
             // A GPU compilation no other PE took (`gate::run_job`), while
             // this PE's guest waits, so the count need not wait for it.
-            #[cfg(feature = "nvk")]
+            #[cfg(feature = "metal-device")]
             if idle {
                 super::gpu::gate::run_job(super::gpu::gate::Taker::Boot);
             }
@@ -1132,7 +1132,7 @@ impl ServiceTimes {
         if let Some(line) = super::gpu::pump_report(tsc_hz) {
             output::arguments(format_args!("{line}\n"));
         }
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         super::gpu::gate::report_calls(tsc_hz);
     }
 
@@ -2207,9 +2207,9 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
 /// at most, and the rest of the live heap (engine, devices, tables).
 fn owner_report(live: usize) {
     let (linux, linux_peak) = stela_linux::heap::usage();
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     let (libc, libc_peak) = super::gpu::client::LIBC_HEAP.usage();
-    #[cfg(not(feature = "nvk"))]
+    #[cfg(not(feature = "metal-device"))]
     let (libc, libc_peak) = (0, 0);
     output::arguments(format_args!(
         "HEAP OWNERS linux={}/{}M libc={}/{}M rest={}M\n",

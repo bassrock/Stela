@@ -7,7 +7,7 @@ use super::output;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use stela_boot_core::bundle_repair::{self, Boot, Change, Driver, Record};
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 use stela_boot_core::bundle_repair::{Decision, Report};
 use stela_soc_data::nor::{Image, nvram::Variables};
 
@@ -56,7 +56,7 @@ pub(super) fn nvram(bank: &[u8]) {
 
 /// What the kext's `report` decides for this boot; a change to NVRAM's
 /// record is kept for the stop. Only the GPU gate reports.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub(super) fn decide(report: Report) -> Decision {
     let record = RECORDS[usize::from(RECORD.load(Ordering::Relaxed)) % RECORDS.len()];
     let decision = bundle_repair::decide(

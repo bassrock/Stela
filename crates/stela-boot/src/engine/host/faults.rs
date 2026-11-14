@@ -212,7 +212,7 @@ pub(crate) fn page_fault(
     saved: &super::super::interrupts::SavedState<'_>,
 ) {
     let write = frame.error & 2 != 0;
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     if super::super::gpu::client::serve_fault(address, write) {
         return;
     }
