@@ -279,6 +279,8 @@ impl Archive {
             remaining_output: entry.bytes,
             inflater,
             produced: 0,
+            held: Vec::new(),
+            held_at: 0,
         })
     }
 
@@ -312,12 +314,26 @@ impl Archive {
         {
             return Err(corrupt("member read range"));
         }
-        // Reuse the cursor only when it has not yet passed this offset.
+        // Reuse the cursor when it has not yet passed this offset, or passed
+        // it only with bytes it holds from a read that failed partway.
         let mut progress = match cursor.take() {
-            Some(progress) if progress.produced <= offset => progress,
+            Some(progress) if progress.produced <= offset || progress.holds(offset) => progress,
             _ => self.start_member(reader, entry)?,
         };
-        if entry.method == Method::Stored {
+        let mut done = 0;
+        if progress.holds(offset) {
+            let from = (offset - progress.held_at) as usize;
+            done = (progress.held.len() - from).min(output.len());
+            output[..done].copy_from_slice(&progress.held[from..from + done]);
+        }
+        if done == output.len() {
+            // Held bytes cover the read; they stay for the reads after it.
+            *cursor = Some(progress);
+            return Ok(());
+        }
+        // Held bytes end where the inflater is, so the read goes on there.
+        progress.held.clear();
+        if entry.method == Method::Stored && done == 0 {
             // No inflater state depends on skipped input. Interleaved member
             // reads can discard a cursor; replaying a multi-gigabyte stored
             // image here would read every preceding byte again.
@@ -327,16 +343,33 @@ impl Archive {
             progress.remaining_output -= skip;
             progress.produced = offset;
         }
+        // A read that fails, as one waiting on the network does, keeps its
+        // cursor, with the bytes it produced for `output`, so the same read
+        // later goes on from there: a failed fill consumes nothing. Without
+        // it each retry inflated the member again from its start, and a
+        // large deflate member read over the network never finished.
         let mut discard = [0; 4096];
-        while progress.produced < offset {
+        while done == 0 && progress.produced < offset {
             let want = (offset - progress.produced).min(discard.len() as u64) as usize;
-            if self.pump(reader, &mut progress, &mut discard[..want])? == 0 {
-                return Err(corrupt("short random member read"));
+            match self.pump(reader, &mut progress, &mut discard[..want]) {
+                Ok(0) => return Err(corrupt("short random member read")),
+                Ok(_) => {}
+                Err(error) => {
+                    *cursor = Some(progress);
+                    return Err(error);
+                }
             }
         }
-        let mut done = 0;
         while done < output.len() {
-            let n = self.pump(reader, &mut progress, &mut output[done..])?;
+            let n = match self.pump(reader, &mut progress, &mut output[done..]) {
+                Ok(n) => n,
+                Err(error) => {
+                    progress.held.extend_from_slice(&output[..done]);
+                    progress.held_at = offset;
+                    *cursor = Some(progress);
+                    return Err(error);
+                }
+            };
             if n == 0 {
                 return Err(corrupt("short random member read"));
             }
@@ -355,12 +388,24 @@ pub struct Progress {
     remaining_output: u64,
     inflater: Option<Inflater>,
     produced: u64,
+    /// The bytes from `held_at` up to `produced` that a read which failed
+    /// partway produced, for its retry.
+    held: Vec<u8>,
+    held_at: u64,
 }
 
 impl Progress {
     /// Uncompressed bytes produced so far.
     pub fn produced(&self) -> u64 {
         self.produced
+    }
+
+    /// Whether held bytes, ending where the inflater is, cover `offset`.
+    fn holds(&self, offset: u64) -> bool {
+        !self.held.is_empty()
+            && offset >= self.held_at
+            && offset < self.produced
+            && self.held_at + self.held.len() as u64 == self.produced
     }
 }
 

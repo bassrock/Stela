@@ -591,3 +591,133 @@ fn a_scan_a_pending_read_stops_goes_on_without_reading_again() {
         );
     }
 }
+
+/// A network source whose every `every`th read runs out of time once
+/// bounded; counts the bytes it serves.
+struct Waiting {
+    source: Memory,
+    reads: usize,
+    every: usize,
+    served: u64,
+    blocked: bool,
+    bounded: bool,
+}
+impl ReadAt for Waiting {
+    type Error = &'static str;
+
+    fn len(&self) -> u64 {
+        self.source.len()
+    }
+
+    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> core::result::Result<(), Self::Error> {
+        self.reads += 1;
+        if self.bounded && self.reads.is_multiple_of(self.every) {
+            self.blocked = true;
+            return Err("the read's time ran out");
+        }
+        self.served += buffer.len() as u64;
+        self.source.read_at(offset, buffer)
+    }
+
+    fn blocked(&mut self) -> bool {
+        core::mem::take(&mut self.blocked)
+    }
+}
+
+fn noise(mut state: u32, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn reads_of_a_deflated_member_that_wait_on_the_network_resume_without_replaying_it() {
+    // RosettaOS, 5.6 GB deflated in the IPSW, read over the network: each
+    // read that ran out of time dropped the member's cursor, and the
+    // retry inflated it again from its start, so the install stalled.
+    let data = noise(0x2545_f491, 16 * BLOCK_BYTES + 777);
+    for every in [2, 3, 5, 7] {
+        let (source, manifest) = parts(&data, true, &[], &[], ERASE);
+        let archive = source.len();
+        let reader = Waiting {
+            source,
+            reads: 0,
+            every,
+            served: 0,
+            blocked: false,
+            bounded: false,
+        };
+        let mut store = Store::open(reader, manifest, 0).unwrap();
+        store.prepare().unwrap();
+        store.reader.served = 0;
+        store.reader.bounded = true;
+        let mut out = Vec::new();
+        let mut pending = 0;
+        let mut offset = 0;
+        while offset < data.len() {
+            let len = BLOCK_BYTES.min(data.len() - offset);
+            match store.read_at("os.dmg", offset as u64, len) {
+                Ok(bytes) => {
+                    out.extend(bytes);
+                    offset += len;
+                }
+                Err(Error::Pending) => pending += 1,
+                Err(error) => panic!("every={every}: {error:?}"),
+            }
+            assert!(pending < 100_000);
+        }
+        assert_eq!(out, data, "every={every}");
+        assert!(pending > 2, "every={every}");
+        // Each compressed byte about once: a retry goes on from its read.
+        assert!(
+            store.reader.served < archive + archive / 2,
+            "every={every}: served {} of {archive}",
+            store.reader.served
+        );
+    }
+}
+
+#[test]
+fn two_members_scanned_in_turn_while_waiting_keep_both_scans() {
+    let data = noise(0x5a, 12 * BLOCK_BYTES + 5);
+    let other = noise(0x61, 12 * BLOCK_BYTES + 9);
+    let (source, manifest) = parts(&data, true, &[("Extra", "extra.dmg", &other)], &[], ERASE);
+    let archive = source.len();
+    let reader = Waiting {
+        source,
+        reads: 0,
+        every: 3,
+        served: 0,
+        blocked: false,
+        bounded: false,
+    };
+    let mut store = Store::open(reader, manifest, 0).unwrap();
+    store.reader.bounded = true;
+    store.reader.served = 0;
+    let mut done = [false, false];
+    let mut turns = 0;
+    while !(done[0] && done[1]) {
+        for (at, path) in ["os.dmg", "extra.dmg"].into_iter().enumerate() {
+            if done[at] {
+                continue;
+            }
+            match store.verify(path) {
+                Ok(()) => done[at] = true,
+                Err(Error::Pending) => {}
+                Err(error) => panic!("{path}: {error:?}"),
+            }
+        }
+        turns += 1;
+        assert!(turns < 100_000);
+    }
+    assert!(
+        store.reader.served < archive + 128 * 1024,
+        "served {} of {archive}",
+        store.reader.served
+    );
+}
