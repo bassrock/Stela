@@ -802,6 +802,19 @@ pub fn release() -> bool {
     .is_some()
 }
 
+/// Stop drawing for good on the screen, whose memory may no longer be
+/// mapped, as a GPU's display after amdgpu's reset unmapped it: neither
+/// [`reclaim`] nor a stop draws on it again. False means another console
+/// operation was active.
+#[cfg(feature = "radv")]
+pub fn forget_screen() -> bool {
+    with_consoles(|active, parked| {
+        *active = None;
+        *parked = None;
+    })
+    .is_some()
+}
+
 /// Permanently stop the boot CPU and guest compositor from touching GOP.
 /// Parked text can still be rebound to a native scanout.
 pub(crate) fn retire_firmware() -> bool {

@@ -466,6 +466,31 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
     }
 }
 
+/// Give up the display [`take`] took and the nodes it kept, as amdgpu's
+/// reset of their GPU left them: the reset unmapped the display's buffers
+/// and holds the display's lock until it ends. Nothing is released, as a
+/// release calls the driver that waits for that end, and the console stops
+/// drawing on the unmapped buffer, which a draw would fault on.
+#[cfg(feature = "radv")]
+pub(in crate::engine) fn abandon() {
+    // SAFETY: the one boot CPU, after `take`.
+    let (taken, waiting) = unsafe { &mut *TAKEN.0.get() };
+    let had = taken.is_some();
+    if let Some(display) = taken.take() {
+        core::mem::forget(display);
+    }
+    let nodes = waiting.len();
+    core::mem::forget(core::mem::take(waiting));
+    if had && !crate::console::forget_screen() {
+        output::arguments(format_args!(
+            "GPU display: the console was busy as its screen was given up\n"
+        ));
+    }
+    output::arguments(format_args!(
+        "GPU display given up after the GPU's reset: display={had} nodes={nodes}\n"
+    ));
+}
+
 /// The scanout of the display [`take`] took, in its own mode, for the
 /// board's DCP.
 pub(in crate::engine) fn scanout() -> Option<Box<dyn Scanout>> {
