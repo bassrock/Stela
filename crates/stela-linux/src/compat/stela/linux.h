@@ -144,6 +144,10 @@ bool stela_linux_try_enter(const struct stela_linux_owner *owner);
 void stela_linux_exit(void);
 /* Checked quiescence in the serialized context, not a native IRQ witness. */
 bool stela_linux_quiescent(void);
+/* Quiescent, or nested only in kernel FPU sections (kernel/linux.c). */
+bool stela_linux_blocking_allocation_allowed(void);
+/* Open kernel_fpu_begin sections (kernel/fpu.c); zero outside one. */
+unsigned int stela_linux_kernel_fpu_depth(void);
 /* Runs irq_work a workqueue worker raised in process context, from a
  * quiescent task (its cond_resched after the item, or its park). */
 void stela_linux_irq_work_run_owed(void);
