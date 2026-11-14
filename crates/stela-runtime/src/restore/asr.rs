@@ -201,7 +201,12 @@ impl Sender {
                 break r;
             }
         };
-        if matches!(r, Poll::Ready(Err(_))) {
+        // A source that ran out of the time it may wait ([`Error::Pending`],
+        // a remote image range still arriving) has changed nothing: every
+        // read precedes the state it would advance, so the next poll reads
+        // again. Only a real failure ends the transfer. (Upstream issue #25,
+        // reported with this fix by rodgod-rr.)
+        if matches!(r, Poll::Ready(Err(_))) && !matches!(r, Poll::Ready(Err(Error::Pending))) {
             self.phase = Phase::Failed;
             self.recycled.clear();
         }
