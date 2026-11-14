@@ -32,6 +32,7 @@ _Noreturn void _Exit(int status);
 int atexit(void (*function)(void));
 char *getenv(const char *name);
 char *secure_getenv(const char *name);
+int system(const char *command);
 int mkstemps(char *path, int suffix);
 int mkstemp(char *path);
 int setenv(const char *name, const char *value, int overwrite);

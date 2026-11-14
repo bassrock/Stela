@@ -1,5 +1,11 @@
-# The libdrm and amdgpu API headers Mesa's AMD support code includes; no
-# library sources.
+# The libdrm and amdgpu API headers Mesa's AMD support code includes, and the
+# parts of libdrm_amdgpu RADV calls: its device, buffer, address space and
+# query entry points. The rest of libdrm is `compat/mesa/drm.c`.
 /*.h
 /include/drm/
 /amdgpu/*.h
+/amdgpu/amdgpu_bo.c
+/amdgpu/amdgpu_device.c
+/amdgpu/amdgpu_gpu_info.c
+/amdgpu/amdgpu_vamgr.c
+/amdgpu/handle_table.c

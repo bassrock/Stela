@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-/* The operating system LLVM's Support library expects, which nothing the image
- * runs reaches on a path that matters: there are no files, users, signals or
- * dates, so each call fails the way POSIX lets it and LLVM reports the error. */
+/* The operating system LLVM's Support library and RADV's debugging aids
+ * expect, which nothing the image runs reaches on a path that matters: there
+ * are no files, users, signals, dates or shell, so each call fails the way
+ * POSIX lets it and the caller reports the error. */
 #include <dirent.h>
 #include <errno.h>
 #include <pwd.h>
 #include <signal.h>
+#include <stdlib.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
@@ -170,4 +174,41 @@ size_t strftime(char *buffer, size_t size, const char *format, const struct tm *
 	(void)format;
 	(void)time;
 	return 0;
+}
+
+/* No shell: none is available, as system(NULL) says. */
+int system(const char *command)
+{
+	if (!command)
+		return 0;
+	errno = ENOSYS;
+	return -1;
+}
+
+int uname(struct utsname *name)
+{
+	(void)name;
+	return refused();
+}
+
+/* No files change under a watch, as there are none. */
+int inotify_init1(int flags)
+{
+	(void)flags;
+	return refused();
+}
+
+int inotify_add_watch(int fd, const char *path, uint32_t mask)
+{
+	(void)fd;
+	(void)path;
+	(void)mask;
+	return refused();
+}
+
+int inotify_rm_watch(int fd, int watch)
+{
+	(void)fd;
+	(void)watch;
+	return refused();
 }
