@@ -66,6 +66,8 @@ pub(super) struct Lane {
     pub(super) packages: &'static [(&'static str, &'static str)],
     /// The archive of the units not linked whole.
     pub(super) archive: &'static str,
+    /// Meson options of this driver's own, after [`OPTIONS`].
+    pub(super) meson_options: &'static [&'static str],
 }
 
 impl Lane {
@@ -80,6 +82,7 @@ impl Lane {
                     (*option).to_owned()
                 }
             })
+            .chain(self.meson_options.iter().map(|option| (*option).to_owned()))
             .collect()
     }
 
@@ -109,6 +112,7 @@ pub(super) const NVK: Lane = Lane {
     libelf: true,
     packages: &[],
     archive: "libstela-nvk.a",
+    meson_options: &[],
 };
 
 /// What NVK needs and nothing else: no window system, no cache on

@@ -64,4 +64,10 @@ pub(super) const RADV: Lane = Lane {
          Cflags: -I{libdrm} -I{libdrm}/include/drm -I{libdrm}/amdgpu\n",
     )],
     archive: "libstela-radv.a",
+    // RADV keys its pipeline cache UUID by its build ID, which it reads from
+    // its own ELF note or a file's timestamp; neither exists in the image, so
+    // the UUID fails and with it the physical device. The note's bytes of
+    // `compat/mesa/build_id.c`: Mesa's disk cache is out, and Stela keys its
+    // pipeline store by the compiler's fingerprint.
+    meson_options: &["-Dradv-build-id=5374656c6120737461746963616c6c79"],
 };
