@@ -414,6 +414,7 @@ pub fn diagnose_steps() -> Vec<Step> {
         optional("/sbin/mount -P 1", 120),
         optional("/usr/libexec/init_data_protection", 180),
         optional("/sbin/mount -P 2", 180),
+        optional("(/usr/libexec/logd &) ; /bin/sleep 5; /bin/echo logd started", 30),
         optional(
             &format!(
                 "{LOG} --predicate 'process == \"WindowServer\" AND (messageType == error OR messageType == fault OR eventMessage CONTAINS[c] \"metal\" OR eventMessage CONTAINS[c] \"device\" OR eventMessage CONTAINS[c] \"accelerator\")' 2>&1 | /usr/bin/tail -120"
@@ -426,7 +427,7 @@ pub fn diagnose_steps() -> Vec<Step> {
             ),
             600,
         ),
-        optional("/usr/sbin/ioreg -l -w0 -r -n gpu 2>&1 | /usr/bin/head -80", 60),
+        optional("/usr/sbin/ioreg -l -w0 -p IODeviceTree 2>&1 | /usr/bin/grep -i -B4 -A40 'stela' | /usr/bin/head -120", 60),
     ])
 }
 
