@@ -1107,7 +1107,9 @@ fn claim(
             ));
         }
     }
+    output::arguments(format_args!("GPU {address}: BARs mapped, reading its first register\n"));
     let first = registers.read32(0).map_err(ServiceError::Mapping)?;
+    output::arguments(format_args!("GPU {address}: first register {first:#010x}\n"));
     let (chip, firmware) = if driver.vendor == NOUVEAU.vendor {
         let chip = gpu::nouveau_chip::Chip::from_boot0(first).ok_or(ServiceError::Refused(
             "the GPU's PMC chipset is unsupported",
@@ -1144,6 +1146,7 @@ fn claim(
     })
     .quiesce_and_bind()
     .map_err(|failure| cold_refusal(address, failure.error))?;
+    output::arguments(format_args!("GPU {address}: bound for its driver\n"));
     // SAFETY: both original owners transfer into this retained function
     // lifetime before Linux probe. Only the temporary UC observation is retired.
     let (bound, views) = unsafe { ready.into_parts() };
@@ -1487,8 +1490,10 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
         bound: Vec::new(),
         result: Ok(()),
     };
+    output::arguments(format_args!("GPU Linux start: {} claimed\n", claimed.len()));
     // SAFETY: entered, on a task.
     job.result = unsafe { gpu::linux::start() };
+    output::arguments(format_args!("GPU Linux started: {:?}\n", job.result));
     if job.result.is_err() {
         // No source-specific device return was acknowledged.
         core::mem::forget(claimed);
@@ -1525,9 +1530,11 @@ fn start(kernel: &LinuxKernel, claimed: Vec<Claimed>) -> Started {
         };
         // SAFETY: entered on the same canonical kernel task. The device and
         // enrolled catalogue retain the exact original configuration/attachment.
+        output::arguments(format_args!("GPU Linux probe: attaching the device\n"));
         let attached = unsafe {
             Attached::new_catalogued(kernel, claimed.device, claimed.placement, authority)
         };
+        output::arguments(format_args!("GPU Linux probe: attach returned (ok={})\n", attached.is_ok()));
         match attached {
             Ok(attached) => {
                 // SAFETY: entered.
