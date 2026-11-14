@@ -131,6 +131,12 @@ pub enum Command {
         /// without display, and RADV backs the Metal device over it.
         #[arg(long)]
         radv: bool,
+        /// Carry amdgpu with its Display Core (CONFIG_DRM_AMD_DC and
+        /// CONFIG_DRM_AMD_DC_FP), which `--amdgpu` leaves out; implies
+        /// `--amdgpu`. DC binds the display hardware but nothing yet scans
+        /// out through it.
+        #[arg(long)]
+        amdgpu_dc: bool,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -504,11 +510,14 @@ pub fn run(command: Command) -> Result<ExitCode> {
             diagnostics,
             amdgpu,
             radv,
+            amdgpu_dc,
         } => {
             crate::gpu::fetch::fetch(false)?;
             let gpu = if radv {
                 crate::gpu::build_radv(crate::gpu::default_jobs())?;
-                Gpu::Radv
+                if amdgpu_dc { Gpu::RadvDc } else { Gpu::Radv }
+            } else if amdgpu_dc {
+                Gpu::AmdgpuDc
             } else if amdgpu {
                 Gpu::Amdgpu
             } else {
@@ -538,6 +547,10 @@ enum Gpu {
     Amdgpu,
     /// RADV, NIR and ACO over amdgpu, from `cargo xtask gpu radv`.
     Radv,
+    /// amdgpu with Display Core, without NVK.
+    AmdgpuDc,
+    /// RADV over amdgpu with its Display Core.
+    RadvDc,
 }
 
 fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
@@ -586,6 +599,12 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
         }
         Gpu::Radv => {
             command.args(["--features", "radv"]);
+        }
+        Gpu::AmdgpuDc => {
+            command.args(["--features", "amdgpu-dc"]);
+        }
+        Gpu::RadvDc => {
+            command.args(["--features", "radv,amdgpu-dc"]);
         }
     }
     if release {

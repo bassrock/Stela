@@ -41,6 +41,9 @@ radv = ["metal-device", "amdgpu", "stela-mesa/radv"]
 # The Metal device over the linked Mesa driver, whichever it is: what `nvk`
 # and `radv` have in common. Not chosen on its own.
 metal-device = ["dep:stela-mesa", "stela-drivers/metal-linked"]
+# amdgpu with its Display Core (CONFIG_DRM_AMD_DC, CONFIG_DRM_AMD_DC_FP): DC
+# binds the display hardware in the composite, as yet without a KMS consumer.
+amdgpu-dc = ["amdgpu", "stela-drivers/amdgpu-dc"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }

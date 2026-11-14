@@ -221,7 +221,7 @@ static bool request_supported(gfp_t flags)
 	if ((flags & (__GFP_HIGH | __GFP_RECLAIM)) == GFP_ATOMIC)
 		allowed |= __GFP_HIGH;
 	if ((flags & ~allowed) ||
-	    (gfpflags_allow_blocking(flags) && !stela_linux_quiescent())) {
+	    (gfpflags_allow_blocking(flags) && !stela_linux_blocking_allocation_allowed())) {
 		stela_linux_unsupported("cache allocation policy or context");
 		return false;
 	}

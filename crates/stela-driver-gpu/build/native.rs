@@ -216,6 +216,19 @@ impl Linux {
                 .iter()
                 .map(|source| PathBuf::from(format!("{DRM}/{source}.c"))),
         );
+        // The DSC and HDCP helpers and the panel backlight quirks amdgpu's
+        // Kconfig entry selects (DRM_DISPLAY_DSC_HELPER,
+        // DRM_DISPLAY_HDCP_HELPER, DRM_PANEL_BACKLIGHT_QUIRKS), which only DC
+        // reaches. Without CONFIG_DMI no quirk matches.
+        #[cfg(feature = "amdgpu-dc")]
+        upstream.extend(
+            [
+                "display/drm_dsc_helper",
+                "display/drm_hdcp_helper",
+                "drm_panel_backlight_quirks",
+            ]
+                .map(|source| PathBuf::from(format!("{DRM}/{source}.c"))),
+        );
         // The buddy allocator's core, which DRM's buddy helper selects.
         #[cfg(feature = "nouveau-port")]
         upstream.push(PathBuf::from(format!("{LINUX}/drivers/gpu/buddy.c")));
