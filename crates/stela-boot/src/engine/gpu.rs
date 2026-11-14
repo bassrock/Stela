@@ -1022,14 +1022,7 @@ fn claim(
         });
         // BAR sizing below temporarily turns off memory decode.
         checked?;
-        // amdgpu here has no display core, so it never takes the screen's
-        // pipe: keep the firmware's framebuffer for the Mac's scanout, which
-        // copies each frame into it, instead of going dark (radv port M0).
-        if driver.vendor == AMDGPU.vendor {
-            output::arguments(format_args!(
-                "GPU {address}: keeping the firmware's screen for the Mac's scanout\n"
-            ));
-        } else if !crate::console::retire_firmware() {
+        if !crate::console::retire_firmware() {
             return Err(ServiceError::Refused(
                 "a firmware framebuffer writer is still active",
             ));
