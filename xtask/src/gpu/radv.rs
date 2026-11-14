@@ -28,7 +28,13 @@ pub(super) const RADV: Lane = Lane {
     // addrlib's AVX2 swizzles, chosen by a CPU check of compiler-rt's that the
     // image lacks; the image runs on any x86-64.
     host_flags: &["-DADDR_ALLOW_SIMD=1"],
-    stand_ins: &["build_id", "drm", "soft_float", "drm_amdgpu"],
+    stand_ins: &[
+        "build_id",
+        "drm",
+        "soft_float",
+        "drm_amdgpu",
+        "radv_nir_options",
+    ],
     vendored: &[
         ("libdrm", "amdgpu/amdgpu_bo.c"),
         ("libdrm", "amdgpu/amdgpu_device.c"),
@@ -38,6 +44,10 @@ pub(super) const RADV: Lane = Lane {
     ],
     vendored_flags: &[
         "-DHAVE_LIBDRM_ATOMIC_PRIMITIVES=1",
+        // amdgpu in the image's Linux environment has functions of these
+        // names; Mesa calls neither, only libdrm's own units.
+        "-Damdgpu_bo_list_create=stela_libdrm_amdgpu_bo_list_create",
+        "-Damdgpu_bo_set_metadata=stela_libdrm_amdgpu_bo_set_metadata",
         "-I{libdrm}",
         "-I{libdrm}/include/drm",
         "-I{libdrm}/amdgpu",
