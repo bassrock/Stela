@@ -387,7 +387,8 @@ mod tests {
         assert_eq!(
             unused(&amd),
             "the AMD display adapter at 0000:03:00.0 (device 744c) is not used: Stela's amdgpu \
-             runs only the Radeon RX 9070 and 9070 XT (Navi 48)"
+             runs only the Radeon RX 9070 and 9070 XT (Navi 48) and the RX 6800, 6800 XT, \
+             6900 XT and 6950 XT (Navi 21)"
         );
         assert!(
             unused(&at(3, Vendor::Amd, 0x7550))

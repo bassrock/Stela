@@ -1091,6 +1091,72 @@ pub const AMDGPU: &[Recipe] = &[
     ),
 ];
 
+/// The files amdgpu asks for on Navi 21 (Sienna Cichlid: the RX 6800, 6800 XT
+/// and 6900 XT), named by the chip: GFX 10.3's CE, PFP, ME, MEC and MEC2
+/// microcode and its RLC, PSP 11.0.7's SOS and TA, SMU 11.0.7, SDMA 5.2 and
+/// VCN 3.0 (`MODULE_FIRMWARE` in gfx_v10_0.c, psp_v11_0.c, smu_v11_0.c,
+/// sdma_v5_2.c and amdgpu_vcn.c). GFX 10.3 runs no MES by default. Not asked
+/// for: the CAP image, which only an SR-IOV virtual function loads, and the
+/// display's DMCUB, which amdgpu loads only with its display core. MEC2 is
+/// byte for byte MEC.
+pub const AMDGPU_NAVI21: &[Recipe] = &[
+    amdgpu(
+        "amdgpu/sienna_cichlid_ce.bin",
+        263296,
+        "156769265ed26c8cb14902a13e14871732245daeffb793bdf394c1bd3de76f00",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_me.bin",
+        263424,
+        "fbdf0e27e1c232e5b0a69f52efd5692a1803ec2a0d77201ea678dc8bc6407116",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_mec.bin",
+        268160,
+        "ce7442ce45828e5726bb7b05d1fba7f228dd184f5c0a9daf6647a025540d7d39",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_mec2.bin",
+        268160,
+        "ce7442ce45828e5726bb7b05d1fba7f228dd184f5c0a9daf6647a025540d7d39",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_pfp.bin",
+        263424,
+        "fa904ab1609ab090d90edc0d11132fc9821a05800466b04a193c62d5a5c2d5ae",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_rlc.bin",
+        132960,
+        "19d19bce396b6dc725acb87cdf419e6151a1b2961ff43d6e026e17ecf20c83d0",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_sdma.bin",
+        34048,
+        "1aad9d95e1205d4a0c8da01670aa9fc6f77010ac04a321d8c644f581ada6c7ce",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_smc.bin",
+        247396,
+        "0eb99764288f764fd853d6973693ffa52419cc7ba62074aee85df4a3e8d0286d",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_sos.bin",
+        227456,
+        "67706b9e1545bf68850bf9cea97660af5972574ecb0ca30041174efbb59fac37",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_ta.bin",
+        386816,
+        "dc28d6a9abc3e3a1e9e8c4f787fc179a3e02bd1d5d6a72f178f88b1ad5e61569",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_vcn.bin",
+        582800,
+        "2f3cbd54cc9fad35665c06079f61e175dae3dca34d971bfeb73e4ab3efd7bf65",
+    ),
+];
+
 /// The target amdgpu's requests carry.
 const AMDGPU_TARGET: Target<'static> = Target {
     driver: "amdgpu",
@@ -1104,16 +1170,33 @@ const AMDGPU_TARGET: Target<'static> = Target {
 /// whose 1002:7550 is the one checked on hardware. Navi 48's 1002:7551
 /// boards would need the kicker images.
 pub fn amd_chip(device: u16) -> Option<&'static str> {
-    (device == 0x7550).then_some("navi48")
+    match device {
+        0x7550 => Some("navi48"),
+        // Navi 21: 73A0..73AF and 73BF are its desktop boards (RX 6800,
+        // 6800 XT, 6900 XT, 6950 XT and the Pro W6800), as amdgpu's PCI ID
+        // table lists them under CHIP_SIENNA_CICHLID. 1002:73BF is the RX 6800
+        // XT this port is checked on.
+        0x73A0..=0x73AF | 0x73BF => Some("navi21"),
+        _ => None,
+    }
+}
+
+/// The recipes amdgpu reads on `chip`, named as [`amd_chip`] names chips.
+pub fn amdgpu_recipes(chip: &str) -> Option<&'static [Recipe]> {
+    match chip {
+        "navi48" => Some(AMDGPU),
+        "navi21" => Some(AMDGPU_NAVI21),
+        _ => None,
+    }
 }
 
 /// Requires the files amdgpu asks for on `chip`, named as [`amd_chip`] names
 /// chips.
 pub fn require_amdgpu(inventory: &mut Inventory, chip: &str) -> Result<(), Error> {
-    if chip != "navi48" {
+    let Some(recipes) = amdgpu_recipes(chip) else {
         return Err(Error(format!("{chip} is no chip Stela's amdgpu runs")));
-    }
-    for recipe in AMDGPU {
+    };
+    for recipe in recipes {
         inventory.observe(Requirement {
             name: recipe.image.member,
             target: AMDGPU_TARGET,
@@ -1133,6 +1216,7 @@ fn select_amdgpu(request: &Request) -> Option<&'static Recipe> {
     }
     AMDGPU
         .iter()
+        .chain(AMDGPU_NAVI21)
         .find(|recipe| recipe.image.member == request.name)
 }
 
