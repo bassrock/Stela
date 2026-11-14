@@ -1861,6 +1861,7 @@ pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
 pub(super) fn serve(
     #[cfg_attr(not(feature = "metal-device"), allow(unused_variables))] screen: Option<(usize, usize)>,
     #[cfg_attr(not(feature = "metal-device"), allow(unused_variables))] firmware: Option<&str>,
+    #[cfg_attr(not(feature = "metal-device"), allow(unused_variables))] size: Option<(u32, u32)>,
 ) {
     #[cfg(feature = "metal-device")]
     {
@@ -1869,7 +1870,7 @@ pub(super) fn serve(
             (Some(_), None) => display::Shown::Unknown,
             (Some(_), Some(function)) => display::Shown::By(function),
         };
-        display::take(screen.unwrap_or((0, 0)), shown);
+        display::take(screen.unwrap_or((0, 0)), shown, size);
         gate::open_service();
     }
 }
