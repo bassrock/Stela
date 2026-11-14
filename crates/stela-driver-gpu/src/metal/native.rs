@@ -198,7 +198,21 @@ unsafe extern "system" fn forward(
     if let Some(data) = data.filter(|data| !data.p_message.is_null()) {
         // SAFETY: the driver's message is a NUL-terminated string for the call.
         if let Ok(message) = unsafe { CStr::from_ptr(data.p_message) }.to_str() {
-            log(message.trim_end());
+            // Mesa names a message by the source line that made it, which
+            // says where a bare result such as an out-of-memory came from.
+            let name = (!data.p_message_id_name.is_null())
+                .then(|| {
+                    // SAFETY: as above, for the name when the driver gives one.
+                    unsafe { CStr::from_ptr(data.p_message_id_name) }
+                        .to_str()
+                        .ok()
+                })
+                .flatten()
+                .filter(|name| !name.is_empty());
+            match name {
+                Some(name) => log(&alloc::format!("{name}: {}", message.trim_end())),
+                None => log(message.trim_end()),
+            }
         }
     }
     vk::FALSE
