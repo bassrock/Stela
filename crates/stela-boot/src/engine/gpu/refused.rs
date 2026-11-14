@@ -26,11 +26,13 @@ const EAGAIN: i64 = -11;
 const ERESTARTSYS: i64 = -512;
 
 /// An ioctl argument's first bytes as the caller passed them: the kernel
-/// writes its answer over the same structure.
+/// writes its answer over the same structure. Only amdgpu's are decoded.
+#[cfg_attr(not(feature = "radv"), allow(dead_code))]
 pub(super) struct Input {
     bytes: [u8; KEPT],
 }
 
+#[cfg_attr(not(feature = "radv"), allow(dead_code))]
 impl Input {
     fn u32(&self, at: usize) -> u32 {
         u32::from_le_bytes(self.bytes[at..at + 4].try_into().expect("four bytes"))
