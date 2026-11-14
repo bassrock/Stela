@@ -178,6 +178,25 @@ bool stela_linux_quiescent(void)
 	       !preempt_count() && irq_flags == ARCH_IRQ_ENABLED;
 }
 
+/* Whether a blocking (GFP_KERNEL-class) allocation may proceed. Quiescence
+ * admits one; so does process context whose only nesting is kernel-mode FPU
+ * sections and the plain preemption counts their callers take around them
+ * (amdgpu's dc_fpu_begin adds one per level). Linux's Display Core builds
+ * whole resource pools inside DC_FP_START with GFP_KERNEL, which Linux's slab
+ * serves without sleeping. Here the platform heap never enters Linux's
+ * scheduler, so no task switch can reuse the FPU save area, and the
+ * scheduler still traps on the nonzero preemption count. */
+bool stela_linux_blocking_allocation_allowed(void)
+{
+	if (stela_linux_quiescent())
+		return true;
+	return stela_linux_kernel_fpu_depth() &&
+	       !stela_linux_atomic_callback_active() &&
+	       !stela_linux_rcu_callback_active() &&
+	       !((unsigned int)preempt_count() & ~PREEMPT_MASK) &&
+	       irq_flags == ARCH_IRQ_ENABLED;
+}
+
 #ifdef STELA_LINUX_ENTRY_GENERATION_TEST
 #include <stela/test.h>
 static void exhaust_generation(void)

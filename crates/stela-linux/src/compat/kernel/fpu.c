@@ -27,6 +27,7 @@
 #include <linux/string.h>
 #include <linux/types.h>
 #include <asm/fpu/api.h>
+#include <stela/linux.h>
 
 /* XSAVE's standard-format area for XCR0's components: CPUID(0xD, 0).EBX,
  * 832 bytes for x87, SSE and AVX, about 2.7 KiB with AVX-512. */
@@ -137,6 +138,11 @@ void kernel_fpu_end(void)
 	preempt_enable();
 }
 EXPORT_SYMBOL_GPL(kernel_fpu_end);
+
+unsigned int stela_linux_kernel_fpu_depth(void)
+{
+	return depth;
+}
 
 /* Linux code never runs in a hardware interrupt here, and a simulated IRQ
  * may use the FPU only outside another section. */
