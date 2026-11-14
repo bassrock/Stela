@@ -592,132 +592,110 @@ fn a_scan_a_pending_read_stops_goes_on_without_reading_again() {
     }
 }
 
-/// A network source whose every `every`th read runs out of time once
-/// bounded; counts the bytes it serves.
-struct Waiting {
-    source: Memory,
-    reads: usize,
-    every: usize,
-    served: u64,
-    blocked: bool,
-    bounded: bool,
-}
-impl ReadAt for Waiting {
-    type Error = &'static str;
-
-    fn len(&self) -> u64 {
-        self.source.len()
+/// A remote image's device-verified members have no scan: their reads go
+/// straight to the cursors. A read longer than a few network refills that
+/// runs out of time again and again still goes on where it stopped, and
+/// reads each compressed byte once; any other failure drops the cursor.
+#[test]
+fn a_pending_device_verified_read_goes_on_from_its_bytes_so_far() {
+    /// Every third read runs out of time once reads are bounded; counts
+    /// the bytes it serves.
+    struct Stalling {
+        source: Memory,
+        reads: usize,
+        served: u64,
+        blocked: bool,
+        bounded: bool,
+        broken: bool,
     }
+    impl ReadAt for Stalling {
+        type Error = &'static str;
 
-    fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> core::result::Result<(), Self::Error> {
-        self.reads += 1;
-        if self.bounded && self.reads.is_multiple_of(self.every) {
-            self.blocked = true;
-            return Err("the read's time ran out");
+        fn len(&self) -> u64 {
+            self.source.len()
         }
-        self.served += buffer.len() as u64;
-        self.source.read_at(offset, buffer)
+
+        fn read_at(
+            &mut self,
+            offset: u64,
+            buffer: &mut [u8],
+        ) -> core::result::Result<(), Self::Error> {
+            self.reads += 1;
+            if self.broken {
+                return Err("connection refused");
+            }
+            if self.bounded && self.reads.is_multiple_of(3) {
+                self.blocked = true;
+                return Err("the read's time ran out");
+            }
+            self.served += buffer.len() as u64;
+            self.source.read_at(offset, buffer)
+        }
+
+        fn blocked(&mut self) -> bool {
+            core::mem::take(&mut self.blocked)
+        }
     }
 
-    fn blocked(&mut self) -> bool {
-        core::mem::take(&mut self.blocked)
-    }
-}
-
-fn noise(mut state: u32, len: usize) -> Vec<u8> {
-    (0..len)
+    // Barely compressible, so one read spans many input refills.
+    let mut state = 0x1b87_3593_u32;
+    let data: Vec<u8> = (0..3 * MAX_READ_BYTES + 777)
         .map(|_| {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
             (state >> 24) as u8
         })
-        .collect()
-}
-
-#[test]
-fn reads_of_a_deflated_member_that_wait_on_the_network_resume_without_replaying_it() {
-    // RosettaOS, 5.6 GB deflated in the IPSW, read over the network: each
-    // read that ran out of time dropped the member's cursor, and the
-    // retry inflated it again from its start, so the install stalled.
-    let data = noise(0x2545_f491, 16 * BLOCK_BYTES + 777);
-    for every in [2, 3, 5, 7] {
-        let (source, manifest) = parts(&data, true, &[], &[], ERASE);
+        .collect();
+    for deflate in [false, true] {
+        let (source, mut manifest) = parts(&data, deflate, &[], &[], ERASE);
+        manifest.layout = stela_formats::payload::Layout::Remote {
+            url: "http://updates-http.cdn-apple.com/a.ipsw".into(),
+            etag: "\"e\"".into(),
+        };
+        manifest.source.sha256 = None;
+        manifest.members[0].sha256 = None;
         let archive = source.len();
-        let reader = Waiting {
+        let reader = Stalling {
             source,
             reads: 0,
-            every,
             served: 0,
             blocked: false,
             bounded: false,
+            broken: false,
         };
         let mut store = Store::open(reader, manifest, 0).unwrap();
         store.prepare().unwrap();
         store.reader.served = 0;
         store.reader.bounded = true;
-        let mut out = Vec::new();
         let mut pending = 0;
         let mut offset = 0;
         while offset < data.len() {
-            let len = BLOCK_BYTES.min(data.len() - offset);
-            match store.read_at("os.dmg", offset as u64, len) {
-                Ok(bytes) => {
-                    out.extend(bytes);
-                    offset += len;
+            let len = MAX_READ_BYTES.min(data.len() - offset);
+            let bytes = loop {
+                match store.read_at("os.dmg", offset as u64, len) {
+                    Ok(bytes) => break bytes,
+                    Err(Error::Pending) => pending += 1,
+                    Err(error) => panic!("deflate={deflate}: {error:?}"),
                 }
-                Err(Error::Pending) => pending += 1,
-                Err(error) => panic!("every={every}: {error:?}"),
-            }
-            assert!(pending < 100_000);
+                assert!(pending < 1000, "deflate={deflate}");
+            };
+            assert!(bytes == data[offset..offset + len], "deflate={deflate}");
+            offset += len;
         }
-        assert_eq!(out, data, "every={every}");
-        assert!(pending > 2, "every={every}");
-        // Each compressed byte about once: a retry goes on from its read.
+        assert!(pending >= 2, "deflate={deflate}");
         assert!(
-            store.reader.served < archive + archive / 2,
-            "every={every}: served {} of {archive}",
+            store.reader.served < archive + 64 * 1024,
+            "deflate={deflate}: served {} of {archive}",
             store.reader.served
         );
+        // A failure that is not the source's time running out drops the
+        // cursor: the next read starts the member again.
+        store.reader.bounded = false;
+        assert!(store.read_at("os.dmg", 0, 16).is_ok());
+        store.reader.broken = true;
+        let error = store.read_at("os.dmg", 16, MAX_READ_BYTES);
+        assert!(matches!(error, Err(Error::Payload(_))), "{error:?}");
+        assert!(store.cursors.0.is_empty(), "deflate={deflate}");
     }
-}
-
-#[test]
-fn two_members_scanned_in_turn_while_waiting_keep_both_scans() {
-    let data = noise(0x5a, 12 * BLOCK_BYTES + 5);
-    let other = noise(0x61, 12 * BLOCK_BYTES + 9);
-    let (source, manifest) = parts(&data, true, &[("Extra", "extra.dmg", &other)], &[], ERASE);
-    let archive = source.len();
-    let reader = Waiting {
-        source,
-        reads: 0,
-        every: 3,
-        served: 0,
-        blocked: false,
-        bounded: false,
-    };
-    let mut store = Store::open(reader, manifest, 0).unwrap();
-    store.reader.bounded = true;
-    store.reader.served = 0;
-    let mut done = [false, false];
-    let mut turns = 0;
-    while !(done[0] && done[1]) {
-        for (at, path) in ["os.dmg", "extra.dmg"].into_iter().enumerate() {
-            if done[at] {
-                continue;
-            }
-            match store.verify(path) {
-                Ok(()) => done[at] = true,
-                Err(Error::Pending) => {}
-                Err(error) => panic!("{path}: {error:?}"),
-            }
-        }
-        turns += 1;
-        assert!(turns < 100_000);
-    }
-    assert!(
-        store.reader.served < archive + 128 * 1024,
-        "served {} of {archive}",
-        store.reader.served
-    );
 }

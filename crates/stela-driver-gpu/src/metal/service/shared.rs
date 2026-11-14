@@ -89,6 +89,9 @@ use core::{
 use stela_contracts::gate::{BundleReport, CallerFault, CallerMemory, GateService, MemoryRange};
 use stela_crypto::{Sha256, digest::Digest};
 
+mod read_back;
+use read_back::{ReadBacks, Step};
+
 pub struct SharedService<B: Backend, C: Compiler> {
     service: UnsafeCell<Service<B, C>>,
     locked: AtomicBool,
@@ -162,6 +165,8 @@ pub struct SharedService<B: Backend, C: Compiler> {
     /// while it is not zero no poll is answered from the published serial,
     /// which cannot say which command buffer failed.
     refusals: Arc<AtomicU32>,
+    /// `GetBytes` calls whose GPU copies are finished outside the turn.
+    read_backs: ReadBacks,
     host: ServiceHost,
 }
 
@@ -254,19 +259,32 @@ impl RecentImports {
 /// The bytes of a library a `NewLibrary` call reads and digests at once,
 /// before its turn; a run reads pieces until its budget
 /// ([`SharedService::set_library_budget`]) is spent, at least one.
-const LIBRARY_PIECE_BYTES: usize = 1 << 20;
+pub(super) const LIBRARY_PIECE_BYTES: usize = 1 << 20;
 
 /// Libraries read in part at once; past this the oldest is dropped, and its
 /// call, made again, starts over.
 const STAGED: usize = 4;
 
-/// A `NewLibrary` call's bytes read so far ([`SharedService::stage_library`]).
+/// A `NewLibrary` call's library read so far ([`SharedService::stage_library`]).
+///
+/// A library is first read only to digest it, a piece at a time through one
+/// piece buffer, keeping no byte: the device shares the bytes of a library
+/// it already holds by their digest, and every process loads the same
+/// system libraries of hundreds of megabytes. Only when the turn finds the
+/// device holds no library of that digest is the library read again into
+/// `kept`, digested again as it is copied, so the kept bytes are what the
+/// digest names even when the caller changed them between the reads.
 struct Staging {
     connection: u64,
     record: u64,
     span: Span,
-    bytes: Vec<u8>,
+    /// The bytes read and digested so far.
+    read: usize,
     digest: Sha256,
+    /// The buffer each piece is read into while only digesting.
+    piece: Vec<u8>,
+    /// The bytes, once the turn asked for them.
+    kept: Option<Vec<u8>>,
 }
 
 /// What reading the next piece of a call's library found.
@@ -648,7 +666,13 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         let lock = compile_lock.clone();
         let relax = host.relax;
         let counted = refusals.clone();
+        // Texture reads copy out of host memory outside the turn; none
+        // outlives the lost device's memory.
+        service.reads_back = true;
+        let read_backs = ReadBacks::new();
+        let generation = read_backs.generation.clone();
         service.prepare_reopened(Box::new(move |device| {
+            generation.end();
             device.count_failures(&counted);
             if let Some(lock) = &lock
                 && let Some(compiler) = air(device.compiler_mut())
@@ -695,6 +719,7 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             upkeep_asked: AtomicBool::new(false),
             look_budget: AtomicU64::new(0),
             refusals,
+            read_backs,
             host,
         }
     }
@@ -994,42 +1019,63 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
                 .position(|staged| (staged.connection, staged.record, staged.span) == at)?;
             Some(staging.remove(found))
         });
+        let piece = self.library_piece.load(Ordering::Acquire);
         let mut staged = match kept {
             Some(staged) => staged,
             None => {
-                let mut bytes = Vec::new();
+                let mut buffer = Vec::new();
                 // Without room the turn reports the failure.
-                if bytes.try_reserve_exact(length).is_err() {
+                if buffer.try_reserve_exact(piece.min(length)).is_err() {
                     return Staged::Not;
                 }
                 Staging {
                     connection: connection.get(),
                     record,
                     span,
-                    bytes,
+                    read: 0,
                     digest: Sha256::new(),
+                    piece: buffer,
+                    kept: None,
                 }
             }
         };
+        // The second read keeps every byte: the one allocation of the
+        // library's size, made only for a library the device does not hold.
+        if let Some(kept) = &mut staged.kept
+            && kept.capacity() < length
+            && kept.try_reserve_exact(length).is_err()
+        {
+            return Staged::Not;
+        }
         let budget = self.library_budget.load(Ordering::Acquire);
-        let piece = self.library_piece.load(Ordering::Acquire);
         let began = (self.host.ticks)();
         let found = loop {
-            let start = staged.bytes.len();
+            let start = staged.read;
             if start == length {
                 break Staged::Ready;
             }
             let end = start.saturating_add(piece).min(length);
-            staged.bytes.resize(end, 0);
-            if let Err(error) = caller.read(span.address + start as u64, &mut staged.bytes[start..])
-            {
-                staged.bytes.truncate(start);
+            let target = match &mut staged.kept {
+                Some(kept) => {
+                    kept.resize(end, 0);
+                    &mut kept[start..end]
+                }
+                None => {
+                    staged.piece.resize(end - start, 0);
+                    &mut staged.piece[..end - start]
+                }
+            };
+            if let Err(error) = caller.read(span.address + start as u64, target) {
+                if let Some(kept) = &mut staged.kept {
+                    kept.truncate(start);
+                }
                 match error {
                     CallerFault::Denied { .. } => break Staged::Unmapped,
                     _ => return Staged::Not,
                 }
             }
-            staged.digest.update(&staged.bytes[start..]);
+            staged.digest.update(&*target);
+            staged.read = end;
             if end < length && (self.host.ticks)().wrapping_sub(began) >= budget {
                 break Staged::Pending;
             }
@@ -1048,15 +1094,35 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
         let staged = self.staging.with(|staging| {
             let found = staging.iter().position(|staged| {
                 (staged.connection, staged.record) == (connection.get(), record)
-                    && staged.bytes.len() as u64 == staged.span.length
+                    && staged.read as u64 == staged.span.length
             })?;
             Some(staging.remove(found))
         })?;
         Some(StagedLibrary {
             span: staged.span,
-            bytes: staged.bytes,
+            bytes: staged.kept,
             digest: staged.digest.finalize().into(),
         })
+    }
+
+    /// Reads the library of the call at `record` again, keeping its bytes,
+    /// once its turn found the device holds no library of its digest.
+    fn keep_library(&self, connection: NonZeroU64, record: u64, span: Span) {
+        let staged = Staging {
+            connection: connection.get(),
+            record,
+            span,
+            read: 0,
+            digest: Sha256::new(),
+            piece: Vec::new(),
+            kept: Some(Vec::new()),
+        };
+        self.staging.with(|staging| {
+            if staging.len() == STAGED {
+                staging.remove(0);
+            }
+            staging.push(staged);
+        });
     }
 
     /// Queues each of `jobs` unless one of its key is queued, running or
@@ -1113,6 +1179,15 @@ impl<B: Backend, C: Compiler + 'static> SharedService<B, C> {
             .try_turn()
             .and_then(|mut turn| turn.device().take_completion())?;
         Some((fd, self.timeline.fetch_add(1, Ordering::AcqRel) + 1))
+    }
+
+    /// Offers the device's completion timeline again
+    /// ([`Self::take_completion`]), for a waiter started in place of one that
+    /// left by itself ([`super::waiters`]): whether one is offered. False
+    /// while a call holds the service, or once the device is lost.
+    pub fn rearm_completion(&self) -> bool {
+        self.try_turn()
+            .is_some_and(|mut turn| turn.device().rearm_completion())
     }
 
     /// Whether work was submitted that is not yet published complete: a
@@ -1403,8 +1478,10 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
         });
         self.staging
             .with(|staging| staging.retain(|staged| staged.connection != connection.get()));
+        self.forget_read_backs(connection);
         // The gate closes only connections it opened and holds.
         let closed = self.call(|service| {
+            self.free_read_backs(service);
             for slot in &self.polling {
                 let _ =
                     slot.compare_exchange(connection.get(), 0, Ordering::AcqRel, Ordering::Acquire);
@@ -1441,6 +1518,16 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
             served_at_once(operation, Status::Pending);
             return Ok(());
         }
+        // A texture read's band whose GPU copy completed is copied to the
+        // caller here, holding no turn.
+        let read_back_from = match self.read_back_step(connection, record, caller)? {
+            Step::Not => None,
+            Step::From(band) => Some(band),
+            Step::Answered(status) => {
+                served_at_once(Operation::GetBytes.raw(), status);
+                return Ok(());
+            }
+        };
         // A poll answers from the completion a turn or the waiter published,
         // whether or not a call holds the service: a turn would ask the
         // device again, a timeline query the host's Linux environment
@@ -1467,6 +1554,9 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
         let Some(mut turn) = self.turn_within(rang) else {
             // Nothing of the call ran: it is made again once the frontend
             // has had its processor back.
+            if let Some(band) = read_back_from {
+                self.resume_read_back(connection, record, caller, band);
+            }
             let call = read_record(record, caller)?;
             answer_pending(record, call, caller)?;
             let left = (self.host.ticks)();
@@ -1491,8 +1581,10 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
         turn.catch_up();
         let job_lock = deferring.then_some(&self.job_lock);
         let mut answer = None;
+        let mut read_back = None;
         self.job_lock.lock.set_deferred(false);
         (self.host.run)(self.host.stack, &mut || {
+            self.free_read_backs(&mut turn);
             self.adopt_jobs(&mut turn);
             turn.device().compiler_mut().defer_compiles(deferring);
             turn.device().backend().defer_pipelines(job_lock);
@@ -1503,8 +1595,18 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
             if staged {
                 turn.staged_library = self.staged_library(connection, record);
             }
+            turn.read_back_from = read_back_from;
             let served = turn.serve(connection, record, &mut deferrable);
+            turn.read_back_from = None;
+            // Read while the turn holds the device it came from.
+            read_back = turn
+                .read_back_started
+                .take()
+                .map(|started| (started, self.read_backs.generation.current()));
             turn.staged_library = None;
+            if let Some(span) = turn.library_wanted.take() {
+                self.keep_library(connection, record, span);
+            }
             let device = turn.device();
             // A call that went on past a deferral may have left both.
             let jobs: Vec<Job> = [
@@ -1526,6 +1628,9 @@ impl<B: Backend + Send, C: Compiler + Send + 'static> GateService for SharedServ
         });
         let (mut served, mut refused, noted, (mut operation, mut status), jobs) =
             answer.expect("the platform runs what it is given");
+        if let Some((started, epoch)) = read_back {
+            self.started_read_back(connection, record, caller, started, epoch);
+        }
         if !jobs.is_empty() {
             // The call left nothing but the compilation: it is answered
             // `Pending`, and made again once the job has run.

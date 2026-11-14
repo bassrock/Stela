@@ -192,6 +192,25 @@ impl Host {
         &mut self,
         dma: &mut dyn DmaAllocator,
     ) -> Result<Self, (alloc::string::String, BlockError)> {
+        let controller = self.engine.io.controller.clone();
+        let port = controller.borrow().root_port_of(self.device.id);
+        self.reset_and_rebind_once(dma)
+            .map_err(|(operation, error)| {
+                // The port as the failed step left it.
+                match port.map(|port| controller.borrow_mut().root_port_status(port)) {
+                    Some(status) => (alloc::format!("{operation} ({status})"), error),
+                    None => (operation, error),
+                }
+            })
+    }
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    fn reset_and_rebind_once(
+        &mut self,
+        dma: &mut dyn DmaAllocator,
+    ) -> Result<Self, (alloc::string::String, BlockError)> {
         self.engine.poisoned = true;
         let fail = |why| {
             (
@@ -426,6 +445,15 @@ impl Host {
     }
     pub fn requires_rebind(&self) -> bool {
         self.engine.poisoned
+    }
+    /// Whether [`Self::reset_and_rebind`] needs fresh rings from its
+    /// allocator, as a device behind a hub does.
+    pub(super) fn reset_needs_allocation(&self) -> bool {
+        self.engine
+            .io
+            .controller
+            .try_borrow()
+            .is_ok_and(|controller| controller.reset_needs_allocation(self.device.id))
     }
     /// What the last command's data phase moved in before it failed.
     pub(super) fn take_failed_data(&mut self) -> Option<Vec<u8>> {

@@ -71,6 +71,10 @@ impl Kick for Doorbells {
         host::fresh_counter()
     }
 
+    fn count(&self) -> Option<u64> {
+        Some(host::fresh_counter())
+    }
+
     fn released(&self) -> bool {
         super::storage::released()
     }
@@ -259,7 +263,8 @@ impl Pe {
                 // staged guest disk its host I/O.
                 stop if machine.yielded_for_interrupt(&stop) => {
                     super::run::host_work(&mut machine, |machine| {
-                        super::service::serve(false, false);
+                        let watch = machine.guest_watch();
+                        super::service::serve(false, false, &watch);
                         super::display::flush(super::display::Turn::Idle);
                         if super::storage::serve_staged(true) {
                             machine.devices.call_home();
@@ -296,6 +301,8 @@ impl Pe {
                 stop => stopped(pe, stop),
             }
             hub.publish(pe, machine.counts());
+            // Whether the boot processor's Linux step returns.
+            super::step_watchdog::look();
             if machine.step_timing().is_some() {
                 hub.add_system_exits(pe, &machine.take_system_exits());
                 if machine.has_hot_samples() {
@@ -431,8 +438,9 @@ pub(super) fn report_source_observations<H: Host>(home: &Machine<H, Board>) {
 
 /// A PE's machine stopped, which only the home machine may: the board stops.
 fn stopped(pe: usize, stop: Stop) -> ! {
-    output::arguments(format_args!("PARALLEL PE {pe} stopped: {stop:?}\n"));
-    output::fatal("a PE on its own host core stopped")
+    output::fatal(format_args!(
+        "PE {pe} on its own host core stopped: {stop:?}"
+    ))
 }
 
 /// Each PE's counts: the home machine's own, and those every other PE's

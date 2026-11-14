@@ -183,6 +183,9 @@ pub(crate) struct MockBackend {
     /// The word a test's GPU writes as the completion marker, when the
     /// test gives one: every mapped word answers it.
     pub(crate) marker: Option<Box<core::sync::atomic::AtomicU32>>,
+    /// The descriptor each export of a semaphore answers, when a test gives
+    /// one.
+    pub(crate) exported: Option<i32>,
     pub(crate) retired: VecDeque<NonZeroU64>,
     pub(crate) semaphores: BTreeMap<u64, u64>,
     /// The highest value each semaphore's submitted signals reach.
@@ -202,6 +205,10 @@ pub(crate) struct MockBackend {
     /// The bytes of each host image copy into an image, which copies out
     /// of it read back.
     pub(crate) image_bytes: BTreeMap<u64, Vec<u8>>,
+    /// The host's view of each memory mapped through `host_bytes`, which a
+    /// submitted copy of an image to its buffer fills from `image_bytes`,
+    /// as the GPU would.
+    pub(crate) host: BTreeMap<u64, Box<[u8]>>,
 }
 
 impl MockBackend {
@@ -422,7 +429,7 @@ impl Backend for MockBackend {
         Ok(Semaphore(id))
     }
     fn export_semaphore(&mut self, _: Semaphore) -> Option<i32> {
-        None
+        self.exported
     }
     fn create_indirect_commands_layout(
         &mut self,
@@ -479,6 +486,20 @@ impl Backend for MockBackend {
         _: u64,
     ) -> Option<core::ptr::NonNull<core::sync::atomic::AtomicU32>> {
         self.marker.as_deref().map(core::ptr::NonNull::from)
+    }
+    fn host_bytes(
+        &mut self,
+        memory: Memory,
+        offset: u64,
+        length: u64,
+    ) -> Option<core::ptr::NonNull<u8>> {
+        let end = usize::try_from(offset.checked_add(length)?).ok()?;
+        let bytes = self
+            .host
+            .entry(memory.0)
+            .or_insert_with(|| alloc::vec![0; end].into_boxed_slice());
+        let place = bytes.get_mut(offset as usize..end)?;
+        core::ptr::NonNull::new(place.as_mut_ptr())
     }
     fn write_memory(&mut self, memory: Memory, offset: u64, bytes: &[u8]) -> Result<()> {
         if let Some(error) = self.write_error.take() {
@@ -594,6 +615,19 @@ impl Backend for MockBackend {
                 }
             }
         }
+        // A buffer and its memory share an id: a copy of an image the host
+        // wrote to a mapped buffer lands where the host reads it.
+        for command in segments.iter().flat_map(|segment| &segment.commands) {
+            if let crate::metal::vulkan::command::Command::CopyImageToBuffer { src, dst, region } =
+                command
+                && let (Some(written), Some(host)) =
+                    (self.image_bytes.get(&src.0), self.host.get_mut(&dst.0))
+                && let Some(place) = host.get_mut(region.buffer_offset as usize..)
+            {
+                let count = written.len().min(place.len());
+                place[..count].copy_from_slice(&written[..count]);
+            }
+        }
         self.submissions.push(segments.to_vec());
         Ok(())
     }
@@ -611,7 +645,9 @@ impl Backend for MockBackend {
 /// constant. Library `n` is the `n`-th added, `None` once removed.
 #[derive(Default)]
 pub(crate) struct MockCompiler {
-    pub(crate) libraries: Vec<Option<Vec<u8>>>,
+    /// Each library's bytes; a shared library holds the same ones, as the
+    /// AIR compiler's does.
+    pub(crate) libraries: Vec<Option<alloc::sync::Arc<Vec<u8>>>>,
     pub(crate) compiled: Vec<Specialization>,
     pub(crate) tessellations: Vec<Tessellation>,
     pub(crate) released: Vec<ShaderCode>,
@@ -784,12 +820,15 @@ impl Compiler for MockCompiler {
         self.adopted += 1;
     }
     fn add_library(&mut self, data: Vec<u8>) -> Result<u64> {
-        self.libraries.push(Some(data));
+        self.libraries.push(Some(alloc::sync::Arc::new(data)));
         Ok(self.libraries.len() as u64 - 1)
     }
     fn share_library(&mut self, library: u64) -> Result<u64> {
-        let data = self.library_data(library)?.to_vec();
-        self.add_library(data)
+        let data = self.libraries[library as usize]
+            .clone()
+            .ok_or(Error::Invalid("unknown library"))?;
+        self.libraries.push(Some(data));
+        Ok(self.libraries.len() as u64 - 1)
     }
     fn functions(&mut self, _: &[u8]) -> Result<Vec<(String, FunctionType)>> {
         Ok(alloc::vec![
@@ -806,6 +845,7 @@ impl Compiler for MockCompiler {
     fn library_data(&self, library: u64) -> Result<&[u8]> {
         self.libraries[library as usize]
             .as_deref()
+            .map(Vec::as_slice)
             .ok_or(Error::Invalid("unknown library"))
     }
     fn remove_library(&mut self, library: u64) -> Result<()> {

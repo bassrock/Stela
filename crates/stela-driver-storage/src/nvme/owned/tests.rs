@@ -136,10 +136,19 @@ struct Model {
     host_memory: (u32, u32, u32, u16),
     host_memory_sets: Vec<([u32; 5], (u64, u32))>,
     refuse_host_memory: bool,
-    /// APSTA with a non-operational PS1; the first entry of each APST
-    /// table set.
+    /// APSTA with a non-operational PS1; APSTE and the first entry of each
+    /// APST table set.
     apst: bool,
-    apst_sets: Vec<u64>,
+    apst_sets: Vec<(bool, u64)>,
+    /// Identify Controller's VID and model, the model space-padded.
+    vendor: u16,
+    model: &'static str,
+    /// The I/O submission queue's QPRIO, as last created.
+    submission_priority: u32,
+    /// CSTS reads all ones for this long after CC.EN is cleared, and when
+    /// it was last cleared, in ticks.
+    removed_after_stop_us: u64,
+    stopped_at: u64,
     /// OAES; the held Asynchronous Event Request; Asynchronous Event
     /// Configurations set and log pages read.
     async_events: u32,
@@ -210,6 +219,8 @@ struct Model {
     /// before one, with Invalid Field in Command.
     /// Refuse the Identify with this CNS, with Invalid Field in Command.
     refuse_identify: Option<u32>,
+    /// The Identify Active Namespace List's IDs, when not namespace 1 alone.
+    active: Option<Vec<u32>>,
     /// Leave every admin command unanswered; and report CSTS.CFS once one
     /// is.
     ignore_admin: bool,
@@ -245,6 +256,11 @@ impl Model {
             refuse_host_memory: false,
             apst: false,
             apst_sets: Vec::new(),
+            vendor: 0,
+            model: "",
+            submission_priority: 0,
+            removed_after_stop_us: 0,
+            stopped_at: 0,
             async_events: 0,
             event_request: None,
             event_configs: Vec::new(),
@@ -297,6 +313,7 @@ impl Model {
             nvm_limits: None,
             nvm_identifies: 0,
             refuse_identify: None,
+            active: None,
             ignore_admin: false,
             fatal_on_admin: false,
             queue_counts: 0,
@@ -448,8 +465,13 @@ impl Model {
                 let mut data = vec![0; 4096];
                 match command[10] {
                     1 => {
+                        data[..2].copy_from_slice(&self.vendor.to_le_bytes());
                         data[4..24].fill(b'S');
                         data[24..64].fill(b'M');
+                        if !self.model.is_empty() {
+                            data[24..64].fill(b' ');
+                            data[24..24 + self.model.len()].copy_from_slice(self.model.as_bytes());
+                        }
                         data[77] = self.mdts;
                         data[516..520].copy_from_slice(&1u32.to_le_bytes());
                         data[520..522].copy_from_slice(&self.oncs.to_le_bytes());
@@ -470,7 +492,12 @@ impl Model {
                             data[2048 + 32 + 8..][..2].copy_from_slice(&1000u16.to_le_bytes());
                         }
                     }
-                    2 => data[..4].copy_from_slice(&1u32.to_le_bytes()),
+                    2 => {
+                        let active = self.active.clone().unwrap_or(vec![1]);
+                        for (at, id) in active.iter().enumerate() {
+                            data[4 * at..4 * at + 4].copy_from_slice(&id.to_le_bytes());
+                        }
+                    }
                     3 => {
                         data[..4].copy_from_slice(&[1, 8, 0, 0]);
                         data[4..12].copy_from_slice(&self.eui64);
@@ -531,10 +558,12 @@ impl Model {
                 self.logs.push(command[10] & 0xff);
             }
             (0, 9) if command[10] == 0x0c => {
-                assert_eq!(command[11], 1);
+                assert!(command[11] <= 1);
                 let table = self.read_iova(u64::from(command[6]) | u64::from(command[7]) << 32, 8);
-                self.apst_sets
-                    .push(u64::from_le_bytes(table[..8].try_into().unwrap()));
+                self.apst_sets.push((
+                    command[11] == 1,
+                    u64::from_le_bytes(table[..8].try_into().unwrap()),
+                ));
             }
             (0, 9) => {
                 assert_eq!(command[10], 0x16);
@@ -550,9 +579,10 @@ impl Model {
             }
             (0, 1) => {
                 assert_eq!(
-                    (command[10] & 0xffff, command[10] >> 16, command[11]),
+                    (command[10] & 0xffff, command[10] >> 16, command[11] & !6),
                     (1, 15, 0x10001)
                 );
+                self.submission_priority = command[11] >> 1 & 3;
                 self.queues[1].0 = u64::from(command[6]) | u64::from(command[7]) << 32;
             }
             // Delete I/O SQ, then its CQ: a CQ with a live SQ is Invalid
@@ -801,6 +831,12 @@ unsafe impl Registers for Regs {
         if m.fail_read {
             return Err(register_error());
         }
+        if offset == 0x1c
+            && m.removed_after_stop_us != 0
+            && Clock::ticks() - m.stopped_at < m.removed_after_stop_us * 1000
+        {
+            return Ok(u32::MAX);
+        }
         if offset == 0x1c && m.enabled && m.enabling_reads > 0 {
             if m.enabling_reads != usize::MAX {
                 m.enabling_reads -= 1;
@@ -831,6 +867,7 @@ unsafe impl Registers for Regs {
                     m.record("enable");
                 } else {
                     m.record("stop");
+                    m.stopped_at = Clock::ticks();
                     if !m.stuck_ready {
                         // A controller reset ends every queue and command.
                         m.enabled = false;
@@ -944,6 +981,8 @@ unsafe impl Lifecycle for Life {
 struct Fixture {
     model: Arc<Mutex<Model>>,
     source: Source,
+    /// The quirks the controller's PCI ID and board give it.
+    quirks: Quirks,
 }
 impl Fixture {
     fn new() -> Self {
@@ -953,6 +992,7 @@ impl Fixture {
                 next: AtomicU64::new(0x9000_0000),
                 released: Arc::new(AtomicUsize::new(0)),
             },
+            quirks: Quirks::NONE,
         }
     }
     fn attach(&self) -> Result<Attached, BlockError> {
@@ -969,6 +1009,7 @@ impl Fixture {
                 },
                 "VMD model requester".into(),
                 1000,
+                self.quirks,
             )
         }
     }
@@ -1106,6 +1147,7 @@ fn invalid_clock_keeps_unadmitted_original_owners_without_any_effect() {
                     ticks_per_microsecond,
                 },
                 "unadmitted original NVMe".into(),
+                Quirks::NONE,
             )
         };
         assert!(result.is_err());
@@ -1118,37 +1160,47 @@ fn invalid_clock_keeps_unadmitted_original_owners_without_any_effect() {
         assert_eq!(f.source.released.load(Ordering::SeqCst), 0);
     }
 }
+/// A completion's submission queue identifier and head are not read, as
+/// Linux's `nvme_handle_cqe` reads neither: commands whose completions
+/// report another queue or a moved head complete with their data.
 #[test]
-fn owned_bad_cqe_identity_never_reuses_dma() {
-    for mutation in [Mutation::Cid, Mutation::Sqid, Mutation::Head] {
+fn owned_cqe_queue_identifier_and_head_are_not_read() {
+    for mutation in [Mutation::Sqid, Mutation::Head] {
         let f = Fixture::new();
         let mut a = f.attach().unwrap();
         let disk = &mut a.namespaces[0];
-        let mut sibling = Namespace {
-            controller: disk.controller.clone(),
-            namespace: disk.namespace,
-            identity: disk.identity.clone(),
-            ids: disk.ids.clone(),
-            scanned: disk.scanned,
-            removed: None,
-        };
-        let before = f.model.lock().unwrap().sync_cpu;
         f.model.lock().unwrap().mutation = mutation;
-        assert!(disk.read(0, &mut [0xa5; 512]).is_err());
-        let commands = f.model.lock().unwrap().commands;
-        assert!(disk.write(0, &[1; 512]).is_err());
-        assert!(disk.flush().is_err());
-        let mut output = [0xa5; 512];
-        assert!(sibling.read(0, &mut output).is_err());
-        assert_eq!(output, [0xa5; 512]);
-        let m = f.model.lock().unwrap();
-        assert_eq!(m.commands, commands);
-        assert_eq!(m.sync_cpu, before);
-        assert_eq!(m.maps.len(), BUFFERS);
-        drop(m);
+        disk.write(0, &[0x3c; 512]).unwrap();
+        disk.flush().unwrap();
+        let mut output = [0; 512];
+        disk.read(0, &mut output).unwrap();
+        assert_eq!(output, [0x3c; 512]);
         disk.retire_owned().unwrap();
         assert!(f.model.lock().unwrap().released);
     }
+}
+
+/// Completions that name no outstanding command are passed over: the CPU
+/// takes back no memory for them (the model refuses a CPU acquire of a page
+/// a command still holds), and the commands they should have ended fail
+/// through their deadlines, Aborts and resets, with the caller's buffer
+/// untouched.
+#[test]
+fn owned_stray_cqe_never_reuses_dma() {
+    let f = Fixture::new();
+    let mut a = f.attach().unwrap();
+    let disk = &mut a.namespaces[0];
+    f.model.lock().unwrap().mutation = Mutation::Cid;
+    let mut output = [0xa5; 512];
+    assert!(disk.read(0, &mut output).is_err());
+    assert_eq!(output, [0xa5; 512]);
+    {
+        let m = f.model.lock().unwrap();
+        assert!(m.events.contains(&"drain"));
+        assert_eq!(m.maps.len(), BUFFERS);
+    }
+    disk.retire_owned().unwrap();
+    assert!(f.model.lock().unwrap().released);
 }
 /// A controller that never sets CSTS.RDY fails its attach at CAP.TO; with
 /// CAP.TO at its largest (127.5 s) a passed device start budget ends the
@@ -1319,6 +1371,104 @@ fn a_refused_identify_namespace_leaves_the_controller_attached() {
     );
 }
 
+/// Linux `nvme_scan_ns` passes over a namespace whose Namespace
+/// Identification Descriptor list (NVMe 1.3) the controller refuses; it is
+/// reported with the command. `NVME_QUIRK_NO_NS_DESC_LIST` never asks for
+/// the list, and the namespace attaches with its IDs from Identify
+/// Namespace, or none under `NVME_QUIRK_BOGUS_NID`.
+#[test]
+fn a_refused_descriptor_list_is_reported_or_never_asked_for_under_its_quirk() {
+    let refusing = |quirks| {
+        let mut f = Fixture::new();
+        {
+            let mut m = f.model.lock().unwrap();
+            m.registers.insert(8, 0x0001_0300);
+            m.refuse_identify = Some(3);
+        }
+        f.quirks = quirks;
+        f
+    };
+    let a = refusing(Quirks::NONE).attach().unwrap();
+    assert!(a.namespaces.is_empty());
+    assert_eq!(a.failures.len(), 1);
+    assert_eq!(
+        format!("namespace {}: {}", a.failures[0].0, a.failures[0].1),
+        "namespace 1: NVMe Identify Namespace Identification Descriptors \
+         (opcode 0x06, CNS 0x03): device status 0x2"
+    );
+    let a = refusing(Quirks::NO_DESCRIPTOR_LIST).attach().unwrap();
+    assert!(a.failures.is_empty());
+    assert_eq!(a.namespaces[0].ids.eui64, [0x11; 8]);
+    let a = refusing(Quirks::for_device(0x126f, 0x2263))
+        .attach()
+        .unwrap();
+    assert!(a.failures.is_empty());
+    assert_eq!(a.namespaces[0].ids, Ids::default());
+}
+
+/// Garbage namespace identifiers under `NVME_QUIRK_BOGUS_NID` are ignored:
+/// a reset whose rescan reads another EUI64, in the descriptors and in
+/// Identify Namespace, keeps the namespace.
+#[test]
+fn bogus_namespace_ids_keep_the_namespace_across_a_reset() {
+    let mut f = Fixture::new();
+    f.model.lock().unwrap().registers.insert(8, 0x0001_0300);
+    f.quirks = Quirks::BOGUS_IDS;
+    let mut a = f.attach().unwrap();
+    let disk = &mut a.namespaces[0];
+    assert_eq!(disk.ids, Ids::default());
+    disk.write(2, &[0x5c; 512]).unwrap();
+    {
+        let mut m = f.model.lock().unwrap();
+        m.eui64 = [0x99; 8];
+        m.delay_io = 1;
+        m.abortable = false;
+    }
+    disk.flush().unwrap();
+    let mut data = [0; 512];
+    disk.read(2, &mut data).unwrap();
+    assert_eq!(data, [0x5c; 512]);
+    disk.retire_owned().unwrap();
+}
+
+/// A refused active namespace list, or one out of order or past NN, is
+/// replaced by the sequential scan, which the attachment notes once: a
+/// list naming namespace 1 twice gives one disk, not two.
+#[test]
+fn a_refused_or_garbage_active_list_falls_back_to_the_sequential_scan() {
+    let scanned = |prepare: fn(&mut Model)| {
+        let f = Fixture::new();
+        prepare(&mut f.model.lock().unwrap());
+        let a = f.attach().unwrap();
+        assert!(a.failures.is_empty());
+        let ids: Vec<u32> = a.namespaces.iter().map(|disk| disk.namespace).collect();
+        (ids, a.sequential)
+    };
+    assert_eq!(scanned(|_| {}), (vec![1], None));
+    let (ids, scan) = scanned(|m| m.refuse_identify = Some(2));
+    assert_eq!(ids, [1]);
+    assert_eq!(
+        format!("{}", scan.unwrap()),
+        "NVMe Identify Active Namespace List (opcode 0x06, CNS 0x02) refused, status 0x2: \
+         NVMe namespace IDs 1 to 1 scanned one by one"
+    );
+    for active in [vec![1, 1], vec![2], vec![1, u32::MAX]] {
+        let f = Fixture::new();
+        f.model.lock().unwrap().active = Some(active.clone());
+        let a = f.attach().unwrap();
+        assert_eq!(a.namespaces.len(), 1, "{active:?}");
+        assert_eq!(a.namespaces[0].namespace, 1);
+        assert_eq!(
+            format!("{}", a.sequential.unwrap()),
+            format!(
+                "NVMe Identify Active Namespace List (opcode 0x06, CNS 0x02) of {} IDs \
+                 out of order or past NN 1: NVMe namespace IDs 1 to 1 scanned one by one",
+                active.len()
+            )
+        );
+    }
+}
+
 #[test]
 fn owned_timeouts_abort_then_reset_contain_dma_and_retry_like_linux() {
     // An abort that completes the held write: it is retried, no reset.
@@ -1463,12 +1613,13 @@ fn namespaces_are_scanned_like_nvme_scan_ns_with_io_command_sets() {
         drop(m);
         f
     };
-    // A namespace not ready is passed over, a zoned one is unsupported.
+    // A namespace not ready is passed over and reported, a zoned one is
+    // unsupported.
     let attached = |f: Fixture| {
         let a = f.attach().unwrap();
         (a.namespaces.len(), a.failures.len())
     };
-    assert_eq!(attached(fixture(0, true)), (0, 0));
+    assert_eq!(attached(fixture(0, true)), (0, 1));
     assert_eq!(attached(fixture(2, false)), (0, 1));
     let f = fixture(0, false);
     let a = f.attach().unwrap();
@@ -1539,7 +1690,99 @@ fn apst_is_configured_at_attach_and_after_resets() {
     drop(m);
     a.namespaces[0].flush().unwrap();
     // PS0 idles into PS1 after 100 ms, at attach and after the reset.
-    assert_eq!(f.model.lock().unwrap().apst_sets, [1 << 3 | 100 << 8; 2]);
+    assert_eq!(
+        f.model.lock().unwrap().apst_sets,
+        [(true, 1 << 3 | 100 << 8); 2]
+    );
+    a.namespaces[0].retire_owned().unwrap();
+}
+
+/// The Intel 600P's quirks create its I/O submission queue with medium
+/// priority and offer no Write Zeroes; the GAMMIX S70 BLADE's no FUA.
+#[test]
+fn pci_id_quirks_set_queue_priority_write_zeroes_and_fua() {
+    let mut f = Fixture::new();
+    f.model.lock().unwrap().oncs = COMMANDS_WRITE_ZEROES;
+    let plain = f.attach().unwrap();
+    let features = plain.namespaces[0].identity().features;
+    assert!(features.write_zeroes.is_some() && features.fua);
+    assert_eq!(f.model.lock().unwrap().submission_priority, 0);
+    drop(plain);
+
+    f = Fixture::new();
+    f.model.lock().unwrap().oncs = COMMANDS_WRITE_ZEROES;
+    f.quirks = Quirks::for_device(0x8086, 0xf1a5);
+    let a = f.attach().unwrap();
+    assert_eq!(a.namespaces[0].identity().features.write_zeroes, None);
+    assert_eq!(f.model.lock().unwrap().submission_priority, 2);
+    drop(a);
+
+    f = Fixture::new();
+    f.quirks = Quirks::for_device(0x1cc1, 0x5370);
+    let a = f.attach().unwrap();
+    let features = a.namespaces[0].identity().features;
+    assert!(features.write_cache && !features.fua);
+}
+
+/// A controller whose CSTS reads all ones for 2.3 s after CC.EN is cleared
+/// starts, and resets, only with `NVME_QUIRK_DELAY_BEFORE_CHK_RDY`.
+#[test]
+fn the_ready_delay_quirk_waits_before_reading_csts_at_attach_and_resets() {
+    let _clock = crate::test_clock::virtualize();
+    let delayed = |quirks| {
+        let mut f = Fixture::new();
+        f.model.lock().unwrap().removed_after_stop_us = 2_300_000;
+        f.quirks = quirks;
+        f
+    };
+    assert_eq!(
+        delayed(Quirks::NONE).attach().err(),
+        Some(removed().at(DISABLE_WAIT))
+    );
+    let f = delayed(Quirks::for_device(0x1c58, 0x0003));
+    let started = Clock::ticks();
+    let mut a = f.attach().unwrap();
+    assert!(Clock::ticks() - started >= 2_300_000 * 1000);
+    let disk = &mut a.namespaces[0];
+    disk.write(0, &[0x42; 512]).unwrap();
+    let mut m = f.model.lock().unwrap();
+    m.delay_io = 1;
+    m.abortable = false;
+    drop(m);
+    disk.flush().unwrap();
+    let mut data = [0; 512];
+    disk.read(0, &mut data).unwrap();
+    assert_eq!(data, [0x42; 512]);
+    disk.retire_owned().unwrap();
+}
+
+/// A PCI ID with `NVME_QUIRK_NO_DEEPEST_PS` keeps APST out of PS1, here the
+/// deepest state; a model `core_quirks` names turns APST off, at attach and
+/// after a reset, and the attachment reports both.
+#[test]
+fn apst_quirks_from_the_pci_id_and_the_model_apply_at_attach_and_after_resets() {
+    let mut f = Fixture::new();
+    f.model.lock().unwrap().apst = true;
+    f.quirks = Quirks::for_device(0x2646, 0x2263);
+    let a = f.attach().unwrap();
+    assert_eq!(a.quirks, Quirks::NO_DEEPEST_POWER_STATE);
+    assert_eq!(f.model.lock().unwrap().apst_sets, [(true, 0)]);
+    drop(a);
+
+    let f = Fixture::new();
+    {
+        let mut m = f.model.lock().unwrap();
+        m.apst = true;
+        (m.vendor, m.model) = (0x1179, "THNSF5256GPUK TOSHIBA");
+    }
+    let mut a = f.attach().unwrap();
+    assert_eq!(a.quirks, Quirks::NO_APST);
+    let mut m = f.model.lock().unwrap();
+    m.delay_io = 1;
+    m.abortable = false;
+    drop(m);
+    a.namespaces[0].flush().unwrap();
+    assert_eq!(f.model.lock().unwrap().apst_sets, [(false, 0); 2]);
     a.namespaces[0].retire_owned().unwrap();
 }
 

@@ -107,6 +107,8 @@ struct Cursors(VecDeque<(String, Progress)>);
 impl Cursors {
     // Each deflate cursor owns a 64 KiB input buffer, a 32 KiB window,
     // and the decoder state. Stored cursors have no inflater allocation.
+    // A cursor whose read is pending also holds that read's bytes so far,
+    // at most MAX_READ_BYTES plus a block.
     const LIMIT: usize = 6;
 
     fn read<R: ReadAt>(
@@ -126,11 +128,19 @@ impl Cursors {
             Some((name, progress)) => (Some(name), Some(progress)),
             None => (None, None),
         };
-        // A read that waits on the network keeps the cursor it left, so the
-        // same read later resumes instead of inflating from the start.
-        let read = archive.read_member_resuming(reader, entry, &mut progress, offset, output);
-        if let Some(progress) = progress
-            && progress.produced() < entry.bytes
+        let result = archive
+            .read_member_resuming(reader, entry, &mut progress, offset, output)
+            .map_err(|error| source_error(reader, error));
+        // A pending read keeps its cursor, with the bytes it produced, so
+        // asking again goes on from there instead of inflating the member's
+        // prefix again; any other failure drops it.
+        let keep = match &result {
+            Ok(()) => true,
+            Err(error) => matches!(error, Error::Pending),
+        };
+        if keep
+            && let Some(progress) = progress
+            && progress.resumes_from() < entry.bytes
         {
             if self.0.len() == Self::LIMIT {
                 self.0.pop_front();
@@ -138,7 +148,7 @@ impl Cursors {
             self.0
                 .push_back((name.unwrap_or_else(|| entry.name.clone()), progress));
         }
-        read.map_err(|error| source_error(reader, error))
+        result
     }
 }
 
@@ -154,14 +164,9 @@ pub struct Store<R> {
     block_count: usize,
     verify: Verify,
     cursors: Cursors,
-    /// The member scans pending reads stopped ([`Store::verify`]), oldest
-    /// first, at most [`SCANS`]: a restore that verifies two members in
-    /// turn, each read waiting on the network, keeps both where they
-    /// stopped instead of starting each over at the other's turn.
-    scans: VecDeque<Box<Scan>>,
+    /// The member scan a pending read stopped ([`Store::verify`]).
+    scan: Option<Box<Scan>>,
 }
-/// The member scans kept across pending reads ([`Store::verify`]).
-const SCANS: usize = 4;
 /// A member's SHA-256 scan in progress: where it is in the member and what
 /// it has hashed, so a read that runs out of time costs no re-read.
 struct Scan {
@@ -285,7 +290,7 @@ impl<R: ReadAt> Store<R> {
             block_count: 0,
             verify: Verify::Full,
             cursors: Cursors::default(),
-            scans: VecDeque::new(),
+            scan: None,
         })
     }
     pub fn manifest(&self) -> &PayloadManifest {
@@ -528,11 +533,11 @@ impl<R: ReadAt> Store<R> {
         if blocks > MAX_BLOCKS - self.block_count {
             return Err(Error::Limit("payload hash index"));
         }
-        // A scan a pending read stopped goes on where it stopped.
-        let kept = self.scans.iter().position(|scan| scan.path == path);
-        let mut scan = match kept.and_then(|at| self.scans.remove(at)) {
-            Some(scan) => scan,
-            None => {
+        // A scan a pending read stopped goes on where it stopped; any other
+        // member's is dropped.
+        let mut scan = match self.scan.take() {
+            Some(scan) if scan.path == path => scan,
+            _ => {
                 let progress = self
                     .archive
                     .start_member(&mut self.reader, &entry)
@@ -560,10 +565,7 @@ impl<R: ReadAt> Store<R> {
                     Err(error) => {
                         let error = source_error(&mut self.reader, error);
                         if matches!(error, Error::Pending) {
-                            if self.scans.len() == SCANS {
-                                self.scans.pop_front();
-                            }
-                            self.scans.push_back(scan);
+                            self.scan = Some(scan);
                         }
                         return Err(error);
                     }

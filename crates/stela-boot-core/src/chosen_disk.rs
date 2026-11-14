@@ -91,6 +91,66 @@ impl Stale {
     }
 }
 
+/// A whole disk Install macOS's picker lists, as far as whether it can be
+/// chosen goes.
+#[derive(Clone, Copy, Debug)]
+pub struct Candidate<'a> {
+    /// The serial number its controller reports, by which Stela finds it
+    /// again once the firmware has exited.
+    pub serial: Option<&'a str>,
+    pub bytes: u64,
+    /// Why Stela's own drivers cannot reach its controller.
+    pub controller: Option<&'static str>,
+}
+
+/// The picker's refusal of a disk whose serial another listed disk also
+/// reports: after the firmware exits, Stela finds the chosen disk by its
+/// serial alone, and two disks with one serial name neither
+/// ([`Search::SeveralDisks`]), so the install would stop.
+pub const SAME_SERIAL: &str = "Same serial as another disk";
+
+/// Why the picker refuses disk `index` of `disks`, which it shows by the
+/// disk; `None` when it can be chosen. A disk Stela's drivers cannot reach
+/// or cannot find again by its serial is refused before its size is.
+pub fn picker_refusal(
+    disks: &[Candidate<'_>],
+    index: usize,
+    min_bytes: u64,
+) -> Option<&'static str> {
+    let disk = disks.get(index)?;
+    if disk.controller.is_some() {
+        return disk.controller;
+    }
+    let shared = |serial: &str| {
+        disks
+            .iter()
+            .enumerate()
+            .any(|(other, listed)| other != index && listed.serial == Some(serial))
+    };
+    match disk.serial {
+        None => Some("No serial number"),
+        Some(serial) if serial.contains(char::is_whitespace) => Some("Serial number has spaces"),
+        Some(serial) if shared(serial) => Some(SAME_SERIAL),
+        Some(_) if disk.bytes < min_bytes => Some("Smaller than 60 GB"),
+        Some(_) => None,
+    }
+}
+
+/// The picker's caution for a disk it lets the user choose but that spins,
+/// as the disk reports its rotation (ATA IDENTIFY word 217): macOS starts
+/// with a storm of small random reads, which a spinning disk serves too
+/// slowly for daemons such as kernelmanagerd to check in within their 60 s,
+/// so macOS on it may never finish starting. `None` for a disk that does not
+/// spin or does not say. The disk is not refused: a fast one may still do.
+pub fn picker_caution(rotation: stela_drivers::block::Rotation) -> Option<alloc::string::String> {
+    match rotation {
+        stela_drivers::block::Rotation::Rpm(rpm) => Some(alloc::format!(
+            "Spinning disk ({rpm} rpm): macOS may be too slow to start"
+        )),
+        stela_drivers::block::Rotation::None | stela_drivers::block::Rotation::Unreported => None,
+    }
+}
+
 /// What a chosen partition whose NVRAM store could not be read is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unreadable {
@@ -119,6 +179,25 @@ pub const UNREADABLE_STORE: &str = "NVRAM on the disk chosen for macOS cannot be
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_spinning_disk_is_marked_but_not_refused() {
+        use stela_drivers::block::Rotation;
+        assert_eq!(
+            picker_caution(Rotation::from_nominal(5400)).as_deref(),
+            Some("Spinning disk (5400 rpm): macOS may be too slow to start")
+        );
+        assert_eq!(picker_caution(Rotation::from_nominal(1)), None);
+        assert_eq!(picker_caution(Rotation::from_nominal(0)), None);
+        // The caution is no refusal: a spinning disk of any size and a
+        // unique serial can still be chosen.
+        let disks = [Candidate {
+            serial: Some("WD-1"),
+            bytes: 1_000_000_000_000,
+            controller: None,
+        }];
+        assert_eq!(picker_refusal(&disks, 0, 60_000_000_000), None);
+    }
 
     #[test]
     fn the_found_partition_is_not_stale() {
@@ -158,6 +237,55 @@ mod tests {
         }
         assert!(Stale::Wiped.screen().contains("is not there"));
         assert!(Stale::NoMacOs.screen().contains("has no macOS"));
+    }
+
+    #[test]
+    fn the_picker_refuses_every_disk_whose_serial_another_disk_reports() {
+        const MIN: u64 = 60_000_000_000;
+        let disk = |serial: Option<&'static str>, bytes: u64| Candidate {
+            serial,
+            bytes,
+            controller: None,
+        };
+        // Two disks behind one USB-SATA bridge, or a cloned NVMe disk,
+        // report one serial: neither can be chosen; the third can.
+        let disks = [
+            disk(Some("S1"), 500_000_000_000),
+            disk(Some("S1"), 1_000_000_000_000),
+            disk(Some("S2"), 500_000_000_000),
+        ];
+        let refusals: Vec<_> = (0..disks.len())
+            .map(|index| picker_refusal(&disks, index, MIN))
+            .collect();
+        assert_eq!(refusals, [Some(SAME_SERIAL), Some(SAME_SERIAL), None]);
+        // The other refusals keep their order: the controller first, then
+        // the serial, then the size.
+        let others = [
+            Candidate {
+                controller: Some("Controller not supported"),
+                ..disk(None, 1)
+            },
+            disk(None, 500_000_000_000),
+            disk(Some("A B"), 500_000_000_000),
+            disk(Some("S3"), 1),
+            disk(Some("S4"), MIN),
+        ];
+        let refusals: Vec<_> = (0..others.len())
+            .map(|index| picker_refusal(&others, index, MIN))
+            .collect();
+        assert_eq!(
+            refusals,
+            [
+                Some("Controller not supported"),
+                Some("No serial number"),
+                Some("Serial number has spaces"),
+                Some("Smaller than 60 GB"),
+                None
+            ]
+        );
+        // No serial is shared by two disks that report none.
+        let unknown = [disk(None, 1), disk(None, 1)];
+        assert_eq!(picker_refusal(&unknown, 0, MIN), Some("No serial number"));
     }
 
     #[test]

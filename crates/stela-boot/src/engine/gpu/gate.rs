@@ -64,7 +64,7 @@ const STACK_BYTES: usize = 16 << 20;
 /// How long a GPU's accepted work may go without progress as the PC stops:
 /// with the guest stopped, an event it waits on will never signal.
 const STOP_STALL_SECONDS: u64 = 5;
-/// How long the stop waits for a GSP to unload.
+/// How long the stop waits for each GPU's GSP to unload.
 const STOP_UNLOAD_SECONDS: u64 = 10;
 
 /// The services for the kernel's interrupts, once all are open.
@@ -220,6 +220,14 @@ static EXITS: ExitWatch = ExitWatch::new();
 /// phase: no turn should come near it.
 const LONG_TURN_MILLIS: u64 = 50;
 
+/// A deferred job this long or longer is reported, each one longer than any
+/// before: its processor's guest took no interrupt meanwhile, and XNU
+/// panics when a processor stays out of its guest for about half a second.
+const LONG_JOB_MILLIS: u64 = 100;
+
+/// The longest deferred job reported so far, in TSC ticks.
+static LONGEST_JOB: AtomicU64 = AtomicU64::new(0);
+
 /// Runs one deferred compilation, between two slices of a processor's guest
 /// and never inside a guest's call: a job runs whole, as the compilers have
 /// no point to stop at, so a processor with no guest work to do takes it
@@ -253,7 +261,20 @@ pub(in crate::engine) fn run_job(taker: Taker) -> bool {
                 unsafe { with_interrupts(|| service.run_job(older)) }
             }
         };
-        measured_job(run)
+        let began = host::rdtsc();
+        let ran = measured_job(run);
+        let took = host::rdtsc().wrapping_sub(began);
+        if ran
+            && took >= LONG_JOB_MILLIS * millis
+            && LONGEST_JOB.fetch_max(took, Ordering::Relaxed) < took
+        {
+            output::arguments(format_args!(
+                "GPU LONG JOB ms={} taker={taker:?} pe={}: its guest took no interrupt meanwhile\n",
+                took / millis.max(1),
+                host::processor()
+            ));
+        }
+        ran
     });
     if taker == Taker::Busy {
         // After a job, busy processors leave the next to a waiting one for
@@ -468,16 +489,7 @@ fn bundle(report: BundleReport) {
             ));
             super::super::service::request_restart();
         }
-        (Decision::StopMissing { attempted: true }, _) => stop(
-            "StelaGPU.bundle is still not installed in /Library/GPUBundles after the automatic \
-             single-user repair (its BUNDLE REPAIR lines say how it went): boot macOS once with \
-             --single-user and install it there by hand",
-        ),
-        (Decision::StopMissing { attempted: false }, _) => stop(
-            "StelaGPU.bundle is not installed in /Library/GPUBundles, a kext cannot create \
-             its directories, and without the machine state's NVRAM no automatic repair can be \
-             recorded: boot macOS once with --single-user and install it there by hand",
-        ),
+        (Decision::StopMissing { attempted }, _) => stop(&bundle_repair::missing(attempted)),
         (Decision::StopFailed, _) => stop(
             "the StelaGPU kext could not install StelaGPU.bundle; its StelaGPU lines above say why",
         ),
@@ -620,8 +632,10 @@ fn note_exit(served: &Served) {
 }
 
 /// `GPU LONG TURN operation=… phase=… held_us=…`, once for each operation
-/// and phase whose turn reached [`LONG_TURN_MILLIS`]: the phase is the timed
-/// operation's longest, `untimed` for an operation timed by no phase.
+/// and phase whose turn reached [`LONG_TURN_MILLIS`], and each time for a
+/// phase that copies through a texture's memory
+/// (`CallPhases::reported_each_time`): the phase is the timed operation's
+/// longest, `untimed` for an operation timed by no phase.
 fn report_long_turn(served: &Served) {
     static SEEN: Seen<128> = Seen::new();
     let tsc_hz = installed().map_or(0, |gpu| gpu.tsc_hz);
@@ -633,7 +647,15 @@ fn report_long_turn(served: &Served) {
         .as_ref()
         .map_or("untimed", |phases| phases.longest_phase().0);
     let key = format!("{:#x} {phase}", served.operation);
-    if let Some(unheld) = SEEN.first_time(&key) {
+    let each_time = served
+        .phases
+        .as_ref()
+        .is_some_and(|phases| phases.reported_each_time());
+    let shown = match each_time {
+        true => Some(Unheld(0)),
+        false => SEEN.first_time(&key),
+    };
+    if let Some(unheld) = shown {
         let detail = served
             .phases
             .as_ref()
@@ -1266,12 +1288,28 @@ pub(super) fn interrupted() {
 }
 
 /// Waits on the completion timeline of each device that has not yet given
-/// it, as a newly opened or reopened device has: completed work is then
+/// it, as a newly opened or reopened device has, or whose waiter left by
+/// itself, which the device then exports again: completed work is then
 /// looked for at once.
 pub(super) fn watch_completions() {
+    use super::waiter::{self, Due};
     for (index, service) in shared().iter().enumerate() {
+        match waiter::due(index) {
+            // A call holding the service leaves it due for the next look.
+            Due::Restart if service.rearm_completion() => {
+                let count = waiter::restarted(index);
+                output::arguments(format_args!(
+                    "GPU {index}: completion waiter started again ({count})\n"
+                ));
+            }
+            Due::GiveUp => output::arguments(format_args!(
+                "GPU {index}: completion waiter left too often; completions are found by \
+                 looks\n"
+            )),
+            Due::Restart | Due::Nothing => {}
+        }
         if let Some((fd, timeline)) = service.take_completion() {
-            super::waiter::start(fd, index, timeline);
+            waiter::start(fd, index, timeline);
         }
     }
 }
@@ -1335,7 +1373,7 @@ pub(in crate::engine) fn stop(close_gates: impl FnOnce() -> u64) {
         output::arguments(format_args!("GPU drivers stopped\n"));
     } else {
         output::arguments(format_args!(
-            "GPU drivers still stopping after {STOP_UNLOAD_SECONDS} s\n"
+            "GPU drivers still stopping after {STOP_UNLOAD_SECONDS} s for each GPU\n"
         ));
         // The calls still running, the stop among them, and for how long.
         if let Some(line) = client::pool_report(gpu.tsc_hz) {
@@ -1361,7 +1399,7 @@ pub(in crate::engine) fn stop_for_fatal() {
         output::arguments(format_args!("GPU drivers stopped before the fatal stop\n"));
     } else {
         output::arguments(format_args!(
-            "GPU drivers still stopping after {STOP_UNLOAD_SECONDS} s; the firmware may still run\n"
+            "GPU drivers still stopping after {STOP_UNLOAD_SECONDS} s for each GPU; the firmware may still run\n"
         ));
     }
 }

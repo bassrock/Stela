@@ -17,6 +17,8 @@ use stela_drivers::{bus::mmio::owned::PhysicalSpan, platform::work::WorkError};
 
 const IF: u64 = 1 << 9;
 const ADDRESS: u64 = 0x000f_ffff_ffff_f000;
+/// CR4.PCIDE: CR3's low twelve bits are the root's PCID.
+const CR4_PCIDE: u64 = 1 << 17;
 
 /// This processor's GS base, as its record's self pointer names it. Every
 /// owner and identity here belongs to an activated processor, whose GS base
@@ -86,7 +88,7 @@ impl ProcessRootScope<'_> {
             || !core::ptr::eq(self.identity.loader_tables, owner)
             || !crate::engine::storage::entered_loader_root(owner)
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }
@@ -96,7 +98,7 @@ impl ProcessRootScope<'_> {
     ) -> Result<Option<stela_boot_core::guarded_stacks::mappings::Observation>, WorkError> {
         self.identity.validate_process_root()?;
         if root() != self.root {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // SAFETY: same HostOwner/original loader owner, kept shared
         // aliases and IF0 scope were checked immediately above. No callbacks.
@@ -104,7 +106,7 @@ impl ProcessRootScope<'_> {
             unsafe { self.identity.loader_tables.observe_shared(address) }.map_err(unavailable)?;
         self.identity.validate_process_root()?;
         if root() != self.root {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(result)
     }
@@ -125,7 +127,7 @@ impl RootIdentity {
         if root() != self.snapshot.cr3
             && !crate::engine::storage::entered_loader_root(self.loader_tables)
         {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         // SAFETY: fixed Host root is held by roots._lease, and the
         // entered original loader root is held by loader_tables. Both shared
@@ -152,10 +154,10 @@ impl RootIdentity {
             let address = crate::layout::physical(self.loader_tables.root());
             let observed = scope
                 .observe_original(address)?
-                .ok_or(WorkError::CorruptContext)?;
+                .ok_or_else(|| WorkError::corrupt())?;
             if observed.physical != self.loader_tables.root() || observed.user || !observed.writable
             {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             Ok(())
         })();
@@ -177,26 +179,42 @@ impl RootIdentity {
         // SAFETY: immutable architectural observation; original owner kept.
         let observed = unsafe { interrupts::observe_descriptors() };
         if observed.gdt != self.gdt || observed.idt != self.idt || observed.task != self.task {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }
     pub(crate) fn check_current(&self) -> Result<(), WorkError> {
         self.affinity()?;
         if root() != self.snapshot.cr3 {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         Ok(())
     }
     pub(crate) fn check_irq_cpu(&self) -> Result<(), WorkError> {
         self.affinity()?;
         let current = root();
-        if current & !ADDRESS != 0 || !self.roots.roots().contains(&current) {
+        // While this core's views are tagged (`host::tag_views`), its guest
+        // roots load as root | PCID, and an IRQ or a Linux call between the
+        // run's slices observes one: the base decides. CR4 is read only for
+        // such a root, not from the host's state, which an IRQ must not
+        // borrow; an untagged root needs no read.
+        let tagged = current & stela_boot_core::paging_controls::ROOT_CONTEXT != 0 && {
+            let cr4: u64;
+            // SAFETY: CPL0 control register read.
+            unsafe { asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+            cr4 & CR4_PCIDE != 0
+        };
+        if !stela_boot_core::paging_controls::registered_root(
+            current,
+            tagged,
+            super::super::CONTEXTS,
+            self.roots.roots(),
+        ) {
             // Preserve the existing pinned guest IRQ roots above. The only
             // additional tagged root is this manager's entered loader
             // root, backed by its original allocation owner and same CPU guard.
             if !crate::engine::storage::entered_loader_root(self.loader_tables) {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             let saved = disable();
             let result = self.validate_process_root();
@@ -227,8 +245,7 @@ impl RootIdentity {
     }
 
     pub(crate) fn fatal(&self, error: WorkError) -> ! {
-        crate::output::arguments(format_args!("NATIVE ROOT FATAL {error:?}\n"));
-        crate::output::fatal("native root contract failed")
+        crate::output::fatal(format_args!("native root contract failed: {error:?}"))
     }
     pub(crate) fn root_pages(&self) -> &[u64] {
         self.roots.roots()
@@ -349,12 +366,12 @@ impl Owner {
         // SAFETY: processor's installed descriptor set.
         let observed = unsafe { interrupts::observe() };
         if observed.gs != self.local.as_ptr() as u64 || snapshot.cr3 & !ADDRESS != 0 {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let state = state();
         let levels = if snapshot.cr4 & (1 << 12) != 0 { 5 } else { 4 };
         if state._loader_tables.levels() != levels {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         if state.native || snapshot.cr3 != state.host_root {
             return Err(WorkError::Busy);
@@ -369,7 +386,7 @@ impl Owner {
         roots.sort_unstable();
         roots.dedup();
         if roots.iter().any(|r| *r == 0 || r & !ADDRESS != 0) {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let mut ram = alloc::vec::Vec::new();
         ram.try_reserve_exact(state.ram.len())
@@ -480,7 +497,7 @@ impl Owner {
             let context = if let Some(context) = self.root_context.upgrade() {
                 context.check_current()?;
                 if !Arc::ptr_eq(&context.identity, &identity) {
-                    return Err(WorkError::CorruptContext);
+                    return Err(WorkError::corrupt());
                 }
                 context
             } else {

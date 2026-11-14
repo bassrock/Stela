@@ -280,7 +280,6 @@ impl Archive {
             inflater,
             produced: 0,
             held: Vec::new(),
-            held_at: 0,
         })
     }
 
@@ -300,6 +299,11 @@ impl Archive {
     /// when it is positioned at or before `offset` and re-opening it
     /// otherwise. Sequential reads of a deflate member then inflate it once,
     /// not once per block. Integrity is the caller's, as for `open_member`.
+    ///
+    /// A read that fails part way leaves `cursor` where it stopped, holding
+    /// the bytes it produced for `output`, so the same read asked again goes
+    /// on from there instead of inflating the member's prefix again. The
+    /// caller drops `cursor` after a failure it will not retry.
     pub fn read_member_resuming<R: ReadAt>(
         &self,
         reader: &mut R,
@@ -314,26 +318,43 @@ impl Archive {
         {
             return Err(corrupt("member read range"));
         }
-        // Reuse the cursor when it has not yet passed this offset, or passed
-        // it only with bytes it holds from a read that failed partway.
+        // Reuse the cursor only when it has not yet passed this offset, or
+        // still holds the bytes there from a read that failed part way.
         let mut progress = match cursor.take() {
-            Some(progress) if progress.produced <= offset || progress.holds(offset) => progress,
+            Some(progress) if progress.resumes_from() <= offset => progress,
             _ => self.start_member(reader, entry)?,
         };
+        let result = self.resume(reader, entry, &mut progress, offset, output);
+        *cursor = Some(progress);
+        result
+    }
+
+    fn resume<R: ReadAt>(
+        &self,
+        reader: &mut R,
+        entry: &Entry,
+        progress: &mut Progress,
+        offset: u64,
+        output: &mut [u8],
+    ) -> Result<(), PayloadError> {
+        let held = core::mem::take(&mut progress.held);
         let mut done = 0;
-        if progress.holds(offset) {
-            let from = (offset - progress.held_at) as usize;
-            done = (progress.held.len() - from).min(output.len());
-            output[..done].copy_from_slice(&progress.held[from..from + done]);
+        if offset < progress.produced {
+            // The held bytes end at `produced` and begin at or before
+            // `offset`.
+            let from = held.len() - (progress.produced - offset) as usize;
+            done = output.len().min(held.len() - from);
+            output[..done].copy_from_slice(&held[from..from + done]);
+            if done == output.len() {
+                progress.held = held;
+                progress.held.drain(..from + done);
+                return Ok(());
+            }
         }
-        if done == output.len() {
-            // Held bytes cover the read; they stay for the reads after it.
-            *cursor = Some(progress);
-            return Ok(());
-        }
-        // Held bytes end where the inflater is, so the read goes on there.
-        progress.held.clear();
-        if entry.method == Method::Stored && done == 0 {
+        // Any held bytes are all returned now: `offset` is at `produced`,
+        // or the held bytes were all before it.
+        let offset = offset + done as u64;
+        if entry.method == Method::Stored {
             // No inflater state depends on skipped input. Interleaved member
             // reads can discard a cursor; replaying a multi-gigabyte stored
             // image here would read every preceding byte again.
@@ -343,30 +364,19 @@ impl Archive {
             progress.remaining_output -= skip;
             progress.produced = offset;
         }
-        // A read that fails, as one waiting on the network does, keeps its
-        // cursor, with the bytes it produced for `output`, so the same read
-        // later goes on from there: a failed fill consumes nothing. Without
-        // it each retry inflated the member again from its start, and a
-        // large deflate member read over the network never finished.
         let mut discard = [0; 4096];
-        while done == 0 && progress.produced < offset {
+        while progress.produced < offset {
             let want = (offset - progress.produced).min(discard.len() as u64) as usize;
-            match self.pump(reader, &mut progress, &mut discard[..want]) {
-                Ok(0) => return Err(corrupt("short random member read")),
-                Ok(_) => {}
-                Err(error) => {
-                    *cursor = Some(progress);
-                    return Err(error);
-                }
+            if self.pump(reader, progress, &mut discard[..want])? == 0 {
+                return Err(corrupt("short random member read"));
             }
         }
         while done < output.len() {
-            let n = match self.pump(reader, &mut progress, &mut output[done..]) {
+            let n = match self.pump(reader, progress, &mut output[done..]) {
                 Ok(n) => n,
                 Err(error) => {
-                    progress.held.extend_from_slice(&output[..done]);
-                    progress.held_at = offset;
-                    *cursor = Some(progress);
+                    // The read's bytes from its offset up to `produced`.
+                    progress.held = output[..done].to_vec();
                     return Err(error);
                 }
             };
@@ -375,7 +385,6 @@ impl Archive {
             }
             done += n;
         }
-        *cursor = Some(progress);
         Ok(())
     }
 }
@@ -388,10 +397,10 @@ pub struct Progress {
     remaining_output: u64,
     inflater: Option<Inflater>,
     produced: u64,
-    /// The bytes from `held_at` up to `produced` that a read which failed
-    /// partway produced, for its retry.
+    /// The last bytes produced, ending at `produced`, that a read which
+    /// failed part way has not returned yet
+    /// ([`Archive::read_member_resuming`]).
     held: Vec<u8>,
-    held_at: u64,
 }
 
 impl Progress {
@@ -400,12 +409,10 @@ impl Progress {
         self.produced
     }
 
-    /// Whether held bytes, ending where the inflater is, cover `offset`.
-    fn holds(&self, offset: u64) -> bool {
-        !self.held.is_empty()
-            && offset >= self.held_at
-            && offset < self.produced
-            && self.held_at + self.held.len() as u64 == self.produced
+    /// The first offset [`Archive::read_member_resuming`] can go on from
+    /// with this position: `produced`, or the start of the bytes it holds.
+    pub fn resumes_from(&self) -> u64 {
+        self.produced - self.held.len() as u64
     }
 }
 
@@ -774,5 +781,83 @@ pub(crate) mod tests {
         let mut stream = archive.open_member(&mut memory, &longer).unwrap();
         assert!(drain(&mut stream, 4096).is_err());
         assert!(Archive::open(&mut Memory(vec![0; 10])).is_err());
+    }
+
+    /// A read larger than several input refills, from a source that fails
+    /// every third refill, goes on from where each failure left it: every
+    /// compressed byte is read once, and no read replays the member.
+    #[test]
+    fn a_resumed_read_that_fails_part_way_keeps_its_bytes_and_inflater() {
+        struct Failing {
+            inner: Memory,
+            reads: usize,
+            served: u64,
+        }
+        impl ReadAt for Failing {
+            type Error = &'static str;
+            fn len(&self) -> u64 {
+                self.inner.len()
+            }
+            fn read_at(&mut self, offset: u64, bytes: &mut [u8]) -> Result<(), Self::Error> {
+                self.reads += 1;
+                if self.reads.is_multiple_of(3) {
+                    return Err("timed out");
+                }
+                self.served += bytes.len() as u64;
+                self.inner.read_at(offset, bytes)
+            }
+        }
+        // Barely compressible, so one read spans many 64 KiB refills.
+        let mut state = 0x6c07_8965_u32;
+        let big: Vec<u8> = (0..3 * 1024 * 1024 + 123)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 24) as u8
+            })
+            .collect();
+        for deflate in [false, true] {
+            let bytes = archive(&[("m", &big, deflate)], true);
+            let size = bytes.len() as u64;
+            let mut reader = Failing {
+                inner: Memory(bytes),
+                reads: 0,
+                served: 0,
+            };
+            let archive = Archive::open(&mut reader.inner).unwrap();
+            let entry = archive.find("m").unwrap().clone();
+            let mut cursor = None;
+            let mut failures = 0;
+            // Windows that do not line up with refills.
+            let window = 1024 * 1024 + 4096;
+            let mut offset = 0;
+            while offset < big.len() {
+                let len = window.min(big.len() - offset);
+                let mut out = vec![0; len];
+                loop {
+                    match archive.read_member_resuming(
+                        &mut reader,
+                        &entry,
+                        &mut cursor,
+                        offset as u64,
+                        &mut out,
+                    ) {
+                        Ok(()) => break,
+                        Err(_) => failures += 1,
+                    }
+                    assert!(failures < 1000, "deflate={deflate}");
+                    assert_eq!(cursor.as_ref().unwrap().resumes_from(), offset as u64);
+                }
+                assert!(out == big[offset..offset + len], "deflate={deflate}");
+                offset += len;
+            }
+            assert!(failures > 0, "deflate={deflate}");
+            assert!(
+                reader.served < size + 4096,
+                "deflate={deflate}: served {} of {size}",
+                reader.served
+            );
+        }
     }
 }

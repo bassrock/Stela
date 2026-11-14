@@ -15,7 +15,8 @@
 //! Hot-plug: once a second the same flush on the boot CPU reads the
 //! connectors as the driver last detected them, which its hot-plug
 //! interrupts keep current. A display taken at start is set again when it
-//! returns after being unplugged. When the firmware's screen is gone and no
+//! returns after being unplugged, and shows on an output connected later
+//! when that output has its size. When the firmware's screen is gone and no
 //! display was taken, the bound GPUs are looked on until one shows a display
 //! in the guest's mode, and probed anew every [`PROBE_LOOKS`] looks, as
 //! Linux's output polling and fbdev helper take a display that appears late.
@@ -152,6 +153,22 @@ impl Scanout for KmsScanout {
         self.look();
         Ok(())
     }
+
+    /// Display sleep turns the outputs off, and a wake lights them again;
+    /// where a request must wait, the next flush on the boot CPU does it.
+    /// With no display taken nothing of this scanout is lit.
+    fn set_power(&mut self, on: bool) -> Result<()> {
+        let Some((_, display)) = &mut self.display else {
+            return Ok(());
+        };
+        display.set_power(on).map_err(|error| {
+            refuse!(
+                "the GPU's display refused to turn its outputs {state}: {error}",
+                state = if on { "on" } else { "off" },
+                error = format!("{error:?}")
+            )
+        })
+    }
 }
 
 impl KmsScanout {
@@ -185,22 +202,18 @@ impl KmsScanout {
         self.next_look = now.saturating_add(self.tsc_hz.saturating_mul(LOOK_SECONDS));
         self.looks = self.looks.wrapping_add(1);
         match &mut self.display {
-            Some((name, display)) => match display.watch() {
-                Ok(Watched::Unchanged) => {}
-                Ok(Watched::Lost) => {
-                    output::arguments(format_args!("GPU {name}: display disconnected\n"));
+            Some((name, display)) => {
+                let watched = display.watch();
+                report_watched(name, display, watched);
+                if let Some(error) = watched.error
+                    && !core::mem::replace(&mut self.reported, true)
+                {
+                    output::arguments(format_args!(
+                        "GPU {name}: display request refused: {error:?}; the other outputs \
+                         are still read and set\n"
+                    ));
                 }
-                Ok(Watched::Restored) => {
-                    output::arguments(format_args!("GPU {name}: display connected again\n"));
-                }
-                Err(error) => {
-                    if !core::mem::replace(&mut self.reported, true) {
-                        output::arguments(format_args!(
-                            "GPU {name}: display connector unreadable: {error:?}\n"
-                        ));
-                    }
-                }
-            },
+            }
             None => self.attach(self.looks.is_multiple_of(PROBE_LOOKS)),
         }
     }
@@ -223,6 +236,7 @@ impl KmsScanout {
             ) {
                 Ok(display) if display.size() == wanted => {
                     output::arguments(format_args!("GPU {name}: display detected after start\n"));
+                    report_outputs(name, &display);
                     let screen = screen(&display);
                     match self.presented {
                         // The guest's next frame shows here, and a stop's
@@ -239,14 +253,17 @@ impl KmsScanout {
                     return;
                 }
                 Ok(display) => {
-                    // No scaler exists; the output keeps the black frame
-                    // the take showed, and the GPU is looked on no more.
+                    // No scaler exists; the outputs are turned off, their
+                    // buffers and the node given back, and the GPU is
+                    // looked on no more.
                     let (width, height) = display.size();
                     output::arguments(format_args!(
                         "GPU {name}: display detected after start has no {}x{} mode, \
                          which macOS draws, only {width}x{height}: not shown\n",
                         wanted.0, wanted.1
                     ));
+                    let Node(fd) = display.release();
+                    client::close_descriptor(fd);
                     self.waiting.swap_remove(index);
                 }
                 Err(DisplayError::NoOutput) => index += 1,
@@ -260,6 +277,48 @@ impl KmsScanout {
                 }
             }
         }
+    }
+}
+
+/// What a look read of `display`'s connectors, one line for each change.
+fn report_watched(name: &str, display: &Display<Node>, watched: Watched) {
+    let lines = [
+        (watched.lost, "display disconnected"),
+        (watched.restored, "display connected again"),
+        (watched.joined, "display added on a new output"),
+        (
+            watched.unshown,
+            "new output has no free mode or controller in the display's size",
+        ),
+        (
+            watched.modeless,
+            "display connected again has no mode of the display's size: left dark",
+        ),
+        (
+            watched.refused,
+            "display connected again refused its mode: left dark",
+        ),
+    ];
+    for (count, what) in lines {
+        if count != 0 {
+            output::arguments(format_args!(
+                "GPU {name}: {what} ({count}); {} outputs run it\n",
+                display.outputs()
+            ));
+        }
+    }
+}
+
+/// How many outputs show `display` and how many connected ones cannot,
+/// when that is more than the one output.
+fn report_outputs(name: &str, display: &Display<Node>) {
+    let (shown, unshown) = (display.outputs(), display.unshown());
+    if shown > 1 || unshown != 0 {
+        let (width, height) = display.size();
+        output::arguments(format_args!(
+            "GPU {name}: display on {shown} outputs, {unshown} connected without a free \
+             {width}x{height} mode or controller\n"
+        ));
     }
 }
 
@@ -386,6 +445,7 @@ pub(in crate::engine) fn take(
                     "GPU {name}: display runs {width}x{height} at {} mHz\n",
                     display.refresh_millihertz()
                 ));
+                report_outputs(name, &display);
                 crate::status::take_screen(Some(screen(&display)));
                 for (_, fd) in waiting.drain(..) {
                     client::close_descriptor(fd);

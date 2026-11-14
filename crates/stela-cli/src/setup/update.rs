@@ -60,22 +60,29 @@ fn activate_build(record: &mut Record, build: &str) -> Result<()> {
 }
 
 /// Remove the bundles and media of everything but the active build and
-/// generation.
+/// generation, and the build a stopped macOS switch moves to: its part of
+/// a new copy stays for the switch to go on from.
 pub(super) fn prune(record: &mut Record) -> Result<()> {
-    let (build, generation) = (record.build.clone(), record.generation());
+    let generation = record.generation();
+    let kept: Vec<String> = std::iter::once(record.build.clone())
+        .chain(record.replacing.clone())
+        .collect();
     let (active, stale): (Vec<_>, Vec<_>) = record
         .bundles
         .drain(..)
-        .partition(|b| b.build == build && b.generation() == generation);
+        .partition(|b| kept.contains(&b.build) && b.generation() == generation);
     record.bundles = active;
     super::remove_bundles(record, &stale)?;
     for build in stale.iter().map(|b| &b.build) {
         let directory = bundle::build_directory(&record.volume, build);
-        if *build != record.build && directory.is_dir() {
+        if !kept.contains(build) && directory.is_dir() {
             fs::remove_dir_all(directory)?;
         }
     }
-    let (active, stale): (Vec<_>, Vec<_>) = record.media.drain(..).partition(|m| m.build == build);
+    let (active, stale): (Vec<_>, Vec<_>) = record
+        .media
+        .drain(..)
+        .partition(|m| kept.contains(&m.build));
     record.media = active;
     for medium in stale {
         remove_medium(&medium)?;
@@ -110,6 +117,9 @@ pub(super) struct UpdateOptions<'a> {
     pub(super) dry_run: bool,
     /// `--yes`: put an older Stela on a stick without asking.
     pub(super) yes: bool,
+    /// It reports the device skips the stick's log names, which `update`
+    /// ends once the whole command is done; a repair reports its own.
+    pub(super) skips: bool,
 }
 
 /// Replace `stela.efi` with `image_path`, preparing bundles of its schema
@@ -126,6 +136,7 @@ pub(super) fn update_stela(
         download_dir,
         dry_run,
         yes,
+        skips,
     } = options;
     let image = read_efi(environment, image_path)?;
     check_firmware_support(&record.esp, &image)?;
@@ -180,7 +191,9 @@ pub(super) fn update_stela(
     let from = fs::read(esp.join(LOADER_PATH)).map_or("none".into(), |image| version_id(&image));
     let mut text = String::new();
     writeln!(text, "Stela update on {}:", esp.display())?;
-    text.push_str(&super::doctor::device_skips(&esp, "stela update", dry_run)?);
+    if skips {
+        text.push_str(&super::doctor::device_skips(&esp, dry_run)?);
+    }
     text.push_str(&super::fdr::prepare(&record, true)?);
     // The firmware the last boot asked for and the USB lacks, which every
     // update that changes something adds.
@@ -372,7 +385,7 @@ pub(super) fn update_stela(
                 writeln!(text, "  remove         {}", pack.path.display())?;
             }
         }
-        None => writeln!(text, "  translations   no store on this USB")?,
+        None => writeln!(text, "  translations   no store on this stick")?,
     }
     if dry_run {
         text.push_str("Dry run: nothing was changed.\n");
@@ -459,7 +472,7 @@ fn room_for_new_copy(
     if dry_run {
         writeln!(
             text,
-            "  remove first   {} ({size}), after asking: the USB has room for one copy of \
+            "  remove first   {} ({size}), after asking: the stick has room for one copy of \
              macOS, and cannot install macOS until the new one is complete",
             directory.display()
         )?;
@@ -495,6 +508,13 @@ pub(super) struct OsOptions<'a> {
     pub(super) dry_run: bool,
     /// `--yes`: remove the old copy for room without asking.
     pub(super) yes: bool,
+    /// The command named the download, as `update --macos` does: without a
+    /// terminal it is not asked about. A repair that finishes a stopped
+    /// switch names none.
+    pub(super) named: bool,
+    /// The bytes of a download plain `stela`'s choice named and the person
+    /// chose, which is not asked about again.
+    pub(super) accepted: Option<u64>,
 }
 
 /// Add the new build's install medium and every machine's restore bundles,
@@ -511,6 +531,8 @@ pub(super) fn update_os(
         download_dir,
         dry_run,
         yes,
+        named,
+        accepted,
     } = options;
     // Everything that can refuse the update comes before any download.
     check_bundle_revision(environment, &record)?;
@@ -596,11 +618,12 @@ pub(super) fn update_os(
     };
     // `--macos` names the download, so only a terminal run asks first.
     if !dry_run {
+        let bytes = super::sources::download_bytes(&source);
         super::consent_download(
             environment,
-            yes,
-            true,
-            super::sources::download_bytes(&source),
+            yes || accepted == Some(bytes),
+            named,
+            bytes,
             &format!("macOS {build}"),
         )?;
     }
@@ -676,7 +699,7 @@ pub(super) fn update_os(
     write_record(&record.esp.clone(), &record)?;
     text.push_str(
         "Done. An installed macOS keeps updating itself. To install this build on a new or \
-         erased disk, boot the USB and choose Install macOS, which erases that disk.\n",
+         erased disk, boot the stick and choose Install macOS, which erases that disk.\n",
     );
     Ok(text)
 }

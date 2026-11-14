@@ -1,6 +1,7 @@
 //! Pure geometry for original captured ECAM/RootBridge descriptions.
 //! This module creates no Resource, mapping, device exclusion or root permission.
 pub mod census;
+pub mod memory;
 pub mod topology;
 use alloc::vec::Vec;
 use core::ops::RangeInclusive;
@@ -88,6 +89,15 @@ fn physical(window: EcamWindow, bits: u8) -> Result<PhysicalSpan, Error> {
         return Err(Error::InvalidRange);
     }
     PhysicalSpan::new(start, end - start)
+}
+
+/// Whether a root bridge forwards configuration requests for `bus` of
+/// `segment`. A request for any other bus of an MCFG window ends at the
+/// root complex, which completes it with all ones.
+pub fn root_decodes(roots: &[RootWindow], segment: u16, bus: u8) -> bool {
+    roots.iter().any(|root| {
+        root.segment == u32::from(segment) && root.buses().is_some_and(|buses| buses.contains(&bus))
+    })
 }
 
 /// Borrowed immutable descriptions whose COMPLETE original MCFG windows were
@@ -297,6 +307,32 @@ mod tests {
         };
         assert_eq!(bus.normalize(), Reading::Derived);
         assert_eq!(bus.buses(), Some(0x10..=0x1f));
+    }
+
+    #[test]
+    fn only_root_bridge_buses_are_decoded() {
+        let root = |segment: u32, first: u64, last: u64| RootWindow {
+            segment,
+            bridge: 1,
+            space: 2,
+            minimum: first,
+            maximum: last,
+            length: last - first + 1,
+            ..RootWindow::default()
+        };
+        let roots = [root(0, 0, 0x3f), root(1, 0x10, 0x10)];
+        assert!(root_decodes(&roots, 0, 0));
+        assert!(root_decodes(&roots, 0, 0x3f));
+        assert!(!root_decodes(&roots, 0, 0x40));
+        assert!(root_decodes(&roots, 1, 0x10));
+        assert!(!root_decodes(&roots, 1, 0x11));
+        assert!(!root_decodes(&roots, 2, 0));
+        // A memory window is no bus grant.
+        let memory = RootWindow {
+            space: 0,
+            ..root(0, 0x40, 0x7f)
+        };
+        assert!(!root_decodes(&[memory], 0, 0x40));
     }
 
     #[test]

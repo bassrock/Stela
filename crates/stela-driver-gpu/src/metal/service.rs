@@ -56,6 +56,7 @@ mod shared;
 mod sharing;
 #[cfg(test)]
 mod tests;
+pub mod waiters;
 pub mod wire;
 
 /// Opens a new device for the GPU after a loss.
@@ -124,14 +125,31 @@ pub trait GuestMemory {
     fn write(&mut self, span: Span, bytes: &[u8]) -> Result<(), Fault>;
 }
 
-/// A `NewLibrary` call's bytes, read from its span and digested
+/// A `NewLibrary` call's library, read from its span and digested
 /// ([`crate::metal::device::pipelines::library_digest`]) a piece at each of its runs
 /// before its turn (`shared.rs`): no turn reads a library of hundreds of
 /// megabytes, and a library of held bytes is shared by its digest.
 pub struct StagedLibrary {
     pub span: Span,
-    pub bytes: Vec<u8>,
+    /// The bytes, when they were kept: a first read only digests them, and
+    /// the call reads them again only for a library the device does not
+    /// hold.
+    pub bytes: Option<Vec<u8>>,
     pub digest: [u8; 32],
+}
+
+/// A band of a `GetBytes` call whose GPU copy into host memory started
+/// ([`crate::metal::device::resources::ReadBack`]): the shared service waits for it and
+/// copies it to the caller outside the turn, then starts the next band in
+/// the call's next turn.
+pub struct StartedReadBack {
+    pub read_back: crate::metal::device::resources::ReadBack,
+    /// The band's index among the call's bands and its span of the caller's
+    /// bytes.
+    pub band: usize,
+    pub span: Span,
+    /// Whether no band follows it.
+    pub last: bool,
 }
 
 /// A device object a connection holds.
@@ -345,6 +363,19 @@ pub struct Service<B: Backend, C: Compiler> {
     /// The bytes of the call served now's library, read before its turn
     /// ([`StagedLibrary`]).
     staged_library: Option<StagedLibrary>,
+    /// The span of the call served now's library, which the device does not
+    /// hold: its bytes are read again before the call's next turn, and the
+    /// call is answered `Pending`.
+    library_wanted: Option<Span>,
+    /// Whether a `GetBytes` call of a texture only host image copies reach
+    /// is answered `Pending` once the GPU copy of its next band starts
+    /// ([`StartedReadBack`]), for the shared service to finish outside the
+    /// turn; otherwise the call reads the image itself.
+    reads_back: bool,
+    /// The band of the call served now that its read-backs reached.
+    read_back_from: Option<usize>,
+    /// The read-back the call served now started.
+    read_back_started: Option<StartedReadBack>,
     reopen: Option<Reopen<B, C>>,
     prepare: Option<Prepare<B, C>>,
 }
@@ -366,6 +397,10 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             loss_described: false,
             pins_reported: false,
             staged_library: None,
+            library_wanted: None,
+            reads_back: false,
+            read_back_from: None,
+            read_back_started: None,
             reopen: None,
             prepare: None,
         }

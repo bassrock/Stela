@@ -19,6 +19,7 @@ use core::{
 use stela_contracts::refuse;
 
 mod mailbox;
+mod park;
 
 const STARTING: u8 = 0;
 const READY: u8 = 1;
@@ -286,9 +287,9 @@ unsafe extern "sysv64" fn enter(argument: u64) -> ! {
     .and_then(|owner| {
         argument.status.store(SYNCING, Ordering::Release);
         let offset = argument.tsc.target()?;
-        // This AP's 24 MHz counter counts from a base its software
-        // correction moved, so that it reads the BSP's count.
-        host::correct_tsc_base(offset);
+        // This AP reads the BSP's counter, and counts its guest clock,
+        // through its software correction from now on.
+        host::agree_tsc(offset);
         Ok(owner)
     });
     match initialized {
@@ -673,6 +674,18 @@ pub(crate) unsafe fn start(
         // their mailbox loop, answering shootdowns, and run no PE.
         processors.retain(|processor| processor.slot < *first);
     }
+    // SAFETY: every started AP is ready, or failed and then nothing starts
+    // from the page again; the memory types are the BSP's, checked above.
+    unsafe {
+        park::park(
+            handoff,
+            capture,
+            &sender,
+            &memory_types,
+            effective_pat,
+            failure.is_some(),
+        )
+    };
     Ok(Executors {
         processors,
         failure: failure.map(|(_, error)| error),
@@ -707,12 +720,24 @@ fn serve(
         match argument.status.load(Ordering::Acquire) {
             SYNCING if !started[index].synced => {
                 let begun = apic::rdtsc();
-                argument.tsc.source();
+                let met = argument.tsc.source();
                 started[index].synced = true;
                 // The APs waiting meanwhile lose none of their second.
                 let spent = apic::rdtsc().wrapping_sub(begun);
                 for other in started.iter_mut() {
                     other.since = other.since.wrapping_add(spent);
+                }
+                if !met {
+                    // The AP stopped mid-synchronization; the abandoned
+                    // rendezvous refuses its later points, so it never
+                    // reports ready on its own.
+                    crate::output::arguments(format_args!(
+                        "NATIVE TSC slot={slot} missed a synchronization point: left out\n"
+                    ));
+                    let failing = started.swap_remove(index);
+                    crate::native_mmio::PROCESSORS.exclude(failing.destination);
+                    failed.push((slot, StartupFailure::Timeout { slot }));
+                    continue;
                 }
                 let outcome = argument.tsc.outcome();
                 crate::output::arguments(format_args!(
@@ -722,12 +747,14 @@ fn serve(
                 static OFFSET_REPORTED: core::sync::atomic::AtomicBool =
                     core::sync::atomic::AtomicBool::new(false);
                 if outcome.offset != 0 && !OFFSET_REPORTED.swap(true, Ordering::Relaxed) {
-                    // Only the guest counter's base takes the offset: raw
-                    // counter reads on this core, such as cross-PE deadlines,
-                    // stay off by it.
+                    // The guest clock and the host's counter reads
+                    // (`host::rdtsc`) take the offset; the raw counter
+                    // stays apart, and only durations measured on one core
+                    // read it.
                     crate::output::arguments(format_args!(
-                        "UNSUPPORTED host TSC agreement in software: slot={slot} offset={}; \
-                         raw counter reads on that core stay off by it\n",
+                        "NATIVE TSC slot={slot} agrees through a software offset of {}: \
+                     its counter has no IA32_TSC_ADJUST or did not converge, and is \
+                     never written\n",
                         outcome.offset,
                     ));
                 }

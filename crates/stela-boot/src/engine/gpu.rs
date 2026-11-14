@@ -415,6 +415,9 @@ struct Host {
     lines: RefCell<Vec<Line>>,
     /// The unsupported operations already reported.
     reported: RefCell<BTreeSet<String>>,
+    /// The first error Linux reported, which a stop before the start
+    /// finished names as the reason the GPU did not start.
+    first_error: RefCell<Option<String>>,
 }
 
 impl Host {
@@ -504,8 +507,34 @@ impl Platform for Host {
     }
 
     fn log(&self, level: i32, message: &CStr) {
+        // A line Linux prints is progress: a long step that reports it is
+        // not stuck.
+        super::step_watchdog::progress();
         let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
         self.report(format_args!("<{level}> {message}"));
+        // KERN_ALERT to KERN_ERR; KERN_EMERG is a terminal stop's own report.
+        if (1..=3).contains(&level) {
+            let mut first = self.first_error.borrow_mut();
+            if first.is_none() {
+                *first = Some(message.to_owned());
+            }
+        }
+    }
+
+    fn fatal(&self, message: &CStr) {
+        // A named stop in place of the C caller's trap, which the engine
+        // would report as an unexpected exception.
+        let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
+        // Before the start finished, its first error is why the GPU did not
+        // start; after it, an error is a running GPU's and names nothing.
+        let failed_start = match installed() {
+            None => self.first_error.borrow().clone(),
+            Some(_) => None,
+        };
+        output::fatal(stela_boot_core::gpu_status::driver_stopped(
+            message,
+            failed_start.as_deref(),
+        ))
     }
 
     fn warn(&self, file: &CStr, line: i32, condition: Option<&CStr>) {
@@ -903,7 +932,9 @@ fn select_firmware<E>(
     // stays allocated for every image borrowed from it for the boot.
     let stored: &'static Catalog = unsafe { &*Arc::into_raw(catalog.clone()) };
     let mut bindings = Vec::new();
-    let mut available = false;
+    // nouveau needs every file of the chip's recipe: one missing fails its
+    // start later with a generic error.
+    let mut missing = Vec::new();
     for selection in plan.selections() {
         let request = &selection.request;
         // An exact binding, else the bundle's file by its pinned digest.
@@ -935,9 +966,10 @@ fn select_firmware<E>(
                             "the GPU firmware digest does not match its pinned recipe",
                         )
                     })?;
-                available = true;
             }
-            Err(error) if error.kind == FirmwareError::Missing => (),
+            Err(error) if error.kind == FirmwareError::Missing => {
+                missing.push(request.name.clone());
+            }
             Err(error) => {
                 output::arguments(format_args!(
                     "GPU {name}: firmware {} refused: {error:?}\n",
@@ -950,10 +982,13 @@ fn select_firmware<E>(
         }
         names.push(request.name.clone());
     }
-    if !available {
+    if !missing.is_empty() {
         output::arguments(format_args!(
-            "GPU {name}: the USB's firmware bundle lacks this chip's files; `stela repair` \
-             completes it\n"
+            "GPU {name}: the USB's firmware bundle lacks {} of this chip's {} files ({}); \
+             `stela repair` completes it\n",
+            missing.len(),
+            names.len(),
+            missing.join(", ")
         ));
         return Err(ServiceError::Refused(NO_FIRMWARE));
     }
@@ -1058,11 +1093,14 @@ fn claim(
     };
     let (mut bars, mut resources) = (Vec::new(), ManuallyDrop::new(Vec::new()));
     let function_bars = function.bars().map_err(ServiceError::Config)?;
-    if !matches!(function_bars[driver.registers], Some(Bar::Memory { prefetchable: false, size, .. }) if size >= PAGE)
-        || function.config().read16(4).map_err(ServiceError::Config)? & 2 == 0
-    {
+    if let Err(why) = gpu::cold::register_bar(function_bars[driver.registers], PAGE) {
+        output::arguments(format_args!(
+            "GPU {address} register BAR refused: {why:?} BAR{}={:?}\n",
+            driver.registers,
+            function_bars[driver.registers]
+        ));
         return Err(ServiceError::Refused(
-            "the GPU's register BAR does not decode",
+            "the GPU's register BAR is not an assigned register window",
         ));
     }
     let mut register_bar = None;
@@ -1105,6 +1143,21 @@ fn claim(
     let register_bar = register_bar.ok_or(ServiceError::Refused(
         "the GPU's register BAR does not decode",
     ))?;
+    // Each memory BAR lies in a host aperture: decode it, as Linux
+    // `pci_enable_device` does before the register reads below.
+    let decode = gpu::cold::enable_decode(function, timer.as_ref()).map_err(|error| {
+        output::arguments(format_args!(
+            "GPU {address} memory decoding refused: {error:?}\n"
+        ));
+        ServiceError::Refused("the GPU's memory decoding did not turn on")
+    })?;
+    if decode.power_state != 0 || decode.memory_was_off {
+        output::arguments(format_args!(
+            "GPU {address}: firmware left it in D{} with memory decoding {}; brought to D0 with decoding on, as Linux pci_enable_device does\n",
+            decode.power_state,
+            if decode.memory_was_off { "off" } else { "on" }
+        ));
+    }
     let config = function
         .config()
         .retain_epoch()
@@ -1382,7 +1435,7 @@ fn cold_refusal(
     ServiceError::Refused("the GPU's original cold handoff was refused")
 }
 
-/// Why a GPU was refused when the USB holds no firmware for its chip.
+/// Why a GPU was refused when the USB lacks any of its chip's firmware files.
 const NO_FIRMWARE: &str = "no pinned firmware for the observed GPU chipset was loaded";
 
 /// An adapter [`claim_all`] did not claim, for the boot screen
@@ -1821,6 +1874,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         devices: RefCell::new(BTreeMap::new()),
         lines: RefCell::new(lines),
         reported: RefCell::new(BTreeSet::new()),
+        first_error: RefCell::new(None),
     };
     // SAFETY: boot's original code and allocator remain installed permanently.
     unsafe {
@@ -1960,7 +2014,7 @@ fn mount_and_start(
         threads,
         time,
         deadline,
-        "Linux's first tasks",
+        &FIRST_TASKS,
         || matches!(srcu.status(), stela_linux::srcu::Status::Pending(status) if status.joined),
     )?;
     // SAFETY: the taskless dispatcher observed the original joined job.
@@ -1979,7 +2033,7 @@ fn mount_and_start(
     // SAFETY: the ready original task broker keeps the callback and all
     // original owners until its genuine managed child has joined.
     let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
-    wait_for_child(runtime, threads, time, deadline, "the GPU's probe", || {
+    wait_for_child(runtime, threads, time, deadline, &PROBE, || {
         pending.status().joined
     })?;
     // SAFETY: physical return on the same dispatcher with the joined status.
@@ -1991,11 +2045,15 @@ fn mount_and_start(
     }
     let job = completed
         .take()
-        .ok_or(environment_error(WorkError::CorruptContext))?;
+        .ok_or_else(|| environment_error(WorkError::corrupt()))?;
     drop(joined.into_job());
     drop(ready);
     Ok((owner, threads, job))
 }
+
+/// The start's stages [`wait_for_child`] names.
+static FIRST_TASKS: &str = "Linux's first tasks";
+static PROBE: &str = "the GPU's probe";
 
 /// Wait for `stage` of the start, which Linux's tasks run, until `finished`
 /// or `deadline` on `time`. A long wait says every
@@ -2010,9 +2068,17 @@ fn wait_for_child(
     threads: &LinuxThreads,
     time: &dyn Clock,
     deadline: u64,
-    stage: &str,
+    stage: &'static &'static str,
     finished: impl Fn() -> bool,
 ) -> Result<(), Error> {
+    struct Staged;
+    impl Drop for Staged {
+        fn drop(&mut self) {
+            super::step_watchdog::clear_stage();
+        }
+    }
+    super::step_watchdog::stage(stage);
+    let _staged = Staged;
     let began = host::rdtsc();
     let began_ns = time.now_ns().map_err(environment_error)?;
     let mut steps = 0u64;
@@ -2767,8 +2833,9 @@ enum Look {
 /// have moved. Most pumps run for a call a PE posted or a Linux timer. The
 /// fallback look every [`LOOK_FALLBACK_NS`] is for a device no waiter
 /// watches: while one waits on the only device's timeline, every fence it
-/// signals reaches the waiter, which asks for the look itself, so the
-/// fallback only starts the waiters of new timelines.
+/// signals reaches the waiter, which asks for the look itself, so while
+/// every device's waiter waits the fallback only starts the waiters of new
+/// timelines.
 fn look_due(gpu: &Installed) -> Look {
     let fired = FIRED.load(Ordering::Acquire);
     let interrupted = LOOKED.swap(fired, Ordering::Relaxed) != fired;
@@ -2785,7 +2852,7 @@ fn look_due(gpu: &Installed) -> Look {
         Look::Device
     } else if !fallback {
         Look::No
-    } else if gate::shared().len() == 1 && waiter::watching() {
+    } else if waiter::watching(gate::shared().len()) {
         Look::Waiters
     } else {
         Look::Device

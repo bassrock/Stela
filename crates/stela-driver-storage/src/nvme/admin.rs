@@ -45,7 +45,17 @@ impl Controller {
         Ok(ready_wait_us(timeout))
     }
 
+    /// Stop the controller, then start it ([`Self::stop`],
+    /// [`Self::start_admin`]).
     pub(super) fn initialize(&mut self) -> Result<(), BlockError> {
+        self.stop()?;
+        self.start_admin()
+    }
+
+    /// Take the controller's capabilities and stop it, as Linux's
+    /// `nvme_pci_configure_admin_queue` does before it sets up the admin
+    /// queue: CC cleared, CSTS.RDY clear.
+    pub(super) fn stop(&mut self) -> Result<(), BlockError> {
         if let Some(owner) = self.owned.as_mut() {
             // An attempted prepare may have effects without establishing D0.
             // Only success authorizes NVMe MMIO; uncertain failure quarantines.
@@ -68,8 +78,17 @@ impl Controller {
         }
         // CAP.MQES, zero-based, bounds the I/O queues alone; AQA sizes the
         // admin queue. Linux shortens its I/O queues to it, refusing none
-        // (the value 0, one entry, is reserved).
-        let longest = (capabilities & 0xffff) + 1;
+        // (the value 0, one entry, is reserved). `nvme_pci_enable` gives a
+        // quirked controller two entries, one command, and the PM1725's
+        // MQES 0 64 entries.
+        let mqes = capabilities & 0xffff;
+        let longest = if self.quirks.contains(Quirks::QUEUE_DEPTH_ONE) {
+            2
+        } else if mqes == 0 && self.quirks.contains(Quirks::QUEUE_DEPTH_64) {
+            64
+        } else {
+            mqes + 1
+        };
         if longest < 2 {
             return Err(BlockError::Unsupported(
                 "NVMe controller reports one-entry queues (CAP.MQES 0)",
@@ -88,15 +107,30 @@ impl Controller {
         if capabilities & CAPABILITY_COMMAND_SETS != 0 {
             self.configuration |= COMMAND_SETS_ALL;
         }
-        self.registers.write32(CONFIGURATION, 0)?;
-        self.wait_status(self.ready_timeout_us, |status| status & READY == 0)
-            .map_err(|error| error.at(DISABLE_WAIT))?;
+        self.stop_and_wait().map_err(|error| error.at(DISABLE_WAIT))
+    }
+
+    /// Point the stopped controller at the admin queue, give it DMA where
+    /// its owner holds it, and enable it.
+    pub(super) fn start_admin(&mut self) -> Result<(), BlockError> {
         self.configure_admin()?;
         if let Some(owner) = self.owned.as_mut() {
             owner.lifecycle.enable_dma()?;
         }
         let timeout = self.enable()?;
         self.wait_enabled(timeout)
+    }
+
+    /// Linux `nvme_disable_ctrl`: clear CC, then wait for CSTS.RDY to clear,
+    /// first sleeping Linux's delay for a quirked controller. Waits: only at
+    /// attach and teardown, outside any service turn; a passed device start
+    /// budget ends the delay early.
+    pub(super) fn stop_and_wait(&mut self) -> Result<(), BlockError> {
+        self.registers.write32(CONFIGURATION, 0)?;
+        if self.quirks.contains(Quirks::READY_DELAY) {
+            self.clock.wait(quirks::READY_CHECK_DELAY_US, || false);
+        }
+        self.wait_status(self.ready_timeout_us, |status| status & READY == 0)
     }
 
     /// Linux `nvme_wait_ready` after CC.EN is set: CSTS.RDY alone ends the
@@ -129,7 +163,12 @@ impl Controller {
         let mut command = [0u32; 16];
         let address = if submission {
             command[0] = u32::from(ADMIN_CREATE_SUBMISSION);
-            command[11] = 1 << 16 | 1; // completion queue 1, contiguous
+            // Completion queue 1, contiguous; medium priority for a
+            // controller that otherwise enables weighted round robin.
+            command[11] = 1 << 16 | 1;
+            if self.quirks.contains(Quirks::MEDIUM_PRIORITY_QUEUE) {
+                command[11] |= SUBMISSION_PRIORITY_MEDIUM;
+            }
             self.io.submissions.address()?
         } else {
             command[0] = u32::from(ADMIN_CREATE_COMPLETION);
@@ -246,12 +285,13 @@ impl Controller {
     /// each: an Asynchronous Event Request's is kept for
     /// [`Self::service_events`] and an Abort's ends it. Command `id`'s result
     /// and status once posted, giving the admin page back to the CPU when
-    /// it holds `data`; any other completion breaks the protocol.
+    /// it holds `data`. A completion that names no outstanding command is
+    /// passed over ([`Self::stray_completion`]).
     pub(super) fn admin_completion(
         &mut self,
         expected: Option<(u16, bool)>,
     ) -> Result<Option<(u32, u32)>, BlockError> {
-        while let Some((id, result, status, _)) = self.posted(false)? {
+        while let Some((id, result, status)) = self.posted(false)? {
             self.ring_completion(false)?;
             if self.events.request == Some(id) {
                 self.events.request = None;
@@ -267,7 +307,7 @@ impl Controller {
                 }
                 return Ok(Some((result, status)));
             } else {
-                return Err(BlockError::Device { status: 0xffff });
+                self.stray_completion()?;
             }
         }
         Ok(None)
@@ -296,18 +336,18 @@ impl Controller {
 
     /// Linux `nvme_scan_ns` before it adds or validates a namespace: its
     /// identifiers and whether the command-set-independent Identify
-    /// Namespace described it, or `None` when Linux passes it over for
-    /// refused descriptors, a command set the controller does not run, or a
+    /// Namespace described it, or why Linux passes it over: refused
+    /// descriptors, a command set the controller does not run, or a
     /// namespace that is not ready.
-    pub(super) fn namespace_ids(
-        &mut self,
-        namespace: u32,
-    ) -> Result<Option<(Ids, bool)>, BlockError> {
-        let Some(ids) = self.descriptors(namespace)? else {
-            return Ok(None);
+    pub(super) fn namespace_ids(&mut self, namespace: u32) -> Result<Scan, BlockError> {
+        let ids = match self.descriptors(namespace)? {
+            Ok(ids) => ids,
+            Err(error) => return Ok(Scan::Passed(error)),
         };
         if ids.csi != CSI_NVM && self.configuration & COMMAND_SETS_ALL == 0 {
-            return Ok(None);
+            return Ok(Scan::Passed(BlockError::Unsupported(
+                "NVMe namespace of a command set the controller does not run",
+            )));
         }
         if self.independent_identify
             || (ids.csi != CSI_NVM && ids.csi != CSI_ZONED)
@@ -315,25 +355,39 @@ impl Controller {
         {
             match self.identify(IDENTIFY_INDEPENDENT_NAMESPACE, namespace) {
                 Ok(data) => {
-                    let ready = data[INDEPENDENT_STATUS] & NAMESPACE_READY != 0;
-                    return Ok(ready.then_some((ids, true)));
+                    return Ok(if data[INDEPENDENT_STATUS] & NAMESPACE_READY != 0 {
+                        Scan::Found(ids, true)
+                    } else {
+                        Scan::Passed(BlockError::Unsupported(
+                            "NVMe namespace not ready (NSTAT.NRDY clear)",
+                        ))
+                    });
                 }
                 Err(BlockError::Device { .. }) => {}
                 Err(error) => return Err(error),
             }
         }
-        Ok(Some((ids, false)))
+        Ok(Scan::Found(ids, false))
     }
 
-    /// Linux `nvme_identify_ns_descs`: none before NVMe 1.3. `None` when the
-    /// controller refused the list; the scan then skips the namespace.
-    pub(super) fn descriptors(&mut self, namespace: u32) -> Result<Option<Ids>, BlockError> {
-        if self.version < VERSION_1_3 {
-            return Ok(Some(Ids::default()));
+    /// Linux `nvme_identify_ns_descs`: none before NVMe 1.3 or under
+    /// `NVME_QUIRK_NO_NS_DESC_LIST`, and only the command set under
+    /// `NVME_QUIRK_BOGUS_NID`. The controller's refusal, named, when it
+    /// refused the list; the scan then skips the namespace.
+    pub(super) fn descriptors(
+        &mut self,
+        namespace: u32,
+    ) -> Result<Result<Ids, BlockError>, BlockError> {
+        if self.version < VERSION_1_3 || self.quirks.contains(Quirks::NO_DESCRIPTOR_LIST) {
+            return Ok(Ok(Ids::default()));
         }
+        let bogus = self.quirks.contains(Quirks::BOGUS_IDS);
         match self.identify(IDENTIFY_DESCRIPTORS, namespace) {
-            Ok(data) => Ok(Some(Ids::from_descriptors(data))),
-            Err(BlockError::Device { .. }) => Ok(None),
+            Ok(data) if bogus => Ok(Ok(Ids::from_descriptors(data).without_identifiers())),
+            Ok(data) => Ok(Ok(Ids::from_descriptors(data))),
+            Err(error @ BlockError::Device { .. }) => {
+                Ok(Err(error.at(identify_name(IDENTIFY_DESCRIPTORS))))
+            }
             Err(error) => Err(error),
         }
     }

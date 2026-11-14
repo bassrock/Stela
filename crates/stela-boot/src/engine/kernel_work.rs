@@ -27,6 +27,21 @@ use stela_drivers::{
     bus::dma::memory::MemoryError,
     platform::work::{self, Cpu, Executor, Queue, Stack, StackBacking, WorkError},
 };
+/// A work segment the step watchdog watches while it runs
+/// (`step_watchdog::enter`).
+struct Watched;
+impl Watched {
+    fn enter() -> Self {
+        super::step_watchdog::enter();
+        Self
+    }
+}
+impl Drop for Watched {
+    fn drop(&mut self) {
+        super::step_watchdog::leave();
+    }
+}
+
 /// Jobs the BSP's queue admits: one for every stack of its pool, and as many
 /// again waiting, which covers the firmware's protected pending events.
 pub(super) const SLOTS: usize = 2 * native_smp::resources::TASK_STACKS;
@@ -171,14 +186,14 @@ unsafe impl stela_linux::threads::OriginalKernelRoot for Reservation {
         let address = layout::physical(physical);
         let page = scope
             .observe_original(address)?
-            .ok_or(WorkError::CorruptContext)?;
+            .ok_or_else(|| WorkError::corrupt())?;
         if page.physical != physical || page.user || !page.writable {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         crate::native_memory::cache::verify_writeback(address, physical, 4096, layout::physical(0))
             .map_err(|_| WorkError::Unavailable)?;
         process.check()?;
-        core::ptr::NonNull::new(address as *mut c_void).ok_or(WorkError::CorruptContext)
+        core::ptr::NonNull::new(address as *mut c_void).ok_or_else(|| WorkError::corrupt())
     }
 }
 
@@ -198,28 +213,28 @@ unsafe impl stela_linux::threads::OriginalKernelGeometry for Reservation {
 
         for entry in target.entries() {
             // SAFETY: the original root and immutable image owner are held.
-            let physical = unsafe { self._image.check_callback(entry) }
-                .map_err(|_| WorkError::CorruptContext)?;
+            let physical =
+                unsafe { self._image.check_callback(entry) }.map_err(|_| WorkError::corrupt())?;
             let page = scope
                 .observe_original(entry as u64)?
-                .ok_or(WorkError::CorruptContext)?;
+                .ok_or_else(|| WorkError::corrupt())?;
             if page.physical != physical || page.user || page.writable || page.nx {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
         }
         for address in target.storage()? {
             if !address.is_multiple_of(core::mem::align_of::<c_uint>()) {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             let bytes = core::mem::size_of::<c_uint>();
             // SAFETY: the original root and immutable image owner are held.
             let physical = unsafe { self._image.writable_span(address, bytes) }
-                .map_err(|_| WorkError::CorruptContext)?;
+                .map_err(|_| WorkError::corrupt())?;
             let page = scope
                 .observe_original(address as u64)?
-                .ok_or(WorkError::CorruptContext)?;
+                .ok_or_else(|| WorkError::corrupt())?;
             if page.physical != physical || page.user || !page.writable || !page.nx {
-                return Err(WorkError::CorruptContext);
+                return Err(WorkError::corrupt());
             }
             crate::native_memory::cache::verify_writeback(
                 address as u64,
@@ -627,6 +642,7 @@ impl KernelWork {
         timeout_us: u64,
         function: F,
     ) -> Result<T, Error> {
+        let _watched = Watched::enter();
         self.reservation
             .identity
             .check_clock_root()
@@ -733,6 +749,7 @@ impl KernelWork {
         if self.linux_execution.get().is_some() {
             return Err(Error::Work(WorkError::Busy));
         }
+        let _watched = Watched::enter();
         self.dispatch(|_| {
             // SAFETY: dispatch entered the kept loader root on the owning
             // BSP. This scope ends after every active frame returns or parks.

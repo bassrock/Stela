@@ -9,8 +9,8 @@ use super::descriptor::{Endpoint, Interface, setup};
 use super::xhci::{Device, MAX_TD, Plan, STALL, Shared};
 use crate::{
     block::{
-        BlockDevice, BlockError, Command, Features, Finished, Identity, Sense, SenseCompletion,
-        Transport,
+        BlockDevice, BlockError, Command, Features, Finished, Identity, Rotation, Sense,
+        SenseCompletion, Transport,
     },
     bus::dma::DmaAllocator,
 };
@@ -37,6 +37,7 @@ const SD_MAX_RETRIES: u32 = 5;
 const SD_RUNTIME_US: u64 = (SD_MAX_RETRIES as u64 + 1) * 30_000_000;
 
 mod binding;
+pub mod settle;
 pub use binding::Binding;
 pub(super) use binding::discover as discover_binding;
 
@@ -203,6 +204,21 @@ trait Scsi {
     {
         None
     }
+    /// Whether [`Self::reset_device`] needs memory its old binding cannot
+    /// give back: a device behind a hub gets new rings.
+    fn reset_needs_allocation(&self) -> bool {
+        false
+    }
+    /// The device's port status when a command last failed in the
+    /// transport, for that failure's log line.
+    fn take_failure_status(&mut self) -> Option<String> {
+        None
+    }
+    /// A port reset the owner ran for a failed command that failed itself,
+    /// for its log line.
+    fn take_reset_failure(&mut self) -> Option<(String, BlockError)> {
+        None
+    }
 }
 impl<I: Io> Scsi for Bot<I> {
     type Lun = u8;
@@ -281,6 +297,12 @@ impl<I: Io> Scsi for Bot<I> {
     ) -> Option<Result<Self, (String, BlockError)>> {
         I::reset_device(self, dma)
     }
+    fn reset_needs_allocation(&self) -> bool {
+        self.io.reset_needs_allocation()
+    }
+    fn take_failure_status(&mut self) -> Option<String> {
+        Bot::take_failure_status(self)
+    }
 }
 impl Scsi for uas::Host {
     type Lun = uas::Lun;
@@ -352,6 +374,9 @@ impl Scsi for uas::Host {
         dma: &mut dyn DmaAllocator,
     ) -> Option<Result<Self, (String, BlockError)>> {
         Some(uas::Host::reset_and_rebind(self, dma))
+    }
+    fn reset_needs_allocation(&self) -> bool {
+        uas::Host::reset_needs_allocation(self)
     }
     fn max_transfer_bytes(&self) -> usize {
         uas::Host::max_transfer_bytes(self)
@@ -597,6 +622,15 @@ fn discover_uas_units<T: Scsi<Lun = uas::Lun>>(
     Ok(disks)
 }
 
+/// A unit's failure line names the port's status when the transport
+/// failed; a unit's own answer (its sense) needs none.
+fn failed_at(location: String, error: &BlockError, status: Option<String>) -> String {
+    match status {
+        Some(status) if !matches!(error, BlockError::Sense(_)) => format!("{location} {status}"),
+        _ => location,
+    }
+}
+
 fn quarantined() -> BlockError {
     BlockError::Unsupported("USB storage interface quarantined during discovery")
 }
@@ -629,6 +663,10 @@ fn publication<T: Scsi>(
             max_read_transfer,
             discard: None,
             write_zeroes: None,
+            // Bulk-Only units skip the VPD pages, Block Device
+            // Characteristics among them, as Linux's usb-storage does; a UAS
+            // unit's is not read.
+            rotation: Rotation::Unreported,
         };
     }
     Ok(Disk {
@@ -691,9 +729,16 @@ fn publish_unit<T: Scsi>(
             probe_identified(&mut *owner.borrow_mut(), lun, &bytes, &location, serial)
         })
         .and_then(|identified| publication(owner, lun, identified));
+    let (status, reset) = {
+        let mut owner = owner.borrow_mut();
+        (owner.take_failure_status(), owner.take_reset_failure())
+    };
     match result {
         Ok(disk) => disks.push(disk),
-        Err(error) => failures.push((location, error)),
+        Err(error) => {
+            failures.push((failed_at(location, &error, status), error));
+            failures.extend(reset);
+        }
     }
     if owner.borrow().poisoned() {
         return Err(quarantined());
@@ -777,10 +822,15 @@ fn discover_units<T: Scsi<Lun = u8>>(
         let location = format!("{prefix} LUN {lun}");
         let identified = probe(&mut *bot.borrow_mut(), lun, &location, serial);
         let result = identified.and_then(|identified| publication(&bot, lun, identified));
+        let (status, reset) = {
+            let mut bot = bot.borrow_mut();
+            (bot.take_failure_status(), bot.take_reset_failure())
+        };
         match result {
             Ok(disk) => disks.push(disk),
             Err(error) => {
-                failures.push((location, error));
+                failures.push((failed_at(location, &error, status), error));
+                failures.extend(reset);
                 // An uncertain interface cannot publish previously found disks
                 // as usable: quarantine the entire owner and discard the list.
                 if bot.borrow().poisoned() {

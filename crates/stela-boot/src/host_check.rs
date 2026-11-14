@@ -64,7 +64,6 @@ use stela_runtime::pc::{
     gpt::{self, Guid},
     power::HostPower,
 };
-use uefi::boot;
 
 const BEAT_SECONDS: u64 = 10;
 /// The stop code at `--deadline`.
@@ -207,8 +206,7 @@ pub fn boot(options: Vec<u8>) -> ! {
         // Configure it before the table owner seals its CR4 snapshot.
         interrupts::enable_avx();
         machine.active_tables = Some(paging::activate(tables).unwrap_or_else(|error| {
-            output::arguments(format_args!("native table activation refused: {error}"));
-            output::fatal("native table activation failed");
+            output::fatal(format_args!("native table activation failed: {error}"));
         }));
         asm!(
             "mov rsp, {top}",
@@ -286,11 +284,11 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
     }
     let registers = (machine.apic_base & apic::BASE_ADDRESS) as usize;
     tables.device(registers, registers + PAGE)?;
+    let final_map = crate::boot_exit::Buffer::allocate();
     crate::output::leave_boot_services();
     // SAFETY: no protocol or pool allocation outlives this call; the heap,
     // stack and tables are LOADER_DATA, which Stela keeps.
-    let map = unsafe { boot::exit_boot_services(None) };
-    core::mem::forget(map);
+    let _ = unsafe { crate::boot_exit::exit(final_map) };
     Ok((machine, tables))
 }
 
@@ -298,8 +296,9 @@ fn prepare(options: &[u8]) -> Result<(Machine, paging::Tables)> {
 extern "sysv64" fn run(machine: &mut Machine) -> ! {
     match machine.active_tables.as_ref() {
         Some(tables) => tables.check_current().unwrap_or_else(|error| {
-            output::arguments(format_args!("activated native root refused: {error}\n"));
-            output::fatal("activated native root is unavailable");
+            output::fatal(format_args!(
+                "activated native root is unavailable: {error}"
+            ));
         }),
         None => output::fatal("actual activated native table owner is missing"),
     }

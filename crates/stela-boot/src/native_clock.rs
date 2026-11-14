@@ -133,7 +133,7 @@ impl RootCpu {
             // No CPUID here: it is slow on every CPU and exits under a
             // hypervisor. The caller's `affinity` already proved this is the
             // owning processor (its unique GS record and descriptors), whose
-            // leaves 0, 1 and 6 cannot change; ARAT matters only to the
+            // vendor and family cannot change; ARAT matters only to the
             // timer, and `rearm` checks it before every arm.
             // SAFETY: original owner and CPU remain held. Source checks
             // real control/power eligibility around the coherent read.
@@ -197,8 +197,7 @@ unsafe impl Cpu for RootCpu {
         self.now().unwrap_or_else(|error| self.fatal(error))
     }
     fn fatal(&self, error: WorkError) -> ! {
-        crate::output::arguments(format_args!("NATIVE CLOCK FATAL {error:?}\n"));
-        crate::output::fatal("native clock/root contract failed")
+        crate::output::fatal(format_args!("native clock/root contract failed: {error:?}"))
     }
 }
 
@@ -362,13 +361,13 @@ unsafe impl stela_linux::owner::MinimumDeadline for MinimumDeadline {
         }
         let elapsed = now
             .checked_sub(self.start)
-            .ok_or(WorkError::CorruptContext)?;
+            .ok_or_else(|| WorkError::corrupt())?;
         let lower_ns = self.epoch.cpu.source.elapsed_bounds(elapsed)?.lower_ns;
         let remaining = self
             .minimum_ns
             .checked_sub(lower_ns)
             .filter(|ns| *ns != 0)
-            .ok_or(WorkError::CorruptContext)?;
+            .ok_or_else(|| WorkError::corrupt())?;
         // A fresh delay for this remainder reapplies the HPET edge bound.
         // The elapsed lower bound never credits more ticks than actually ran.
         Ok(remaining.div_ceil(quantum_ns))
@@ -493,7 +492,7 @@ impl State {
             .clamp(1, u128::from(u32::MAX)) as u32;
         let apic = self.cpu.controller();
         if apic.read(apic::DIVIDE) & 0b1011 != 0b1011 {
-            return Err(self.cpu.health.fail(WorkError::CorruptContext));
+            return Err(self.cpu.health.fail(WorkError::corrupt()));
         }
         apic.write(apic::LVT_TIMER, u32::from(interrupts::TIMER_VECTOR));
         apic.write(apic::INITIAL, ticks);
@@ -577,7 +576,7 @@ unsafe impl EnteredProcess for DriverProcess<'_, '_> {
     fn check(&self) -> Result<(), WorkError> {
         self.execution.check()?;
         if !self.execution.process_borrowed.get() || self.execution.root != root() {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         let flags: u64;
         // SAFETY: read-only flag observation on the admitted physical CPU.
@@ -625,7 +624,7 @@ impl DriverExecution<'_> {
     ) -> Result<R, WorkError> {
         self.check()?;
         if root() != self.root {
-            return Err(WorkError::CorruptContext);
+            return Err(WorkError::corrupt());
         }
         if self.process_borrowed.get() {
             return Err(WorkError::Busy);
@@ -643,7 +642,7 @@ impl DriverExecution<'_> {
 impl Drop for DriverExecution<'_> {
     fn drop(&mut self) {
         if self.check().is_err() {
-            self.installed.state.cpu.fatal(WorkError::CorruptContext);
+            self.installed.state.cpu.fatal(WorkError::corrupt());
         }
         if self.process_borrowed.get() {
             self.installed.state.cpu.fatal(WorkError::Busy);

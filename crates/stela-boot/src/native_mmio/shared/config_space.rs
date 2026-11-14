@@ -209,29 +209,23 @@ impl ConfigInventory<'_> {
         scope.read(offset, width)
     }
 
-    /// Check a bridge's buses against its root grant and the ECAM windows,
-    /// returning the buses it forwards. The primary field routes nothing;
-    /// like Linux, a wrong one is kept.
+    /// Check a bridge's buses against its root grant, the ECAM windows and
+    /// the bridges `admitted` before it (`census::admit`), returning the
+    /// buses it forwards. The primary field routes nothing; like Linux, a
+    /// wrong one is kept.
     pub(crate) fn check_bridge(
         &self,
         address: Address,
         buses: u32,
-    ) -> Result<Option<RangeInclusive<u8>>, Error> {
-        match census::route(address.bus, buses) {
-            census::Route::Unconfigured => Ok(None),
-            census::Route::Invalid => Err(Error::InvalidPlatformReply),
-            census::Route::Forwards { buses, primary } => {
-                self.geometry.check_bridge(
-                    self.source.platform.wire().roots(),
-                    address,
-                    buses.clone(),
-                )?;
-                if !primary {
-                    report_oddity(census::Oddity::PrimaryBus, address);
-                }
-                Ok(Some(buses))
-            }
+        admitted: &[(Address, RangeInclusive<u8>)],
+    ) -> Result<Option<RangeInclusive<u8>>, census::Misconfigured> {
+        let roots = self.source.platform.wire().roots();
+        let within = |range| self.geometry.check_bridge(roots, address, range).is_ok();
+        let forwarded = census::admit(address, buses, within, admitted)?;
+        if forwarded.is_some() && buses as u8 != address.bus {
+            report_oddity(census::Oddity::PrimaryBus, address);
         }
+        Ok(forwarded)
     }
 
     fn withdraw(&mut self) -> Result<(), Error> {
@@ -314,6 +308,9 @@ impl Source {
 
     /// Read an AML PCI operation through a scoped UC map without lending a
     /// writable address or letting the provider change the physical function.
+    /// A bridge whose forwarding is restored is read through the owner that
+    /// keeps its page. A bus of an MCFG window that no root bridge forwards
+    /// reads all ones, as the root complex completes such a request.
     pub(crate) fn read_firmware_config(
         &self,
         address: Address,
@@ -323,8 +320,22 @@ impl Source {
         if !matches!(width, 1 | 2 | 4)
             || offset > PAGE as u16 - width
             || !offset.is_multiple_of(width)
+            || address.device >= 32
+            || address.function >= 8
         {
             return Err(Error::InvalidRange);
+        }
+        let wire = self.platform.wire();
+        let windows = stela_runtime::pc::acpi::mcfg(wire.mcfg()).map_err(failed)?;
+        if windows.iter().any(|window| {
+            window.segment == address.segment
+                && (window.start_bus..=window.end_bus).contains(&address.bus)
+        }) && !stela_boot_core::ecam::root_decodes(wire.roots(), address.segment, address.bus)
+        {
+            return Ok(u32::MAX >> (32 - u32::from(width) * 8));
+        }
+        if let Some(value) = self.read_forwarding_bridge(address, offset, width) {
+            return value;
         }
         let (_, span) = self.config_page(address)?;
         // SAFETY: the original capture supplies this function extent. This

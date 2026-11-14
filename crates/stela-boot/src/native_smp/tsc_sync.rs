@@ -13,17 +13,20 @@
 //! Otherwise the AP moves its own counter by the warp through
 //! `IA32_TSC_ADJUST`, forward when it saw the counter go back and so ran
 //! behind, else back, and tries again. Linux finds the sync mechanism's own
-//! overhead leaves at most a third round needed. An AP with no
-//! `IA32_TSC_ADJUST`, as every AMD processor, moves the counter itself by
-//! writing `IA32_TIME_STAMP_COUNTER`, so that every raw read on it agrees
-//! too; Linux, which can fall back to another clock, marks such a counter
-//! unstable instead. Where those writes do not converge in [`ROUNDS`], the AP
-//! instead adds a software offset to the counter it reads in further
-//! rounds, and once those agree counts its guest clock from a base moved by
-//! that offset (`tsc::sync::corrected_base`). An AP that agrees in neither
-//! way is refused.
+//! overhead leaves at most a third round needed. Where those writes do not
+//! converge in [`ROUNDS`], or the AP has no `IA32_TSC_ADJUST`, as every AMD
+//! processor, the AP instead adds a software offset to the counter it reads
+//! in further rounds (`tsc::sync::correction_move`). It never writes
+//! `IA32_TIME_STAMP_COUNTER`: a Zen 2 core took its own count back within
+//! seconds of such a write. Once the rounds agree, the AP keeps the offset
+//! (`host::agree_tsc`): its guest clock counts from a base moved by it
+//! (`tsc::sync::corrected_base`), and every counter value the host reads on
+//! it is the BSP's (`tsc::sync::shared_tsc`). An AP that agrees in neither
+//! way is refused. Every rendezvous point and turn waits at most a
+//! round and [`POINT_MILLIS`] for the other core; a core that stops
+//! mid-round leaves the other with a refusal instead of a spin with no end.
 use crate::Result;
-use crate::cpu::msr::{TSC_ADJUST, wrmsr};
+use crate::cpu::msr::TSC_ADJUST;
 use core::{
     arch::{
         asm,
@@ -31,21 +34,25 @@ use core::{
     },
     sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering},
 };
-use stela_boot_core::tsc::sync::correction;
+use stela_boot_core::tsc::sync::{
+    FIRST_POINT_MILLIS, Move, POINT_MILLIS, Rendezvous, correction, correction_move,
+};
 use stela_contracts::refuse;
 
-/// Rounds of each correction, in the processor and in software.
+/// Rounds of each correction, through `IA32_TSC_ADJUST` and in software.
 const ROUNDS: u32 = 4;
-/// IA32_TIME_STAMP_COUNTER.
-const TIME_STAMP_COUNTER: u32 = 0x10;
 const BSP: usize = 0;
 const AP: usize = 1;
 
 /// One AP's synchronization with the BSP.
 pub(super) struct Sync {
     round_ticks: u64,
-    /// Arrivals at the rendezvous points; each point needs both cores.
-    arrivals: AtomicU32,
+    /// The most a point or a turn waits for the other core.
+    wait_ticks: u64,
+    /// The most the AP waits at its first point (`FIRST_POINT_MILLIS`).
+    first_ticks: u64,
+    /// The rendezvous points; each needs both cores.
+    rendezvous: Rendezvous,
     lock: AtomicBool,
     last: AtomicU64,
     /// The most the shared counter value went back, as the BSP and as the
@@ -63,8 +70,7 @@ pub(super) struct Sync {
 /// How an AP's counter came to agree with the BSP's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Outcome {
-    /// Added to its `IA32_TSC_ADJUST`, or to the counter itself where it has
-    /// none.
+    /// Added to its `IA32_TSC_ADJUST`.
     pub(super) adjusted: i64,
     /// Added in software to every value it reads: its counter base moves by
     /// this much.
@@ -86,7 +92,9 @@ impl Sync {
     pub(super) fn new(tsc_hz: u64, round_millis: u64) -> Self {
         Self {
             round_ticks: tsc_hz / 1000 * round_millis,
-            arrivals: AtomicU32::new(0),
+            wait_ticks: tsc_hz / 1000 * (round_millis + POINT_MILLIS),
+            first_ticks: tsc_hz / 1000 * FIRST_POINT_MILLIS,
+            rendezvous: Rendezvous::new(),
             lock: AtomicBool::new(false),
             last: AtomicU64::new(0),
             warps: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -97,24 +105,30 @@ impl Sync {
         }
     }
 
-    /// Wait until both cores reach rendezvous `point`, counted from one.
-    fn meet(&self, point: u32) {
-        self.arrivals.fetch_add(1, Ordering::AcqRel);
-        while self.arrivals.load(Ordering::Acquire) < 2 * point {
-            core::hint::spin_loop();
-        }
+    /// Wait until both cores reach rendezvous `point`, counted from one:
+    /// whether they met within `wait` ticks.
+    fn meet(&self, point: u32, wait: u64) -> bool {
+        let started = ordered();
+        self.rendezvous
+            .meet(point, || ordered().wrapping_sub(started) >= wait)
     }
 
     /// Read the counter, moved by `offset`, in turn with the other core for
-    /// a round, noting the most the shared value went back as `side` saw it.
-    fn measure(&self, side: usize, offset: i64) {
+    /// a round, noting the most the shared value went back as `side` saw it:
+    /// false when the other core held its turn past the wait.
+    fn measure(&self, side: usize, offset: i64) -> bool {
         let started = ordered();
         loop {
+            let waiting = ordered();
             while self
                 .lock
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_err()
             {
+                if ordered().wrapping_sub(waiting) >= self.wait_ticks {
+                    self.rendezvous.abandon();
+                    return false;
+                }
                 core::hint::spin_loop();
             }
             let previous = self.last.load(Ordering::Relaxed);
@@ -125,37 +139,44 @@ impl Sync {
                 self.warps[side].fetch_max(previous - now, Ordering::Relaxed);
             }
             if now.wrapping_sub(offset as u64).wrapping_sub(started) >= self.round_ticks {
-                return;
+                return true;
             }
         }
     }
 
-    /// The BSP's part: every round the AP asks for.
-    pub(super) fn source(&self) {
+    /// The BSP's part: every round the AP asks for. False when the AP
+    /// missed a point or held its turn past the wait.
+    pub(super) fn source(&self) -> bool {
         let mut point = 0;
         loop {
             point += 1;
-            self.meet(point);
-            self.measure(BSP, 0);
+            if !self.meet(point, self.wait_ticks) || !self.measure(BSP, 0) {
+                return false;
+            }
             point += 1;
-            self.meet(point);
+            if !self.meet(point, self.wait_ticks) {
+                return false;
+            }
             point += 1;
-            self.meet(point);
+            if !self.meet(point, self.wait_ticks) {
+                return false;
+            }
             if self.finished.load(Ordering::Acquire) {
-                return;
+                return true;
             }
         }
     }
 
     /// The AP's part, on the AP: rounds until its counter agrees with the
-    /// BSP's, correcting it between them in the processor while that
-    /// converges, else in software. Returns the software offset.
+    /// BSP's, correcting it between them through `IA32_TSC_ADJUST` while
+    /// that converges, else in software. Returns the software offset.
     pub(super) fn target(&self) -> Result<i64> {
         // CPUID.(EAX=7,ECX=0):EBX[1] enumerates IA32_TSC_ADJUST.
         let adjustable = __cpuid_count(0, 0).eax >= 7 && __cpuid_count(7, 0).ebx & 1 << 1 != 0;
         // SAFETY: enumerated above, and read only then.
         let base = adjustable.then(|| unsafe { TSC_ADJUST.read() });
         let (mut adjusted, mut offset) = (0i64, 0i64);
+        let missed = || refuse!("the BSP missed a point of this AP's TSC synchronization");
         let mut point = 0;
         for round in 1..=2 * ROUNDS {
             self.last.store(0, Ordering::Relaxed);
@@ -163,10 +184,20 @@ impl Sync {
                 warp.store(0, Ordering::Relaxed);
             }
             point += 1;
-            self.meet(point);
-            self.measure(AP, offset);
+            // The BSP comes to the first point once it is done with the
+            // APs before this one.
+            let wait = if point == 1 {
+                self.first_ticks
+            } else {
+                self.wait_ticks
+            };
+            if !self.meet(point, wait) || !self.measure(AP, offset) {
+                return Err(missed());
+            }
             point += 1;
-            self.meet(point);
+            if !self.meet(point, self.wait_ticks) {
+                return Err(missed());
+            }
             let seen_by_bsp = self.warps[BSP].load(Ordering::Relaxed);
             let seen_here = self.warps[AP].load(Ordering::Relaxed);
             let outcome = if seen_by_bsp == 0 && seen_here == 0 {
@@ -177,19 +208,11 @@ impl Sync {
                 )))
             } else {
                 let step = correction(seen_here, seen_by_bsp);
-                match base {
-                    Some(base) if round < ROUNDS => {
+                match (base, correction_move(adjustable, round, ROUNDS)) {
+                    (Some(base), Move::Adjust) => {
                         adjusted = adjusted.wrapping_add(step);
                         // SAFETY: enumerated; Linux writes the same register.
                         unsafe { TSC_ADJUST.write(base.wrapping_add(adjusted as u64)) };
-                    }
-                    None if round < ROUNDS => {
-                        adjusted = adjusted.wrapping_add(step);
-                        // SAFETY: IA32_TIME_STAMP_COUNTER is architectural on
-                        // every processor with RDTSC and writable at CPL 0; this
-                        // AP runs nothing else yet. The write's own time is
-                        // what the next round measures and corrects.
-                        unsafe { wrmsr(TIME_STAMP_COUNTER, ordered().wrapping_add(step as u64)) };
                     }
                     _ => offset = offset.wrapping_add(step),
                 }
@@ -201,11 +224,15 @@ impl Sync {
                 self.rounds.store(round, Ordering::Relaxed);
                 self.finished.store(true, Ordering::Release);
                 point += 1;
-                self.meet(point);
+                if !self.meet(point, self.wait_ticks) {
+                    return Err(missed());
+                }
                 return outcome;
             }
             point += 1;
-            self.meet(point);
+            if !self.meet(point, self.wait_ticks) {
+                return Err(missed());
+            }
         }
         unreachable!("the last round decides")
     }
