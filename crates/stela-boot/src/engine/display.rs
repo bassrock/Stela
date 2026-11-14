@@ -500,3 +500,32 @@ pub fn boot_framebuffer(
         bits_per_pixel: BYTES_PER_PIXEL * 8,
     })
 }
+
+/// The scanout of a machine whose only screen was the firmware's on a GPU
+/// that amdgpu claimed headless: the guest's DCP keeps one connected monitor
+/// at the firmware's mode, and its frames go nowhere until amdgpu can display.
+pub struct HeadlessScanout {
+    mode: ScanoutMode,
+}
+
+impl HeadlessScanout {
+    pub fn new(width: usize, height: usize) -> Self {
+        Self {
+            mode: ScanoutMode {
+                width: width as u32,
+                height: height as u32,
+                format: ScanoutFormat::Bgra8888,
+            },
+        }
+    }
+}
+
+impl Scanout for HeadlessScanout {
+    fn mode(&self) -> ScanoutMode {
+        self.mode
+    }
+
+    fn present(&mut self, _: &[u8]) -> Result<()> {
+        Ok(())
+    }
+}
