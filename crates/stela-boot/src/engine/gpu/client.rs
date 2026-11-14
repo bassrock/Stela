@@ -15,7 +15,7 @@
 //! shootdowns and spins, the boot CPU also runs the environment, and a task
 //! thread sleeps.
 use super::{
-    BOOT_CPU, Installed, PAGE, installed,
+    BOOT_CPU, Installed, PAGE, installed, refused,
     stack::{self, Stack},
 };
 use crate::{engine::host, output};
@@ -79,6 +79,7 @@ impl LibcClock {
     }
 }
 
+const EINVAL: i64 = -22;
 const ENODEV: i64 = -19;
 const EFAULT: i64 = -14;
 const ENOMEM: i64 = -12;
@@ -381,23 +382,18 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 fd,
                 request,
                 argument,
-            } => client::control(fd, request, argument),
+            } => {
+                let input = refused::before(request, argument);
+                let result = client::control(fd, request, argument);
+                refused::control(fd, request, input.as_ref(), result);
+                result
+            }
             Operation::Map { fd, offset, size } => {
-                let pages = size / PAGE as usize;
-                let Some(address) = gpu.window.reserve(pages) else {
-                    return ENOMEM;
-                };
-                match client::map(fd, address, size, offset) {
-                    Ok(mapping) => {
-                        gpu.mappings.borrow_mut().insert(address, (mapping, pages));
-                        MAPPINGS.fetch_add(1, Ordering::Relaxed);
-                        address as i64
-                    }
-                    Err(error) => {
-                        gpu.window.release(address, pages);
-                        error.into()
-                    }
+                let result = map_pages(gpu, fd, offset, size);
+                if result < 0 {
+                    refused::map(fd, offset, size, result);
                 }
+                result
             }
             Operation::Unmap(address) => {
                 let Some((mapping, pages)) = gpu.mappings.borrow_mut().remove(&address) else {
@@ -446,6 +442,39 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                     .for_each(|attached| attached.shutdown());
                 0
             }
+        }
+    }
+}
+
+/// Maps `size` bytes of `fd` at `offset` in the window, for the address or a
+/// negative errno. As Linux's `mmap`, the length need not be whole pages: the
+/// mapping covers the pages it reaches. libdrm maps a buffer object by the
+/// size it was asked for, which for RADV's events, queries and descriptor
+/// pools is a few bytes.
+///
+/// # Safety
+/// As [`perform`].
+unsafe fn map_pages(gpu: &Installed, fd: c_int, offset: u64, size: usize) -> i64 {
+    let Some(size) = size
+        .checked_next_multiple_of(PAGE as usize)
+        .filter(|size| *size != 0)
+    else {
+        return EINVAL;
+    };
+    let pages = size / PAGE as usize;
+    let Some(address) = gpu.window.reserve(pages) else {
+        return ENOMEM;
+    };
+    // SAFETY: as the function's; the window reserved `address` for it.
+    match unsafe { client::map(fd, address, size, offset) } {
+        Ok(mapping) => {
+            gpu.mappings.borrow_mut().insert(address, (mapping, pages));
+            MAPPINGS.fetch_add(1, Ordering::Relaxed);
+            address as i64
+        }
+        Err(error) => {
+            gpu.window.release(address, pages);
+            error.into()
         }
     }
 }
