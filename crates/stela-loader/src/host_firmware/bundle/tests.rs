@@ -21,8 +21,8 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS do.
     assert_eq!(count + 3, recipes().count());
-    // The recipes' recorded lengths: 108 files, 121.1 MiB.
-    assert_eq!((count, bytes), (108, 126_955_372), "{count} {bytes}");
+    // The recipes' recorded lengths: 109 files, 121.2 MiB.
+    assert_eq!((count, bytes), (109, 127_069_536), "{count} {bytes}");
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 63_571_696);
     let manifest = manifest(&complete()).unwrap();
