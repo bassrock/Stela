@@ -61,7 +61,7 @@ mod bare_host;
 pub(crate) mod chain_check;
 mod faults;
 pub(crate) mod pmu;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 mod process_fault;
 mod signals;
 pub use bare_host::BareHost;
@@ -84,12 +84,12 @@ mod translated;
 pub(crate) use local::activated_base;
 pub(crate) use local::context::RootIdentity;
 use local::state;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub(crate) use local::{processor, processors};
 
 /// Calls `action` with each host run behind `bytes` of guest RAM at `guest`, as
 /// (host physical, bytes). False, partway, if part of it is not RAM.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub(crate) fn guest_runs(guest: u64, bytes: u64, action: impl FnMut(u64, u64)) -> bool {
     ram::runs(&local::state().ram, guest, bytes, action)
 }

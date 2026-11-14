@@ -413,7 +413,7 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
     }
     // The Metal device's pipelines, rewritten over the translation store's
     // partition.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     if files.len() < MAX_FILES
         && let Some(store) = crate::engine::pipelines::read()
     {

@@ -1259,7 +1259,7 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
 /// Report `message` as the reason the mount stops through an orderly
 /// power-off the caller has requested (`engine::service`), which brings the
 /// GPUs to rest and unloads their firmware first, unlike [`fatal`].
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub fn stopping(message: &str) {
     crate::engine::write_guest_output_at_stop();
     arguments(format_args!("\nSTELA STOP {message}\n"));

@@ -1,8 +1,10 @@
-//! The Metal service over NVK, which the guest reaches through StelaGPU's gate,
+//! The Metal service over the linked Mesa driver, which the guest reaches
+//! through StelaGPU's gate: NVK over nouveau, or in an image built with
+//! `radv`, RADV over amdgpu.
 //!
-//! It opens on the boot CPU once nouveau has bound the GPUs, before the guest's
-//! DeviceTree is final, so the tree has a gate only with a device behind it,
-//! and one for each GPU that opened.
+//! It opens on the boot CPU once the driver has bound the GPUs, before the
+//! guest's DeviceTree is final, so the tree has a gate only with a device
+//! behind it, and one for each GPU that opened.
 //!
 //! Each service runs on a stack of its own, deep enough for a compile. Its
 //! lock means one is enough; opening comes before any caller. A second
@@ -30,11 +32,7 @@ use stela_drivers::gpu::metal::{
     device::{lifecycle::QuiesceStatus, pass_times},
     error::Error,
     native::{
-        self, ExportedMemory, Loader, MemoryExporter, NativeBackend, Refusals, pipeline_store, vk,
-    },
-    nvidia::{
-        Attachment,
-        open::{Gpu, OpenError, open, reopen},
+        self, ExportedMemory, Loader, MemoryExporter, NativeBackend, pipeline_store, vk,
     },
     service::{JobSlice, Served, ServiceHost, SharedService, identity::DeviceEpoch, wire::Status},
     timing::{ExitWatch, Totals},
@@ -45,6 +43,20 @@ use stela_linux::{
     function::{dma_quarantine_status, quarantined_functions},
 };
 use stela_loader::{apple_device_tree::DeviceTree, stela_gpu};
+
+#[cfg(feature = "radv")]
+use stela_drivers::gpu::metal::amd::{
+    Attachment, GcVersion,
+    open::{Gpu, OpenError, open, reopen},
+};
+#[cfg(feature = "nvk")]
+use stela_drivers::gpu::metal::{
+    native::Refusals,
+    nvidia::{
+        Attachment,
+        open::{Gpu, OpenError, open, reopen},
+    },
+};
 
 type Shared = SharedService<NativeBackend, AirCompiler>;
 
@@ -60,6 +72,13 @@ const STOP_UNLOAD_SECONDS: u64 = 10;
 /// The services for the kernel's interrupts, once all are open.
 static SERVICES: AtomicPtr<Vec<Arc<Shared>>> = AtomicPtr::new(ptr::null_mut());
 
+#[cfg(feature = "radv")]
+unsafe extern "C" {
+    /// `compat/mesa/radv_nir_options.c`.
+    fn stela_radv_nir_options(physical: vk::PhysicalDevice) -> *const c_void;
+}
+
+#[cfg(feature = "nvk")]
 unsafe extern "C" {
     fn stela_nvk_nir_options(physical: vk::PhysicalDevice) -> *const c_void;
     /// `compat/mesa/submit_thread.c`.
@@ -394,8 +413,8 @@ fn report(reason: &str) {
     }
 }
 
-/// Logs each distinct error or warning NVK reports, such as why a call failed
-/// with only a generic result: in a job too, where no slice ends in it.
+/// Logs each distinct error or warning the driver reports, such as why a
+/// call failed with only a generic result: in a job too, where no slice ends in it.
 fn driver_message(text: &str) {
     static SEEN: Seen<128> = Seen::new();
     if let Some(unheld) = SEEN.first_time(text) {
@@ -1059,7 +1078,7 @@ fn report_lock(tsc_hz: u64) {
     output::arguments(format_args!("{line}\n"));
 }
 
-/// NVK's entry point, as Vulkan types it.
+/// The driver's entry point, as Vulkan types it.
 unsafe extern "system" fn entry(
     instance: vk::Instance,
     name: *const c_char,
@@ -1095,8 +1114,8 @@ fn guest_pages(ranges: &[MemoryRange]) -> Result<Vec<Run>, Error> {
     Ok(runs)
 }
 
-/// Guest RAM the kext wired, for NVK to import. The GPU reaches it through
-/// the host pages behind it.
+/// Guest RAM the kext wired, for the driver to import. The GPU reaches it
+/// through the host pages behind it.
 struct Exporter;
 
 impl MemoryExporter for Exporter {
@@ -1117,7 +1136,9 @@ impl MemoryExporter for Exporter {
     }
 }
 
-fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
+/// NVK's loader: its NIR options, its submit thread and its refusals.
+#[cfg(feature = "nvk")]
+fn loader() -> (Loader, fn(vk::PhysicalDevice) -> compiler::Service) {
     let compiler = |physical| {
         // SAFETY: NVK's own physical device, whose options last as long.
         let options = unsafe { stela_nvk_nir_options(physical) };
@@ -1137,6 +1158,32 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
         // An import's driver work after its turn may wait for Linux here.
         relax,
     };
+    (loader, compiler)
+}
+
+/// RADV's loader. It has neither of NVK's hooks yet: a commit's submission
+/// runs on its PE, whose ioctls wait for the boot CPU, and a submission
+/// amdgpu refuses loses the device, which the service reopens.
+#[cfg(feature = "radv")]
+fn loader() -> (Loader, fn(vk::PhysicalDevice) -> compiler::Service) {
+    let compiler = |physical| {
+        // SAFETY: RADV's own physical device, whose options last as long.
+        let options = unsafe { stela_radv_nir_options(physical) };
+        compiler::Service::linked(NonNull::new(options.cast_mut()).expect("RADV has NIR options"))
+    };
+    let loader = Loader {
+        get_instance_proc_addr: entry,
+        log: driver_message,
+        submit_thread: None,
+        refusals: None,
+        // An import's driver work after its turn may wait for Linux here.
+        relax,
+    };
+    (loader, compiler)
+}
+
+fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
+    let (loader, compiler) = loader();
     // SAFETY: the linked NVK and compiler, which last for the boot.
     let service = unsafe {
         open(
@@ -1210,8 +1257,28 @@ fn open_gpu(
     let Some(link) = bound.link else {
         return refuse("no PCIe link");
     };
+    #[cfg(feature = "nvk")]
     let Some(chipset) = client::chipset(index as u32) else {
         return refuse("no chipset reported");
+    };
+    #[cfg(feature = "radv")]
+    let Some((gc, rings)) = client::gc_version(index as u32) else {
+        return refuse("amdgpu reported no graphics core (AMDGPU_INFO_HW_IP_INFO)");
+    };
+    #[cfg(feature = "radv")]
+    let gc = {
+        let gc = GcVersion::from_ip_discovery(gc);
+        let sizes = client::vram_gtt(index as u32).unwrap_or_default();
+        output::arguments(format_args!(
+            "GPU {}: amdgpu gc={gc} gfx_rings={rings:#x} vram={}M cpu_visible={}M gtt={}M link=gen{}x{}\n",
+            bound.name,
+            sizes.vram >> 20,
+            sizes.visible >> 20,
+            sizes.gtt >> 20,
+            link.speed,
+            link.width,
+        ));
+        gc
     };
     let Some(stack) = Stack::map(gpu.window, STACK_BYTES) else {
         return refuse("no memory for its service");
@@ -1226,7 +1293,10 @@ fn open_gpu(
             device: bound.drm.slot.into(),
             function: bound.drm.function.into(),
         },
+        #[cfg(feature = "nvk")]
         chipset,
+        #[cfg(feature = "radv")]
+        gc,
         // A GPU in a Thunderbolt enclosure reaches Stela as the function
         // firmware enumerated, like any other in a slot.
         attachment: Attachment {
@@ -1242,6 +1312,10 @@ fn open_gpu(
     });
     match opened? {
         Ok(service) => {
+            output::arguments(format_args!(
+                "GPU {}: Metal service open at DRM minor {index}\n",
+                bound.name
+            ));
             // Without a second stack, every compilation stays in its turn.
             service.set_wait_bound(gpu.tsc_hz / 1000 * WAIT_BOUND_MILLIS);
             service.set_look_budget(gpu.tsc_hz / 1_000_000 * LOOK_MICROS);

@@ -201,7 +201,7 @@ impl Service {
             let durable = nor.finish();
             super::bundle_repair::stored(&durable);
         }
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         super::gpu::gate::stop(|| self.devices.serve(|devices| devices.stop_gpu_gates()));
     }
 
