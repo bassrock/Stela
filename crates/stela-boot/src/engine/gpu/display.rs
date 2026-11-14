@@ -386,7 +386,11 @@ const RETURN_STEP_MILLIS: u64 = 100;
 /// or likely to exist, so it is awaited within [`RETURN_SECONDS`], once.
 /// What stops one GPU is reported with what its connectors detected, and
 /// its node is kept for the scanout's looks.
-pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
+pub(in crate::engine) fn take(
+    wanted: (usize, usize),
+    firmware: Shown<'_>,
+    size: Option<(u32, u32)>,
+) {
     let Some(gpu) = super::installed() else {
         return;
     };
@@ -413,7 +417,10 @@ pub(in crate::engine) fn take(wanted: (usize, usize), firmware: Shown<'_>) {
         let result = loop {
             match Display::take_fitting(
                 Node(fd),
-                kms::Wanted::Native(wanted),
+                match size {
+                    Some(size) => kms::Wanted::Size(size),
+                    None => kms::Wanted::Native(wanted),
+                },
                 &stela_soc::dcp::modes::advertisable,
             ) {
                 Err(DisplayError::NoOutput) if host::rdtsc().wrapping_sub(began) < patience => {
