@@ -14,6 +14,7 @@ pub mod metal;
 #[cfg(feature = "nouveau-port")]
 pub mod linux;
 
+pub mod amdgpu_chip;
 pub mod cold;
 pub mod nouveau_chip;
 
