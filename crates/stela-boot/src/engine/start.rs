@@ -1668,7 +1668,18 @@ fn place_devices(
         .or_else(firmware_scanout)
         .or_else(|| gpu::display::awaited(handoff.screen?).map(mirrored));
     #[cfg(not(feature = "nvk"))]
-    let scanout = firmware_scanout();
+    let scanout = firmware_scanout().or_else(|| {
+        // amdgpu retired the firmware's screen to claim its GPU headless;
+        // the Mac keeps a monitor at that screen's mode.
+        handoff.screen.map(|screen| {
+            let (width, height) = screen.resolution();
+            output::arguments(format_args!(
+                "DISPLAY headless scanout {width}x{height}: the firmware's screen was retired for the GPU\n"
+            ));
+            alloc::boxed::Box::new(display::HeadlessScanout::new(width, height))
+                as alloc::boxed::Box<dyn stela_soc::machine::Scanout>
+        })
+    });
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
     let memory = board.and_then(|board| memory_resources(board, canonical_ram, programmed));
     let cacheless_memory = memory.is_some();
