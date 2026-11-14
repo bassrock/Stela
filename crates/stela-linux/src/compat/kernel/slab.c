@@ -81,9 +81,8 @@ static bool request_supported(gfp_t flags)
 		__GFP_NORETRY | __GFP_RETRY_MAYFAIL;
 	if (!IS_ENABLED(CONFIG_MEMCG))
 		allowed |= __GFP_ACCOUNT;
-	bool quiescent = stela_linux_quiescent();
 	bool may_block = gfpflags_allow_blocking(flags);
-	if ((flags & ~allowed) || (may_block && !quiescent)) {
+	if ((flags & ~allowed) || (may_block && !stela_linux_blocking_allocation_allowed())) {
 		stela_linux_unsupported("kmalloc allocation policy or context");
 		return false;
 	}

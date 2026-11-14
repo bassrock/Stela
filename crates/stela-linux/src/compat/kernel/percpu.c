@@ -41,7 +41,7 @@ void __percpu *pcpu_alloc_noprof(size_t size, size_t align, bool reserved, gfp_t
 	align = max_t(size_t, align, sizeof(struct percpu_header));
 	gfp_t backing = gfp & (GFP_KERNEL | __GFP_NORETRY | __GFP_NOWARN);
 	bool blocking = gfpflags_allow_blocking(backing);
-	if (blocking && !stela_linux_quiescent()) {
+	if (blocking && !stela_linux_blocking_allocation_allowed()) {
 		stela_linux_unsupported("percpu blocking allocation context");
 		return NULL;
 	}
