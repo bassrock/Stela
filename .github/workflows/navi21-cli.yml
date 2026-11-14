@@ -1,0 +1,66 @@
+# bassrock/Stela fork: the Windows `stela.exe` for the Navi 21 port.
+# It carries no stela.efi of its own (no STELA_EFI); setup takes the amdgpu
+# image built on a Mac with `cargo xtask boot build --release --amdgpu` through
+# `--efi`. Runs on every push to a navi21 branch, and by hand.
+name: navi21-cli
+
+on:
+  push:
+    branches: ["navi21*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: navi21-cli-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Put LLVM on PATH
+        run: echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: navi21-cli-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: navi21-cli-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add x86_64-pc-windows-msvc
+          for tool in clang llvm-lib; do
+            command -v "$tool" >/dev/null || { echo "::error::$tool is not on PATH"; exit 1; }
+          done
+
+      - name: Build stela.exe
+        run: |
+          cargo build --release --locked -p stela-cli --target x86_64-pc-windows-msvc
+          target/x86_64-pc-windows-msvc/release/stela.exe --version
+          target/x86_64-pc-windows-msvc/release/stela.exe setup --help >/dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-navi21-windows-x86_64
+          path: target/x86_64-pc-windows-msvc/release/stela.exe
+          if-no-files-found: error

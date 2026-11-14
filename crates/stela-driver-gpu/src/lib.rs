@@ -94,12 +94,15 @@ impl Adapter {
     pub fn unavailable_reason(&self) -> &'static str {
         match self.vendor {
             Vendor::Nvidia => "NVIDIA requires nouveau/GSP binding and an NVK-enabled image",
-            // The Navi 48 board `recipes::amd_chip` names.
-            Vendor::Amd if self.device == 0x7550 => {
+            // The Navi 48 and Navi 21 boards `recipes::amd_chip` names.
+            Vendor::Amd if matches!(self.device, 0x7550 | 0x73A0..=0x73AF | 0x73BF) => {
                 "amdgpu runs it only in an image built with `amdgpu`, as yet with neither \
                  display nor Metal"
             }
-            Vendor::Amd => "Stela's amdgpu runs only the Radeon RX 9070 and 9070 XT (Navi 48)",
+            Vendor::Amd => {
+                "Stela's amdgpu runs only the Radeon RX 9070 and 9070 XT (Navi 48) and the RX \
+                 6800, 6800 XT, 6900 XT and 6950 XT (Navi 21)"
+            }
             Vendor::Intel => "Intel i915/xe are not ported to Stela",
             Vendor::Other(_) => "no Stela GPU backend for this PCI vendor",
         }

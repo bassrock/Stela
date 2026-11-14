@@ -34,7 +34,7 @@ pub const TARGET: driver::Target<'static> = driver::Target {
 
 /// Every recipe family, in the order a volume short of room keeps them: the
 /// small network and Bluetooth files first, the GPU's large images last.
-pub const FAMILIES: [(&str, &[Recipe]); 9] = [
+pub const FAMILIES: [(&str, &[Recipe]); 10] = [
     ("Wi-Fi regulatory database", recipes::REGULATORY),
     ("Realtek Ethernet", recipes::REALTEK),
     ("Realtek Wi-Fi", recipes::REALTEK_WIFI),
@@ -42,6 +42,7 @@ pub const FAMILIES: [(&str, &[Recipe]); 9] = [
     ("Intel Wi-Fi", recipes::INTEL_WIFI),
     ("MediaTek Bluetooth", recipes::MEDIATEK_BLUETOOTH),
     ("Intel Bluetooth", recipes::INTEL_RSA),
+    ("AMD amdgpu (Navi 21)", recipes::AMDGPU_NAVI21),
     ("AMD amdgpu", recipes::AMDGPU),
     ("NVIDIA GSP-RM", recipes::GSP),
 ];
