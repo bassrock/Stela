@@ -7,6 +7,7 @@
 //! links it. Mesa's Rust builds as ordinary Cargo dependencies of the image,
 //! from sources generated here. Mesa itself stays unpatched: what differs is
 //! the C library, the configuration below and the units in `compat/mesa`.
+//! Another Vulkan driver of Mesa's builds the same way, by its own [`Lane`].
 use super::{
     support::{NATIVE_TARGET, build_directory, capture, gpu, slashed, third_party, tool},
     sysroot::Sysroot,
@@ -25,6 +26,89 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     time::SystemTime,
+};
+
+/// One Vulkan driver's build: what Meson builds of Mesa for it, what is left
+/// out or stood in for, and the archives it leaves.
+pub(super) struct Lane {
+    /// The build tree, under `target/gpu`.
+    pub(super) name: &'static str,
+    /// The `vulkan-drivers` option, in place of [`OPTIONS`]' own.
+    pub(super) vulkan_drivers: &'static str,
+    /// The Vulkan drivers the image links, as Meson's targets.
+    pub(super) drivers: &'static [&'static str],
+    /// The libraries Meson links whole, by their objects' names.
+    pub(super) whole_libraries: &'static [&'static str],
+    /// Units not built, by a part of their source path: each either has a
+    /// stand-in in `compat/mesa`, or needs what the image lacks and nothing
+    /// here calls it.
+    pub(super) skipped: &'static [&'static str],
+    /// Meson's flags of this driver's units that name a path the image does
+    /// not take, beside [`HOST_FLAGS`] and [`HOST_DEFINES`].
+    pub(super) host_flags: &'static [&'static str],
+    /// Stela's stand-ins, under `compat/mesa`, built with the model unit's flags.
+    pub(super) stand_ins: &'static [&'static str],
+    /// Upstream sources outside Mesa, as a submodule and a path in it, built
+    /// with the model unit's flags and [`Lane::vendored_flags`].
+    pub(super) vendored: &'static [(&'static str, &'static str)],
+    /// What the [`Lane::vendored`] units add: `{libdrm}` is libdrm's checkout.
+    pub(super) vendored_flags: &'static [&'static str],
+    /// The driver's unit whose flags the units above compile with.
+    pub(super) model_unit: &'static str,
+    /// Whether the driver has Rust: its bindings are generated again for the
+    /// image's C library, and checked for floats that cross into C.
+    pub(super) rust: bool,
+    /// Whether Meson finds libelf, which only NVK's `compat/mesa/nv_cubin.c`
+    /// stands in for: with it, Mesa's AMD code reads shader ELF through it.
+    pub(super) libelf: bool,
+    /// `.pc` files beside libdrm's (and libelf's), as a name and its body:
+    /// `{libdrm}` is libdrm's checkout and `{version}` its version.
+    pub(super) packages: &'static [(&'static str, &'static str)],
+    /// The archive of the units not linked whole.
+    pub(super) archive: &'static str,
+}
+
+impl Lane {
+    /// Meson's options for this driver.
+    fn options(&self) -> Vec<String> {
+        OPTIONS
+            .iter()
+            .map(|option| {
+                if option.starts_with("-Dvulkan-drivers=") {
+                    format!("-Dvulkan-drivers={}", self.vulkan_drivers)
+                } else {
+                    (*option).to_owned()
+                }
+            })
+            .collect()
+    }
+
+    /// Whether Meson links `unit`'s library whole: its entry points are
+    /// reached only by weak reference, which pulls no member from an archive.
+    fn linked_whole(&self, object: &str) -> bool {
+        let name = object_name(object);
+        self.whole_libraries
+            .iter()
+            .any(|library| name.contains(library))
+    }
+}
+
+/// NVK, NIR and NAK.
+pub(super) const NVK: Lane = Lane {
+    name: "nvk",
+    vulkan_drivers: "nouveau",
+    drivers: &DRIVERS,
+    whole_libraries: &WHOLE_LIBRARIES,
+    skipped: &SKIPPED,
+    host_flags: &[],
+    stand_ins: &STAND_INS,
+    vendored: &[],
+    vendored_flags: &[],
+    model_unit: MODEL_UNIT,
+    rust: true,
+    libelf: true,
+    packages: &[],
+    archive: "libstela-nvk.a",
 };
 
 /// What NVK needs and nothing else: no window system, no cache on
@@ -83,11 +167,9 @@ if "--depfile" in arguments:
 /// `.pc` files for what Mesa's configuration requires: libdrm's headers are
 /// vendored and its calls are `compat/mesa/drm.c`; the one user of libelf is
 /// `compat/mesa/nv_cubin.c`.
-const LIBDRM_VERSION: &str = "2.4.133";
+pub(super) const LIBDRM_VERSION: &str = "2.4.133";
 const LIBELF_VERSION: &str = "0.190";
 
-/// Units not built, by a part of their source path: each either has a stand-in
-/// in `compat/mesa`, or needs what the image lacks and nothing here calls it.
 /// The libraries Meson links whole, by their objects' names.
 const WHOLE_LIBRARIES: [&str; 4] = [
     "libvulkan_lite_runtime_a",
@@ -95,7 +177,8 @@ const WHOLE_LIBRARIES: [&str; 4] = [
     "libvulkan_instance_a",
     "libnvk_a",
 ];
-
+/// Units not built, by a part of their source path: each either has a stand-in
+/// in `compat/mesa`, or needs what the image lacks and nothing here calls it.
 const SKIPPED: [&str; 11] = [
     "nvkcl",
     "build_id",
@@ -265,6 +348,7 @@ fn paths(directory: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 fn setup(
+    lane: &Lane,
     toolchain: &Toolchain,
     sysroot: &Sysroot,
     directory: &Path,
@@ -307,10 +391,22 @@ fn setup(
             slashed(&libdrm)
         ),
     )?;
-    fs::write(
-        packages.join("libelf.pc"),
-        format!("Name: libelf\nDescription: unused\nVersion: {LIBELF_VERSION}\nCflags:\n"),
-    )?;
+    let libelf = packages.join("libelf.pc");
+    if lane.libelf {
+        fs::write(
+            libelf,
+            format!("Name: libelf\nDescription: unused\nVersion: {LIBELF_VERSION}\nCflags:\n"),
+        )?;
+    } else if libelf.is_file() {
+        fs::remove_file(libelf)?;
+    }
+    for (name, body) in lane.packages {
+        fs::write(
+            packages.join(name),
+            body.replace("{libdrm}", &slashed(&libdrm))
+                .replace("{version}", LIBDRM_VERSION),
+        )?;
+    }
     let mut setup = Command::new(tool("meson", GENERATORS)?);
     setup
         .arg("setup")
@@ -318,7 +414,7 @@ fn setup(
         .arg(third_party("mesa"))
         .arg("--cross-file")
         .arg(machine)
-        .args(OPTIONS)
+        .args(lane.options())
         .env("PATH", path);
     // Rust on Windows does not link through the C compiler Meson finds.
     if cfg!(windows) {
@@ -582,6 +678,7 @@ fn object_name(output: &str) -> String {
 
 /// The units the drivers link, with Stela's stand-ins and C library.
 fn units(
+    lane: &Lane,
     build: &Path,
     objects: &Path,
     ninja: &Path,
@@ -592,7 +689,7 @@ fn units(
     let linked = capture(
         Command::new(ninja)
             .args(["-t", "inputs"])
-            .args(DRIVERS)
+            .args(lane.drivers)
             .current_dir(build)
             .env("PATH", path),
     )?;
@@ -608,7 +705,11 @@ fn units(
     // A source two libraries compile is the one's that is linked whole.
     let whole: BTreeSet<&str> = entries
         .iter()
-        .filter(|entry| entry["output"].as_str().is_some_and(linked_whole))
+        .filter(|entry| {
+            entry["output"]
+                .as_str()
+                .is_some_and(|output| lane.linked_whole(output))
+        })
         .filter_map(|entry| entry["file"].as_str())
         .collect();
     for entry in entries {
@@ -619,14 +720,16 @@ fn units(
             continue;
         };
         let output = &words[at + 1];
-        if !linked.contains(output.as_str()) || (whole.contains(file) && !linked_whole(output)) {
+        if !linked.contains(output.as_str()) || (whole.contains(file) && !lane.linked_whole(output))
+        {
             continue;
         }
-        if file.ends_with(MODEL_UNIT) {
+        if file.ends_with(lane.model_unit) {
             model = Some((file.to_owned(), words.clone()));
         }
         if file.ends_with(".S")
-            || SKIPPED
+            || lane
+                .skipped
                 .iter()
                 .any(|skip| output.contains(skip) || file.contains(skip))
         {
@@ -638,6 +741,7 @@ fn units(
             "{file} is neither C nor C++"
         );
         let mut arguments = retarget(&words, if is_cxx { cxx } else { common });
+        arguments.retain(|argument| !lane.host_flags.contains(&argument.as_str()));
         if file.ends_with("rust/bindings.c") {
             arguments.extend(
                 FLOAT_WRAPPERS
@@ -678,7 +782,7 @@ fn units(
     };
     let model_unit =
         |source: &Path, name: &str, added: &[String]| like(&file, &words, source, name, added);
-    for name in STAND_INS {
+    for name in lane.stand_ins {
         let source = compat.join("mesa").join(format!("{name}.c"));
         units.push(model_unit(&source, name, &[]));
     }
@@ -693,6 +797,21 @@ fn units(
     for name in AIR {
         let source = compiler.join(format!("{name}.c"));
         units.push(model_unit(&source, name, &added));
+    }
+    let libdrm = slashed(&third_party("libdrm"));
+    let vendored_flags: Vec<_> = lane
+        .vendored_flags
+        .iter()
+        .map(|flag| flag.replace("{libdrm}", &libdrm))
+        .collect();
+    for (submodule, file) in lane.vendored {
+        let source = third_party(submodule).join(file);
+        let stem = Path::new(file)
+            .file_stem()
+            .context("vendored unit")?
+            .to_string_lossy();
+        let name = format!("{submodule}_{stem}");
+        units.push(model_unit(&source, &name, &vendored_flags));
     }
     for name in LIBC {
         let mut arguments = common.to_vec();
@@ -808,27 +927,22 @@ pub(super) fn gather_constructors(units: &[Unit]) -> Result<()> {
     Ok(())
 }
 
-/// Whether Meson links `unit`'s library whole: its entry points are reached
-/// only by weak reference, which pulls no member from an archive.
-fn linked_whole(object: &str) -> bool {
-    let name = object_name(object);
-    WHOLE_LIBRARIES.iter().any(|library| name.contains(library))
-}
-
-pub fn build(jobs: u16) -> Result<()> {
+pub fn build(lane: &Lane, jobs: u16) -> Result<()> {
     let toolchain = super::toolchain::discover()?;
-    let directory = build_directory("nvk");
+    let directory = build_directory(lane.name);
     let build = directory.join("build");
     let (_, path) = paths(&directory)?;
     fs::create_dir_all(&directory)?;
     super::llvm::build(&toolchain, jobs, false)?;
     let sysroot = Sysroot::build(&toolchain, &directory, jobs)?;
-    setup(&toolchain, &sysroot, &directory, &build, &path)?;
+    setup(lane, &toolchain, &sysroot, &directory, &build, &path)?;
     generate(&sysroot, &build, &path, &toolchain.libclang)?;
     let libc = gpu().join("compat/libc");
     let includes = include_flags(&toolchain.clang, &libc)?;
-    bindings(&build, &path, &includes, &toolchain.libclang)?;
-    check_float_crossings(&build)?;
+    if lane.rust {
+        bindings(&build, &path, &includes, &toolchain.libclang)?;
+        check_float_crossings(&build)?;
+    }
 
     let objects = directory.join("objects");
     fs::create_dir_all(&objects)?;
@@ -838,12 +952,12 @@ pub fn build(jobs: u16) -> Result<()> {
     common.push(format!("-I{}", gpu().join("compat/mesa").display()));
     let ninja = tool("ninja", GENERATORS)?;
     let cxx = super::llvm::cxx_flags(&common);
-    let units = units(&build, &objects, &ninja, &path, &common, &cxx)?;
+    let units = units(lane, &build, &objects, &ninja, &path, &common, &cxx)?;
     compile(&toolchain.clang, &build, &units, jobs)?;
 
     gather_constructors(&units)?;
     let (whole, lazy): (Vec<_>, Vec<_>) = units.iter().partition(|unit| {
-        linked_whole(
+        lane.linked_whole(
             &unit
                 .output
                 .file_name()
@@ -851,8 +965,8 @@ pub fn build(jobs: u16) -> Result<()> {
                 .to_string_lossy(),
         )
     });
-    let archive = directory.join("libstela-nvk.a");
-    for (name, members) in [("libstela-vulkan.a", &whole), ("libstela-nvk.a", &lazy)] {
+    let archive = directory.join(lane.archive);
+    for (name, members) in [("libstela-vulkan.a", &whole), (lane.archive, &lazy)] {
         let archive = directory.join(name);
         if archive.is_file() {
             fs::remove_file(&archive)?;
