@@ -277,8 +277,19 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
         .filter(|identity| identity.vendor == NVIDIA && identity.class[0] == 0x03)
         .map(|identity| identity.device)
         .collect();
-    let notice = gpu_notice(&nvidia);
-    if nvidia.is_empty() {
+    // A RADV image drives AMD display controllers itself: one of them is
+    // the GPU macOS starts with, so the NVIDIA-only notice does not apply.
+    let amd = cfg!(feature = "radv")
+        && functions
+            .iter()
+            .map(crate::pci_io::FunctionObservation::identity)
+            .any(|identity| identity.vendor == AMD && identity.class[0] == 0x03);
+    let notice = if amd { 0 } else { gpu_notice(&nvidia) };
+    if amd {
+        output::arguments(format_args!(
+            "HOST GPU: an AMD display controller, which this RADV image drives\n"
+        ));
+    } else if nvidia.is_empty() {
         output::arguments(format_args!(
             "UNSUPPORTED host GPU: no NVIDIA display controller among {} PCI functions\n",
             functions.len()
@@ -292,6 +303,7 @@ fn report_census(functions: &[crate::pci_io::FunctionObservation]) {
 }
 
 const NVIDIA: u16 = 0x10de;
+const AMD: u16 = 0x1002;
 /// Which notice the census chose: 0 none, 1 no NVIDIA card, 2 none Stela drives.
 static GPU_NOTICE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
