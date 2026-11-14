@@ -26,6 +26,10 @@ nouveau-port = ["linux-kernel", "stela-c-build/linux-registry"]
 # environment traps, and linked into the image, where its module_init
 # registers its PCI driver. It binds no device the boot does not claim.
 amdgpu-port = ["nouveau-port"]
+# amdgpu-port with Display Core: `display/`'s objects under CONFIG_DRM_AMD_DC
+# and CONFIG_DRM_AMD_DC_FP, the DML units compiled with SSE as Linux's
+# CC_FLAGS_FPU compiles them, and the DSC and HDCP helpers amdgpu selects.
+amdgpu-dc = ["amdgpu-port"]
 # Stela's Metal device over the internal Vulkan boundary; no Vulkan driver.
 metal = ["dep:stela-contracts"]
 # The Metal device's native backend over a loaded Vulkan driver (NVK).

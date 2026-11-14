@@ -141,6 +141,12 @@ pub enum Command {
         /// goes on past the GPU.
         #[arg(long)]
         amdgpu: bool,
+        /// Carry amdgpu with its Display Core (CONFIG_DRM_AMD_DC and
+        /// CONFIG_DRM_AMD_DC_FP), which `--amdgpu` leaves out; implies
+        /// `--amdgpu`. DC binds the display hardware but nothing yet scans
+        /// out through it.
+        #[arg(long)]
+        amdgpu_dc: bool,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -518,9 +524,12 @@ pub fn run(command: Command) -> Result<ExitCode> {
             release,
             diagnostics,
             amdgpu,
+            amdgpu_dc,
         } => {
             crate::gpu::fetch::fetch(false)?;
-            let gpu = if amdgpu {
+            let gpu = if amdgpu_dc {
+                Gpu::AmdgpuDc
+            } else if amdgpu {
                 Gpu::Amdgpu
             } else {
                 crate::gpu::build_nvk(crate::gpu::default_jobs())?;
@@ -547,6 +556,8 @@ enum Gpu {
     Nvk,
     /// amdgpu, without NVK.
     Amdgpu,
+    /// amdgpu with Display Core, without NVK.
+    AmdgpuDc,
 }
 
 fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
@@ -592,6 +603,9 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
         }
         Gpu::Amdgpu => {
             command.args(["--features", "amdgpu"]);
+        }
+        Gpu::AmdgpuDc => {
+            command.args(["--features", "amdgpu-dc"]);
         }
     }
     if release {

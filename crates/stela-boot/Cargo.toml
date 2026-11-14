@@ -35,6 +35,9 @@ native-profile = ["stela-soc/native-profile", "stela-engine/native-profile"]
 nvk = ["dep:stela-mesa", "stela-drivers/metal-linked"]
 # amdgpu in the image's Linux environment, which registers its PCI driver.
 amdgpu = ["stela-drivers/amdgpu-port"]
+# amdgpu with its Display Core (CONFIG_DRM_AMD_DC, CONFIG_DRM_AMD_DC_FP): DC
+# binds the display hardware in the composite, as yet without a KMS consumer.
+amdgpu-dc = ["amdgpu", "stela-drivers/amdgpu-dc"]
 
 [dependencies]
 stela-linux = { path = "../stela-linux", features = ["kernel"] }
