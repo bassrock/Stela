@@ -152,6 +152,94 @@ void devm_release_action(struct device *dev, void (*action)(void *), void *data)
 	WARN_ON(1);
 }
 
+/* Resource groups, following devres.c: a group is an open and a close marker
+ * in the managed list, and releasing it undoes, last first, what was added
+ * between them, or since the open marker while the group is still open. The
+ * markers are managed entries whose actions do nothing, so a driver's detach
+ * frees them with the rest. Unlike devres.c, a group inside the released one
+ * keeps its markers; nothing Stela runs nests groups. */
+static void devres_group_open(void *id)
+{
+	(void)id;
+}
+
+static void devres_group_close(void *id)
+{
+	(void)id;
+}
+
+static struct managed_action *devres_group_marker(struct device *dev,
+						 void (*marker)(void *), void *id)
+{
+	struct managed_action *managed;
+
+	list_for_each_entry(managed, &dev->devres_head, node)
+		if (managed->action == marker && managed->data == id)
+			return managed;
+	return NULL;
+}
+
+void *devres_open_group(struct device *dev, void *id, gfp_t gfp)
+{
+	struct managed_action *open = kmalloc(sizeof(*open), gfp);
+
+	if (!open)
+		return NULL;
+	open->action = devres_group_open;
+	open->data = id ? id : open;
+	list_add(&open->node, &dev->devres_head);
+	return open->data;
+}
+
+void devres_close_group(struct device *dev, void *id)
+{
+	struct managed_action *close;
+
+	if (WARN_ON(!devres_group_marker(dev, devres_group_open, id)) ||
+	    WARN_ON(devres_group_marker(dev, devres_group_close, id)))
+		return;
+	close = kmalloc_obj(*close);
+	/* devres.c allocates the close marker with the group; without it the
+	 * group stays open, so a release still undoes only its own entries. */
+	if (WARN_ON(!close))
+		return;
+	close->action = devres_group_close;
+	close->data = id;
+	list_add(&close->node, &dev->devres_head);
+}
+
+int devres_release_group(struct device *dev, void *id)
+{
+	struct managed_action *open = devres_group_marker(dev, devres_group_open, id);
+	struct managed_action *close = devres_group_marker(dev, devres_group_close, id);
+	struct managed_action *managed, *next;
+	bool inside = !close;
+	int released = 0;
+
+	if (WARN_ON(!open))
+		return -ENOENT;
+	list_for_each_entry_safe(managed, next, &dev->devres_head, node) {
+		if (managed == close) {
+			inside = true;
+		} else if (managed == open) {
+			break;
+		} else if (inside && managed->action != devres_group_open &&
+			   managed->action != devres_group_close) {
+			list_del(&managed->node);
+			managed->action(managed->data);
+			kfree(managed);
+			released++;
+		}
+	}
+	if (close) {
+		list_del(&close->node);
+		kfree(close);
+	}
+	list_del(&open->node);
+	kfree(open);
+	return released;
+}
+
 /* Attribute files, following drivers/base/core.c. Stela has no sysfs, so a
  * file or group is only checked and, when managed, its removal recorded for
  * the driver's detach. */
@@ -303,7 +391,7 @@ STELA_UNSUPPORTED(void, device_link_del, struct device_link *)
 #include <stela/test.h>
 
 static unsigned int released;
-static char undone[4];
+static char undone[8];
 static unsigned int undone_count;
 
 static void release(struct device *dev)
@@ -400,8 +488,18 @@ int main(void)
 	assert(!device_create_file(NULL, &dev_attr_value));
 	device_remove_file(NULL, &dev_attr_value);
 	assert(!devm_device_add_group(&child, &test_group));
+	/* A group releases, last first, only what was added inside it. */
+	static const char d = 'd', e = 'e', f = 'f';
+	void *group = devres_open_group(&child, NULL, GFP_KERNEL);
+	assert(group);
+	assert(!__devm_add_action(&child, undo, (void *)&d, "d"));
+	assert(!__devm_add_action(&child, undo, (void *)&e, "e"));
+	devres_close_group(&child, group);
+	assert(!__devm_add_action(&child, undo, (void *)&f, "f"));
+	assert(devres_release_group(&child, group) == 2);
+	assert(undone_count == 3 && !memcmp(undone, "bed", 3));
 	device_unregister(&child);
-	assert(!memcmp(undone, "bca", 3));
+	assert(!memcmp(undone, "bedfca", 6));
 	put_device(&child);
 	assert(released == 2);
 
