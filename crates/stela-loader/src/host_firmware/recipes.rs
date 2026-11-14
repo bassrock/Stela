@@ -966,15 +966,20 @@ pub const AMDGPU: &[Recipe] = &[
 /// and 6900 XT), named by the chip: GFX 10.3's CE, PFP, ME, MEC and MEC2
 /// microcode and its RLC, PSP 11.0.7's SOS and TA, SMU 11.0.7, SDMA 5.2 and
 /// VCN 3.0 (`MODULE_FIRMWARE` in gfx_v10_0.c, psp_v11_0.c, smu_v11_0.c,
-/// sdma_v5_2.c and amdgpu_vcn.c). GFX 10.3 runs no MES by default. Not asked
-/// for: the CAP image, which only an SR-IOV virtual function loads, and the
-/// display's DMCUB, which amdgpu loads only with its display core. MEC2 is
-/// byte for byte MEC.
+/// sdma_v5_2.c and amdgpu_vcn.c), and DCN 3.0's DMCUB, which amdgpu_dm.c
+/// requests when amdgpu runs with its display core (`amdgpu-dc`) and the PSP
+/// loads. GFX 10.3 runs no MES by default. Not asked for: the CAP image,
+/// which only an SR-IOV virtual function loads. MEC2 is byte for byte MEC.
 pub const AMDGPU_NAVI21: &[Recipe] = &[
     amdgpu(
         "amdgpu/sienna_cichlid_ce.bin",
         263296,
         "156769265ed26c8cb14902a13e14871732245daeffb793bdf394c1bd3de76f00",
+    ),
+    amdgpu(
+        "amdgpu/sienna_cichlid_dmcub.bin",
+        114164,
+        "286458c7911172734dd514631dcfba9690c2242f24f9be72afd6b56c0341974a",
     ),
     amdgpu(
         "amdgpu/sienna_cichlid_me.bin",
