@@ -1171,6 +1171,17 @@ fn open_gpu(
             location_number: index as u64,
         },
     };
+    // Made before RADV's first submission, so a reset that submission
+    // caused shows on it.
+    #[cfg(feature = "radv")]
+    let watch = client::ResetWatch::new(index as u32);
+    #[cfg(feature = "radv")]
+    if watch.is_none() {
+        output::arguments(format_args!(
+            "GPU {}: no amdgpu context to watch for resets\n",
+            bound.name
+        ));
+    }
     let mut opened = None;
     run(top, &mut || {
         construct(constructed);
@@ -1178,6 +1189,30 @@ fn open_gpu(
     });
     match opened? {
         Ok(service) => {
+            #[cfg(feature = "radv")]
+            if let Some(flags) = watch.as_ref().and_then(client::ResetWatch::flags)
+                && flags & (client::CTX_RESET | client::CTX_RESET_IN_PROGRESS) != 0
+            {
+                // RADV's first submission hung the GPU and amdgpu's recovery
+                // took it: its fence was signaled by the reset, not the GPU.
+                // Every later file close and submission waits on that reset,
+                // which on this host has not been seen to end. The service is
+                // kept unreleased, as its release closes RADV's file.
+                output::arguments(format_args!(
+                    "GPU {}: amdgpu reset the GPU during RADV's first submission \
+                     (context flags {flags:#x}{}); the Mac boots without Metal on it\n",
+                    bound.name,
+                    if flags & client::CTX_RESET_IN_PROGRESS != 0 {
+                        ", reset still in progress"
+                    } else {
+                        ""
+                    },
+                ));
+                core::mem::forget(service);
+                // The reset unmapped the display's buffers too.
+                super::display::abandon();
+                return None;
+            }
             output::arguments(format_args!(
                 "GPU {}: Metal service open at DRM minor {index}\n",
                 bound.name

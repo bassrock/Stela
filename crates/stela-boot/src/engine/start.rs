@@ -765,6 +765,16 @@ fn describe_host(
     ));
 }
 
+/// A part of "Setting up the Mac's hardware" begins: named on the log and,
+/// in a Metal build, whose parts call the GPU's driver, stored on the USB
+/// first. The step stores the log only at its end, so a part that never
+/// returns showed no line of its own: this one names it.
+fn hardware_step(name: &str) {
+    output::arguments(format_args!("HARDWARE {name}\n"));
+    #[cfg(feature = "metal-device")]
+    output::flush_log();
+}
+
 fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     let Boot {
         handoff,
@@ -824,6 +834,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     if loaded_tree.is_some() {
         crate::status::begin("Setting up the Mac's hardware");
     }
+    hardware_step("roster");
     let roster = topology::AssignedRoster::new(
         native_processors.expect("validated native roster"),
         &executors,
@@ -860,8 +871,11 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         ..
     } = storage;
     let mut bare = host_owner.host();
+    hardware_step("assign");
     #[cfg_attr(not(feature = "metal-device"), allow(unused_mut))]
     let mut assigned = assign(boot, &roster, topology_source.as_ref(), &full_profile);
+    #[cfg(feature = "metal-device")]
+    hardware_step("gpu-gates");
     #[cfg(feature = "metal-device")]
     let gpu_gates = assigned
         .as_mut()
@@ -876,6 +890,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     // SAFETY: all raw guest input copies have ended, AP executors are waiting
     // for their guest contexts, and no guest/device DMA producer has entered.
     // The same loader bytes are for every subsequent native CPU and synchronous device writer.
+    hardware_step("canonical-ram");
     let canonical_ram = unsafe {
         crate::native_smp::canonical::reserve_for_workers(
             handoff,
@@ -890,8 +905,10 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     // ID-register list in `target`.
     #[cfg(feature = "metal-device")]
     if let Some(assigned) = &mut assigned {
+        hardware_step("describe-host");
         describe_host(&mut assigned.tree, gpu_gates.len(), canonical_ram.target());
     }
+    hardware_step("board");
     if let Some(assigned) = &assigned {
         board = Some(assigned_board(
             handoff,
@@ -942,6 +959,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     let mut cpu = Cpu::of(profile.chip, entry, Pstate::reset(el));
     cpu.state.x[0] = x0;
     let now = stela_engine::machine::Host::counter(&mut bare);
+    hardware_step("place-devices");
     let Placed {
         mut devices,
         restore_usb,
@@ -968,6 +986,8 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         tree,
     );
     #[cfg(feature = "metal-device")]
+    hardware_step("add-gpu-gates");
+    #[cfg(feature = "metal-device")]
     if let Some(board) = &board {
         for (placement, service) in gpu_gates {
             // The board's AIC took its dies and inputs from this vector too.
@@ -984,6 +1004,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     // Device placement has copied the carried firmware. This function
     // never returns, so release the remaining input buffers here.
     drop(built);
+    hardware_step("processor-power");
     let processor_power = connect_processor_power(
         &mut devices,
         topology_source.as_ref(),
@@ -1547,6 +1568,8 @@ fn place_devices(
         false => scanout,
     };
     #[cfg(feature = "metal-device")]
+    hardware_step("scanout");
+    #[cfg(feature = "metal-device")]
     let scanout = gpu::display::scanout()
         .map(mirrored)
         .or_else(firmware_scanout)
@@ -1554,6 +1577,7 @@ fn place_devices(
         .or_else(headless_scanout);
     #[cfg(not(feature = "metal-device"))]
     let scanout = firmware_scanout().or_else(headless_scanout);
+    hardware_step("devices");
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
     let memory = board.and_then(|board| memory_resources(board, canonical_ram, programmed));
     let cacheless_memory = memory.is_some();

@@ -390,9 +390,7 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
             }
             Operation::Map { fd, offset, size } => {
                 let result = map_pages(gpu, fd, offset, size);
-                if result < 0 {
-                    refused::map(fd, offset, size, result);
-                }
+                refused::map(fd, offset, size, result);
                 result
             }
             Operation::Unmap(address) => {
@@ -1340,19 +1338,116 @@ pub(super) struct VramGtt {
     pub gtt: u64,
 }
 
-/// amdgpu's memory sizes of the bound GPU at `index`.
+/// The VRAM bytes [`vram_gtt`] last read of each bound GPU, by index; zero
+/// before it read them.
+#[cfg(feature = "radv")]
+static VRAM_BYTES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// amdgpu's memory sizes of the bound GPU at `index`, which
+/// [`vram_bytes`] answers from then on.
 #[cfg(feature = "radv")]
 pub(super) fn vram_gtt(index: u32) -> Option<VramGtt> {
     let mut sizes = VramGtt::default();
-    amdgpu_info(index, AMDGPU_INFO_VRAM_GTT, [0; 4], &mut sizes).then_some(sizes)
+    let read = amdgpu_info(index, AMDGPU_INFO_VRAM_GTT, [0; 4], &mut sizes);
+    if read && let Some(kept) = VRAM_BYTES.get(index as usize) {
+        kept.store(sizes.vram, Ordering::Relaxed);
+    }
+    read.then_some(sizes)
 }
 
-/// The VRAM bytes of the bound GPU at `index`, for the guest's `StelaHost`.
+/// The VRAM bytes of the bound GPU at `index`, for the guest's `StelaHost`,
+/// as the service's open read them. Asking amdgpu again would open and close
+/// a file of the GPU, and the close waits, unbounded, for its VM's page-table
+/// clear: on a GPU amdgpu is still resetting that never comes, and the boot
+/// stopped at "Setting up the Mac's hardware".
 #[cfg(feature = "radv")]
 pub(in crate::engine) fn vram_bytes(index: u32) -> Option<u64> {
-    vram_gtt(index)
-        .map(|sizes| sizes.vram)
+    VRAM_BYTES
+        .get(index as usize)
+        .map(|kept| kept.load(Ordering::Relaxed))
         .filter(|&bytes| bytes != 0)
+}
+
+/// `DRM_IOCTL_AMDGPU_CTX`: `DRM_IOWR(DRM_COMMAND_BASE + 0x02, union
+/// drm_amdgpu_ctx)`.
+#[cfg(feature = "radv")]
+const AMDGPU_CTX: u32 = 0xc010_6442;
+#[cfg(feature = "radv")]
+const AMDGPU_CTX_OP_ALLOC_CTX: u32 = 1;
+#[cfg(feature = "radv")]
+const AMDGPU_CTX_OP_QUERY_STATE2: u32 = 4;
+/// `AMDGPU_CTX_QUERY2_FLAGS_RESET`: the GPU was reset since the context was made.
+#[cfg(feature = "radv")]
+pub(super) const CTX_RESET: u64 = 1 << 0;
+/// `AMDGPU_CTX_QUERY2_FLAGS_RESET_IN_PROGRESS`: amdgpu is resetting it now.
+#[cfg(feature = "radv")]
+pub(super) const CTX_RESET_IN_PROGRESS: u64 = 1 << 5;
+
+/// `union drm_amdgpu_ctx`: `drm_amdgpu_ctx_in`, over which the kernel
+/// writes `drm_amdgpu_ctx_out` (`alloc.ctx_id` or `state.flags`).
+#[cfg(feature = "radv")]
+#[repr(C)]
+#[derive(Default)]
+struct AmdgpuCtx {
+    op: u32,
+    flags: u32,
+    ctx_id: u32,
+    priority: i32,
+}
+
+/// An amdgpu context on a file of its own, made before a GPU's first work,
+/// that tells whether amdgpu reset the GPU since. Its file stays open for
+/// the boot: closing a file of a GPU in reset waits for the reset's end.
+#[cfg(feature = "radv")]
+pub(super) struct ResetWatch {
+    fd: c_int,
+    ctx: u32,
+}
+
+#[cfg(feature = "radv")]
+impl ResetWatch {
+    /// A watch on the bound GPU at `index`; `None` when amdgpu gave no file
+    /// or context.
+    pub(super) fn new(index: u32) -> Option<Self> {
+        let fd = submit(Operation::Open(RENDER_MINOR + index)) as c_int;
+        if fd < 0 {
+            return None;
+        }
+        let mut ctx = AmdgpuCtx {
+            op: AMDGPU_CTX_OP_ALLOC_CTX,
+            ..AmdgpuCtx::default()
+        };
+        let result = submit(Operation::Control {
+            fd,
+            request: AMDGPU_CTX,
+            argument: (&raw mut ctx).cast(),
+        });
+        // A file without a context watches nothing; it closes while the
+        // GPU has had no work.
+        if result != 0 {
+            close_descriptor(fd);
+            return None;
+        }
+        // `alloc.ctx_id` is the output's first word.
+        Some(Self { fd, ctx: ctx.op })
+    }
+
+    /// `AMDGPU_CTX_QUERY2_FLAGS_*` of the context now, `None` when amdgpu
+    /// did not answer. Takes only the file's own context lock.
+    pub(super) fn flags(&self) -> Option<u64> {
+        let mut ctx = AmdgpuCtx {
+            op: AMDGPU_CTX_OP_QUERY_STATE2,
+            ctx_id: self.ctx,
+            ..AmdgpuCtx::default()
+        };
+        let result = submit(Operation::Control {
+            fd: self.fd,
+            request: AMDGPU_CTX,
+            argument: (&raw mut ctx).cast(),
+        });
+        // `state.flags` is the output's first eight bytes.
+        (result == 0).then_some(u64::from(ctx.op) | u64::from(ctx.flags) << 32)
+    }
 }
 
 /// The VRAM bytes of the bound GPU at `index`, for the guest's `StelaHost`.
@@ -1379,9 +1474,20 @@ pub(in crate::engine) fn vram_bytes(index: u32) -> Option<u64> {
 /// False when `address` is not one a client mapped.
 pub(in crate::engine) fn serve_fault(address: u64, write: bool) -> bool {
     installed().is_some_and(|gpu| {
-        gpu.window.contains(address)
-            && MAPPINGS.load(Ordering::Relaxed) != 0
-            && submit(Operation::Fault { address, write }) == 0
+        if !gpu.window.contains(address) || MAPPINGS.load(Ordering::Relaxed) == 0 {
+            return false;
+        }
+        // The boot CPU reaches Linux only through its dispatcher, which a
+        // fault's handler cannot enter, except on a Linux task, which calls
+        // in place. Say what faulted, not only that the dispatch was refused.
+        if host::processor() == BOOT_CPU.load(Ordering::Relaxed) && current_thread(gpu).is_none()
+        {
+            output::fatal(format_args!(
+                "a GPU mapping at {address:#x} (write={write}) faulted on the boot CPU outside \
+                 Linux, which cannot map it again there: amdgpu unmapped it, as its GPU reset does"
+            ));
+        }
+        submit(Operation::Fault { address, write }) == 0
     })
 }
 
