@@ -409,23 +409,24 @@ pub fn diagnose_steps() -> Vec<Step> {
         seconds,
         required: false,
     };
-    const REPORTS: &str = "/Library/Logs/DiagnosticReports";
+    const LOG: &str = "/usr/bin/log show --last 3h --style compact --info --debug";
     Vec::from([
         optional("/sbin/mount -P 1", 120),
         optional("/usr/libexec/init_data_protection", 180),
         optional("/sbin/mount -P 2", 180),
-        optional(&format!("/bin/ls -lt {REPORTS} {REPORTS}/Retired 2>&1 | /usr/bin/head -40"), 30),
         optional(
             &format!(
-                "for f in $(/bin/ls -t {REPORTS}/WindowServer* 2>/dev/null | /usr/bin/head -2); do echo \"== $f\"; /usr/bin/head -c 16000 \"$f\"; echo; done"
+                "{LOG} --predicate 'process == \"WindowServer\" AND (messageType == error OR messageType == fault OR eventMessage CONTAINS[c] \"metal\" OR eventMessage CONTAINS[c] \"device\" OR eventMessage CONTAINS[c] \"accelerator\")' 2>&1 | /usr/bin/tail -120"
             ),
-            120,
+            600,
         ),
         optional(
-            "/bin/ls -la /System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle/Contents /System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle/Contents/MacOS 2>&1",
-            30,
+            &format!(
+                "{LOG} --predicate 'eventMessage CONTAINS[c] \"StelaGPU\" OR eventMessage CONTAINS[c] \"GPUBundles\" OR eventMessage CONTAINS[c] \"MTLCopyAllDevices\" OR subsystem == \"com.apple.Metal\"' 2>&1 | /usr/bin/tail -80"
+            ),
+            600,
         ),
-        optional("/usr/sbin/ioreg -l -w0 -r -c StelaGPU 2>&1 | /usr/bin/head -60", 60),
+        optional("/usr/sbin/ioreg -l -w0 -r -n gpu 2>&1 | /usr/bin/head -80", 60),
     ])
 }
 
