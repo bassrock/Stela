@@ -232,7 +232,7 @@ pub(crate) fn page_fault(
     if !in_code(state, frame.rip) {
         // A client's mapping Linux moved: its refault may sleep, which only
         // the faulting context may do, never this handler.
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         if super::super::gpu::client::client_fault(address) {
             match super::process_fault::redirect(frame, address) {
                 Ok(()) => return,

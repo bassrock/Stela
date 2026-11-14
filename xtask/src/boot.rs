@@ -121,12 +121,16 @@ pub enum Command {
         /// Include authored hardware fixtures in the mount.
         #[arg(long)]
         diagnostics: bool,
-        /// Carry amdgpu instead of NVK, for a Radeon RX 9070 (Navi 48):
-        /// amdgpu binds it in the Linux environment, as yet with neither
-        /// display nor Metal device, so only a `--single-user` boot of macOS
-        /// goes on past the GPU.
-        #[arg(long)]
+        /// Carry amdgpu instead of NVK, for a Radeon RX 9070 (Navi 48) or RX
+        /// 6800-6950 XT (Navi 21): amdgpu binds it in the Linux environment,
+        /// with neither display nor Metal device, so only a `--single-user`
+        /// boot of macOS goes on past the GPU.
+        #[arg(long, conflicts_with = "radv")]
         amdgpu: bool,
+        /// Carry amdgpu and RADV instead of NVK: amdgpu binds the GPU, still
+        /// without display, and RADV backs the Metal device over it.
+        #[arg(long)]
+        radv: bool,
     },
     /// Boot `stela.efi` with an ARM image in x86 QEMU.
     Run(Box<Run>),
@@ -499,9 +503,13 @@ pub fn run(command: Command) -> Result<ExitCode> {
             release,
             diagnostics,
             amdgpu,
+            radv,
         } => {
             crate::gpu::fetch::fetch(false)?;
-            let gpu = if amdgpu {
+            let gpu = if radv {
+                crate::gpu::build_radv(crate::gpu::default_jobs())?;
+                Gpu::Radv
+            } else if amdgpu {
                 Gpu::Amdgpu
             } else {
                 crate::gpu::build_nvk(crate::gpu::default_jobs())?;
@@ -528,6 +536,8 @@ enum Gpu {
     Nvk,
     /// amdgpu, without NVK.
     Amdgpu,
+    /// RADV, NIR and ACO over amdgpu, from `cargo xtask gpu radv`.
+    Radv,
 }
 
 fn build_for_boot(release: bool, diagnostics: bool, gpu: Gpu) -> Result<PathBuf> {
@@ -573,6 +583,9 @@ fn build_with_diagnostics(release: bool, diagnostics: bool, gpu: Gpu) -> Result<
         }
         Gpu::Amdgpu => {
             command.args(["--features", "amdgpu"]);
+        }
+        Gpu::Radv => {
+            command.args(["--features", "radv"]);
         }
     }
     if release {

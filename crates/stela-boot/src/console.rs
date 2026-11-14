@@ -215,7 +215,7 @@ impl Framebuffer {
     }
 
     /// A blue-low `width` by `height` screen at `base`, `stride` pixels a row.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     pub fn linear(base: usize, width: usize, height: usize, stride: usize) -> Self {
         Self {
             base,
@@ -782,7 +782,7 @@ pub fn install(screen: Framebuffer) {
 }
 
 /// Keep the text [`release`] kept for `screen`, which now shows.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub fn parked_on(screen: Framebuffer) {
     with_consoles(|_, parked| {
         if let Some(text) = parked {

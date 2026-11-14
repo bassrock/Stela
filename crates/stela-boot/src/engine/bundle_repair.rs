@@ -9,7 +9,7 @@ use alloc::{string::String, vec::Vec};
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use stela_boot_core::bundle_repair::{self, Boot, Change, Driver, Outcome, Record};
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 use stela_boot_core::bundle_repair::{Decision, Report};
 use stela_formats::boot_bundle::Nvram;
 use stela_soc_data::nor::{Image, nvram::Variables};
@@ -87,7 +87,7 @@ fn keep(change: Change) {
 
 /// What the kext's `report` decides for this boot; a change to NVRAM's
 /// record is kept for the stop. Only the GPU gate reports.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub(super) fn decide(report: Report) -> Decision {
     let record = this_record();
     let decision = bundle_repair::decide(
@@ -110,7 +110,7 @@ pub(super) fn decide(report: Report) -> Decision {
 /// The stop's reason for a normal boot that finds the plugin missing
 /// (`Decision::StopMissing`): what the last repair reported, or why none
 /// can run.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub(super) fn missing(attempted: bool) -> String {
     let reported = REPORTED.0.try_borrow().ok().and_then(|kept| kept.clone());
     bundle_repair::stop_reason(

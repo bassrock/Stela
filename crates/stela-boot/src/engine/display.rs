@@ -13,7 +13,7 @@ use crate::Result;
 use crate::console::{self, Framebuffer};
 use crate::output;
 use alloc::vec::Vec;
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 use alloc::{boxed::Box, vec};
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -24,11 +24,11 @@ use stela_formats::boot_bundle;
 use stela_soc::machine::{DisplayLog, Scanout, ScanoutFormat, ScanoutMode};
 use stela_soc::scanout::union;
 
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 use super::gpu::client::{present_took, timed_present as timed};
 /// Counts a present that took `ticks`; the GPU's reports count presents
 /// only with a GPU.
-#[cfg(not(feature = "nvk"))]
+#[cfg(not(feature = "metal-device"))]
 fn present_took(_ticks: u64) {}
 
 /// Whether the DCP model has presented a swap: the first one takes the
@@ -295,13 +295,13 @@ pub fn print_log(entry: &DisplayLog) {
 /// that the boot log names. A debugger reads it from there, as QEMU's `memsave`
 /// does; a frame's rows are blue-low `width` pixels top to bottom.
 /// Its presents are timed for the GPU's reports.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub struct MirroredScanout {
     scanout: Box<dyn Scanout>,
     frame: Box<[u8]>,
 }
 
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 impl MirroredScanout {
     pub fn new(scanout: Box<dyn Scanout>) -> Self {
         Self {
@@ -329,7 +329,7 @@ impl MirroredScanout {
     }
 }
 
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 impl Scanout for MirroredScanout {
     fn mode(&self) -> ScanoutMode {
         self.scanout.mode()

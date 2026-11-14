@@ -382,7 +382,7 @@ fn open_host(
         .and_then(|file| translations::install(unsafe { bundle::contents_mut(file) }))
         .filter(|_| handoff.storage.present);
     // The Metal device's stored pipelines, before any GPU opens.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     if let Some(file) = handoff.files[..handoff.file_count]
         .iter()
         .find(|file| file.name() == super::pipelines::FILE)
@@ -816,7 +816,7 @@ fn start_processors(boot: Boot<'_>, host: &mut OpenedHost) -> Processors {
 /// of the `gates` StelaGPU gate nodes' `stela-host` property, which the kext
 /// publishes as `StelaHost`, with the translator's target and identity and
 /// each GPU's VRAM.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 fn describe_host(
     tree: &mut stela_loader::apple_device_tree::DeviceTree,
     gates: usize,
@@ -873,7 +873,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         x0,
         read_only_region,
         core_locks,
-        #[cfg_attr(not(feature = "nvk"), allow(unused_mut))]
+        #[cfg_attr(not(feature = "metal-device"), allow(unused_mut))]
         mut hidden_devices,
         live_tree: mut loaded_tree,
         source: loaded_source,
@@ -960,14 +960,14 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     } = storage;
     let mut bare = host_owner.host();
     let mut assigned = assign(boot, &roster, topology_source.as_ref(), &full_profile);
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     let gpu_gates = assigned
         .as_mut()
         .map(|assigned| gpu::gate::place(&mut assigned.tree))
         .unwrap_or_default();
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     let metal_device = !gpu_gates.is_empty();
-    #[cfg(not(feature = "nvk"))]
+    #[cfg(not(feature = "metal-device"))]
     let metal_device = false;
     if let Some(assigned) = &mut assigned
         && options.hides_agx(metal_device)
@@ -1004,7 +1004,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
     // The translator compiles for the canonical RAM's target (the BSP's live
     // features under the common worker ceiling), not the board profile's
     // ID-register list in `target`.
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     if let Some(assigned) = &mut assigned {
         describe_host(&mut assigned.tree, gpu_gates.len(), canonical_ram.target());
     }
@@ -1083,7 +1083,7 @@ fn run_guest(boot: Boot<'_>, mut host: OpenedHost, mut storage: Storage) -> ! {
         loaded_source.as_ref(),
         tree,
     );
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     if let Some(board) = &board {
         for (placement, service) in gpu_gates {
             // The board's AIC took its dies and inputs from this vector too.
@@ -1465,7 +1465,7 @@ fn open_gpus(
         return false;
     }
     let tsc_hz = handoff.tsc_hz;
-    #[cfg(feature = "nvk")]
+    #[cfg(feature = "metal-device")]
     let heap_bytes = heap.end - heap.start;
     crate::status::begin("Starting the GPU");
     let gop = if handoff.screen.is_some() {
@@ -1540,7 +1540,7 @@ fn open_gpus(
         random,
         tsc_hz,
         wall: handoff.wall,
-        #[cfg(feature = "nvk")]
+        #[cfg(feature = "metal-device")]
         heap_bytes,
     };
     // Store the claim's lines before Linux starts, so the USB keeps them
@@ -1658,28 +1658,9 @@ fn place_devices(
                     as alloc::boxed::Box<dyn stela_soc::machine::Scanout>
             })
     };
-    // The firmware's scanout keeps its newest frame itself; a GPU's is
-    // wrapped to keep one for `--scanout-mirror`. A bound GPU with no display
-    // leaves the firmware's screen on another adapter showing its frames
-    // (`GopScanout::copying_gpu_frames`). With neither a GPU's display nor
-    // the firmware's screen, which a bound GPU's reset ended, the guest keeps
-    // that screen's mode and a GPU's display found later shows it.
-    #[cfg(feature = "nvk")]
-    let mirrored = |scanout: alloc::boxed::Box<dyn stela_soc::machine::Scanout>| match options
-        .scanout_mirror
-    {
-        true => alloc::boxed::Box::new(display::MirroredScanout::new(scanout)) as _,
-        false => scanout,
-    };
-    #[cfg(feature = "nvk")]
-    let scanout = gpu::display::scanout()
-        .map(mirrored)
-        .or_else(|| firmware_scanout(gpu::display::drawn_without_display()))
-        .or_else(|| gpu::display::awaited(handoff.screen).map(mirrored));
-    #[cfg(not(feature = "nvk"))]
-    let scanout = firmware_scanout(false).or_else(|| {
-        // amdgpu retired the firmware's screen to claim its GPU headless;
-        // the Mac keeps a monitor at that screen's mode.
+    // amdgpu, built without its display core, retired the firmware's screen
+    // to claim its GPU headless; the Mac keeps a monitor at that screen's mode.
+    let headless_scanout = || {
         handoff.screen.map(|screen| {
             let (width, height) = screen.resolution();
             output::arguments(format_args!(
@@ -1688,7 +1669,28 @@ fn place_devices(
             alloc::boxed::Box::new(display::HeadlessScanout::new(width, height))
                 as alloc::boxed::Box<dyn stela_soc::machine::Scanout>
         })
-    });
+    };
+    // The firmware's scanout keeps its newest frame itself; a GPU's is
+    // wrapped to keep one for `--scanout-mirror`. A bound GPU with no display
+    // leaves the firmware's screen on another adapter showing its frames
+    // (`GopScanout::copying_gpu_frames`). With neither a GPU's display nor
+    // the firmware's screen, which a bound GPU's reset ended, the guest keeps
+    // that screen's mode and a GPU's display found later shows it.
+    #[cfg(feature = "metal-device")]
+    let mirrored = |scanout: alloc::boxed::Box<dyn stela_soc::machine::Scanout>| match options
+        .scanout_mirror
+    {
+        true => alloc::boxed::Box::new(display::MirroredScanout::new(scanout)) as _,
+        false => scanout,
+    };
+    #[cfg(feature = "metal-device")]
+    let scanout = gpu::display::scanout()
+        .map(mirrored)
+        .or_else(|| firmware_scanout(gpu::display::drawn_without_display()))
+        .or_else(|| gpu::display::awaited(handoff.screen).map(mirrored))
+        .or_else(headless_scanout);
+    #[cfg(not(feature = "metal-device"))]
+    let scanout = firmware_scanout(false).or_else(headless_scanout);
     let programmed = mount::memory_locks(placement.read_only_region, core_locks);
     let memory = board.and_then(|board| memory_resources(board, canonical_ram, programmed));
     let cacheless_memory = memory.is_some();
@@ -3119,7 +3121,7 @@ fn start_devices(
             disks.profile_callbacks(options.profile);
             if let Some(store) = store {
                 translations::set_partition(store);
-                #[cfg(feature = "nvk")]
+                #[cfg(feature = "metal-device")]
                 super::pipelines::prepare();
             }
             fdr_device = fdr;

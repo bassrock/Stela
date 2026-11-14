@@ -281,7 +281,7 @@ static ACTIVE: AtomicU32 = AtomicU32::new(0);
 
 /// How many processors have become active: each one's [`processor`] is
 /// below it.
-#[cfg(feature = "nvk")]
+#[cfg(feature = "metal-device")]
 pub(crate) fn processors() -> u32 {
     ACTIVE.load(Ordering::Relaxed)
 }

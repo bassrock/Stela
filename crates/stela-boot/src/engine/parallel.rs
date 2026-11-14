@@ -274,7 +274,7 @@ impl Pe {
                         // The translation pack's writes, a bounded step.
                         super::translations::step();
                         // A GPU compilation a guest call deferred.
-                        #[cfg(feature = "nvk")]
+                        #[cfg(feature = "metal-device")]
                         super::gpu::gate::run_job(super::gpu::gate::Taker::Waiting);
                     })
                 }
@@ -293,7 +293,7 @@ impl Pe {
                     // code, where the guest holds no lock and no kernel
                     // watchdog counts, rather than inside the guest call that
                     // waits for it.
-                    #[cfg(feature = "nvk")]
+                    #[cfg(feature = "metal-device")]
                     if machine.cpu.pstate.el == 0 && super::gpu::gate::busy_job_due() {
                         super::run::host_work(&mut machine, "gpu job", |_| {
                             super::gpu::gate::run_job(super::gpu::gate::Taker::Busy)

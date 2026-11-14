@@ -29,9 +29,9 @@ pub(super) fn load(
     let framebuffer = options
         .bundle
         .then(|| {
-            #[cfg(feature = "nvk")]
+            #[cfg(feature = "metal-device")]
             let gpu = gpu::display::taken_size();
-            #[cfg(not(feature = "nvk"))]
+            #[cfg(not(feature = "metal-device"))]
             let gpu = None;
             let firmware = handoff.screen.map(|screen| screen.resolution());
             let chosen = stela_boot_core::guest_screen::choose(firmware, gpu);
