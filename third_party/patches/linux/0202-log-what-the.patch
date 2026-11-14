@@ -1,0 +1,396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Brooks <bass_rock@me.com>
+Date: Sat, 14 Nov 2026 20:23:11 +0000
+Subject: [PATCH] feat(amdgpu): log what the GPU was doing when a job times
+ out, every IV the interrupt handler takes, and how long PSP's memory training
+ takes
+
+On a job timeout, log the fence the GPU last wrote against the ones
+amdgpu emitted and saw signal, the ring's packets around the CP's read
+pointer, the job's IBs and their contents read through its VM, the
+interrupt ring's pointers, the VM hubs' protection fault registers, the
+ring's invalidation engine and the job's VM context, and the GC registers
+amdgpu's IP dump took. Log the first IVs the interrupt handler decodes,
+and the ops and phases of PSP v11's memory training. Say why a ring reset
+failed.
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c |  15 ++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h |   3 +
+ drivers/gpu/drm/amd/amdgpu/amdgpu_job.c | 187 +++++++++++++++++++++++-
+ drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c  |  35 +++++
+ drivers/gpu/drm/amd/amdgpu/gfx_v10_0.h  |   2 +
+ drivers/gpu/drm/amd/amdgpu/psp_v11_0.c  |   9 ++
+ 6 files changed, 250 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+index 53be764968e45fe06784f075f6162d715edc263b..ef82eef0ede5f0ecdc4ba3e8336b4bf4aaec47e6 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.c
+@@ -197,12 +197,18 @@ void amdgpu_irq_disable_all(struct amdgpu_device *adev)
+  * Returns:
+  * result of handling the IRQ, as defined by &irqreturn_t
+  */
++/* Stela: how many times the interrupt handler ran, and how many IVs it has
++ * logged: the first 64, then up to 192 more that are not the display's. */
++u64 amdgpu_stela_irqs;
++static unsigned int amdgpu_stela_ivs_logged;
++
+ static irqreturn_t amdgpu_irq_handler(int irq, void *arg)
+ {
+ 	struct drm_device *dev = (struct drm_device *) arg;
+ 	struct amdgpu_device *adev = drm_to_adev(dev);
+ 	irqreturn_t ret;
+ 
++	WRITE_ONCE(amdgpu_stela_irqs, amdgpu_stela_irqs + 1);
+ 	ret = amdgpu_ih_process(adev, &adev->irq.ih);
+ 	if (ret == IRQ_HANDLED)
+ 		pm_runtime_mark_last_busy(dev->dev);
+@@ -492,6 +498,15 @@ void amdgpu_irq_dispatch(struct amdgpu_device *adev,
+ 	client_id = entry.client_id;
+ 	src_id = entry.src_id;
+ 
++	if (amdgpu_stela_ivs_logged < 64 ||
++	    (amdgpu_stela_ivs_logged < 256 && client_id != SOC15_IH_CLIENTID_DCE)) {
++		amdgpu_stela_ivs_logged++;
++		dev_info(adev->dev, "STELA IV ih%ld client=%u src=%u ring=%u vmid=%u pasid=%u data=0x%x,0x%x,0x%x,0x%x rptr=0x%x irqs=%llu\n",
++			 (long)(ih - &adev->irq.ih), client_id, src_id, entry.ring_id,
++			 entry.vmid, entry.pasid, entry.src_data[0], entry.src_data[1],
++			 entry.src_data[2], entry.src_data[3], ih->rptr, amdgpu_stela_irqs);
++	}
++
+ 	if (client_id >= AMDGPU_IRQ_CLIENTID_MAX) {
+ 		dev_dbg(adev->dev, "Invalid client_id in IV: %d\n", client_id);
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+index af72405a7226263ca3a9a3359beee58be2b14668..3035c6fe7bb4db56df1a427f4683933734aa2742 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_irq.h
+@@ -79,6 +79,9 @@ struct amdgpu_irq_src_funcs {
+ 		       struct amdgpu_iv_entry *entry);
+ };
+ 
++/* Stela: how many times amdgpu's interrupt handler ran. */
++extern u64 amdgpu_stela_irqs;
++
+ struct amdgpu_irq {
+ 	bool				installed;
+ 	unsigned int			irq;
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+index 07771721af9d247de724e3b16d5cf9d94f4491ba..2c9f05c6d9ff59b6030b669f4b51e165a066864d 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_job.c
+@@ -32,6 +32,8 @@
+ #include "amdgpu_reset.h"
+ #include "amdgpu_dev_coredump.h"
+ #include "amdgpu_xgmi.h"
++#include "gfx_v10_0.h"
++#include <drm/drm_exec.h>
+ 
+ static void amdgpu_job_do_core_dump(struct amdgpu_device *adev,
+ 				    struct amdgpu_job *job)
+@@ -48,6 +50,188 @@ static void amdgpu_job_do_core_dump(struct amdgpu_device *adev,
+ 	amdgpu_coredump(adev, true, false, job);
+ }
+ 
++/* Stela: dwords of @words at @base, eight to a line, under @what. */
++static void amdgpu_job_stela_log_words(struct amdgpu_device *adev, const char *what,
++				       u64 base, const u32 *words, u32 count)
++{
++	u32 i;
++
++	for (i = 0; i < count; i += 8)
++		dev_info(adev->dev, "STELA HANG %s +0x%03x(0x%llx): %08x %08x %08x %08x %08x %08x %08x %08x\n",
++			 what, i, base + i * 4ull,
++			 words[i], i + 1 < count ? words[i + 1] : 0,
++			 i + 2 < count ? words[i + 2] : 0, i + 3 < count ? words[i + 3] : 0,
++			 i + 4 < count ? words[i + 4] : 0, i + 5 < count ? words[i + 5] : 0,
++			 i + 6 < count ? words[i + 6] : 0, i + 7 < count ? words[i + 7] : 0);
++}
++
++/* Stela: the IBs a timed-out job runs, read through its VM's mappings. The
++ * VM's root and each IB's BO are only tried, as a reservation held
++ * elsewhere would stall the timeout handler. At most 2048 dwords an IB. */
++static void amdgpu_job_stela_log_ibs(struct amdgpu_device *adev, struct amdgpu_job *job)
++{
++	struct amdgpu_bo *root = NULL;
++	struct amdgpu_vm *vm;
++	unsigned long flags;
++	u32 *words;
++	u32 i;
++
++	if (!job->pasid)
++		return;
++	xa_lock_irqsave(&adev->vm_manager.pasids, flags);
++	vm = xa_load(&adev->vm_manager.pasids, job->pasid);
++	if (vm)
++		root = amdgpu_bo_ref(vm->root.bo);
++	xa_unlock_irqrestore(&adev->vm_manager.pasids, flags);
++	if (!root)
++		return;
++	if (!dma_resv_trylock(root->tbo.base.resv)) {
++		dev_info(adev->dev, "STELA HANG IBs not read: the VM is reserved\n");
++		amdgpu_bo_unref(&root);
++		return;
++	}
++	words = kvmalloc_array(2048, 4, GFP_KERNEL);
++	for (i = 0; words && i < job->num_ibs; i++) {
++		u64 va = job->ibs[i].gpu_addr & AMDGPU_GMC_HOLE_MASK;
++		u32 count = min_t(u32, job->ibs[i].length_dw, 2048);
++		struct amdgpu_bo_va_mapping *mapping;
++		struct amdgpu_bo *bo;
++		bool locked = false;
++		u64 offset;
++		char what[24];
++		int r;
++
++		mapping = amdgpu_vm_bo_lookup_mapping(vm, va / AMDGPU_GPU_PAGE_SIZE);
++		if (!mapping || !mapping->bo_va || !mapping->bo_va->base.bo) {
++			dev_info(adev->dev, "STELA HANG IB %u at 0x%llx: no mapping\n", i, va);
++			continue;
++		}
++		bo = mapping->bo_va->base.bo;
++		offset = va - mapping->start * AMDGPU_GPU_PAGE_SIZE + mapping->offset;
++		dev_info(adev->dev, "STELA HANG IB %u at 0x%llx: bo size=0x%lx domain=%u flags=0x%llx offset=0x%llx mapping=0x%llx-0x%llx flags=0x%llx\n",
++			 i, va, amdgpu_bo_size(bo), bo->tbo.resource ? bo->tbo.resource->mem_type : 99,
++			 bo->flags, offset, mapping->start, mapping->last, mapping->flags);
++		if (bo->tbo.base.resv != root->tbo.base.resv) {
++			if (!dma_resv_trylock(bo->tbo.base.resv)) {
++				dev_info(adev->dev, "STELA HANG IB %u not read: its BO is reserved\n", i);
++				continue;
++			}
++			locked = true;
++		}
++		if (offset + count * 4ull > amdgpu_bo_size(bo) || !bo->tbo.resource) {
++			r = -ERANGE;
++		} else if (bo->flags & AMDGPU_GEM_CREATE_NO_CPU_ACCESS) {
++			r = -EACCES;
++		} else {
++			struct ttm_bo_kmap_obj map;
++			bool iomem;
++
++			r = ttm_bo_kmap(&bo->tbo, offset >> PAGE_SHIFT,
++					PFN_UP((offset & ~PAGE_MASK) + count * 4ull), &map);
++			if (!r) {
++				memcpy(words, (u8 *)ttm_kmap_obj_virtual(&map, &iomem) +
++				       (offset & ~PAGE_MASK), count * 4);
++				ttm_bo_kunmap(&map);
++			}
++		}
++		if (locked)
++			dma_resv_unlock(bo->tbo.base.resv);
++		if (r) {
++			dev_info(adev->dev, "STELA HANG IB %u not read: %d\n", i, r);
++			continue;
++		}
++		snprintf(what, sizeof(what), "IB %u", i);
++		amdgpu_job_stela_log_words(adev, what, va, words, count);
++	}
++	kvfree(words);
++	dma_resv_unlock(root->tbo.base.resv);
++	amdgpu_bo_unref(&root);
++}
++
++/* Stela: what the GPU was doing when @job timed out on @ring, in the log:
++ * the fence the GPU last wrote against the ones amdgpu emitted and saw
++ * signal, the ring's packets around the CP's read pointer, the job's IBs
++ * and their contents, the interrupt ring, the VM hubs' first protection
++ * faults, and the GC registers amdgpu's IP dump took. */
++static void amdgpu_job_stela_log_hang(struct amdgpu_device *adev, struct amdgpu_ring *ring,
++				      struct amdgpu_job *job)
++{
++	struct amdgpu_ih_ring *ih = &adev->irq.ih;
++	struct amdgpu_vm_fault_info *fault = &adev->vm_manager.fault_info;
++	u64 rptr = amdgpu_ring_get_rptr(ring);
++	u64 wptr = amdgpu_ring_get_wptr(ring);
++	u32 hw = ring->fence_drv.cpu_addr ? le32_to_cpu(*ring->fence_drv.cpu_addr) : 0;
++	u32 words[256];
++	u64 first, last, at;
++	unsigned int i, n;
++
++	dev_info(adev->dev, "STELA HANG ring %s fence written=%u signaled=%u emitted=%u rptr=0x%llx wptr=0x%llx ring_dw=%u ring_gpu=0x%llx irqs=%llu\n",
++		 ring->name, hw, atomic_read(&ring->fence_drv.last_seq), ring->fence_drv.sync_seq,
++		 rptr, wptr, ring->ring_size / 4, ring->gpu_addr, amdgpu_stela_irqs);
++	dev_info(adev->dev, "STELA HANG job vmid=%u pasid=%u ibs=%u pd=0x%llx needs_flush=%d gds=%u+%u gws=%u+%u oa=%u+%u uf=0x%llx shadow=0x%llx csa=0x%llx init_shadow=%d preamble=0x%x cleaner=%d isolation=%d run=%u\n",
++		 job->vmid, job->pasid, job->num_ibs, job->vm_pd_addr, job->vm_needs_flush,
++		 job->gds_base, job->gds_size, job->gws_base, job->gws_size, job->oa_base,
++		 job->oa_size, job->uf_addr, job->shadow_va, job->csa_va, job->init_shadow,
++		 job->preamble_status, job->run_cleaner_shader, job->enforce_isolation,
++		 job->job_run_counter);
++	for (i = 0; i < job->num_ibs; i++)
++		dev_info(adev->dev, "STELA HANG job IB %u gpu=0x%llx dw=%u flags=0x%x\n", i,
++			 job->ibs[i].gpu_addr, job->ibs[i].length_dw, job->ibs[i].flags);
++	if (ih->ring_size)
++		dev_info(adev->dev, "STELA HANG ih rptr=0x%x wptr_wb=0x%x RB_RPTR=0x%x RB_WPTR=0x%x RB_CNTL=0x%x size=0x%x msi=%d installed=%d\n",
++			 ih->rptr, ih->wptr_cpu ? le32_to_cpu(*ih->wptr_cpu) : 0,
++			 RREG32(ih->ih_regs.ih_rb_rptr), RREG32(ih->ih_regs.ih_rb_wptr),
++			 RREG32(ih->ih_regs.ih_rb_cntl), ih->ring_size, adev->irq.msi_enabled,
++			 adev->irq.installed);
++	dev_info(adev->dev, "STELA HANG last fault seen by interrupt: hub=%u addr=0x%llx status=0x%x\n",
++		 fault->vmhub, fault->addr, fault->status);
++	amdgpu_gfx_off_ctrl(adev, false);
++	for (i = 0; i < AMDGPU_MAX_VMHUBS; i++) {
++		struct amdgpu_vmhub *hub = &adev->vmhub[i];
++		u32 status, lo, hi;
++
++		if (!test_bit(i, adev->vmhubs_mask) || !hub->vm_l2_pro_fault_status)
++			continue;
++		status = RREG32(hub->vm_l2_pro_fault_status);
++		lo = RREG32(hub->vm_l2_pro_fault_status + 1);
++		hi = RREG32(hub->vm_l2_pro_fault_status + 2);
++		dev_info(adev->dev, "STELA HANG vmhub %u L2_PROTECTION_FAULT_STATUS=0x%08x ADDR_LO32=0x%08x ADDR_HI32=0x%08x CNTL=0x%08x\n",
++			 i, status, lo, hi, RREG32(hub->vm_l2_pro_fault_cntl));
++		if (status && hub->vmhub_funcs && hub->vmhub_funcs->print_l2_protection_fault_status)
++			hub->vmhub_funcs->print_l2_protection_fault_status(adev, status);
++		if (i != ring->vm_hub || !hub->vm_inv_eng0_req)
++			continue;
++		dev_info(adev->dev, "STELA HANG vmhub %u inv eng %u REQ=0x%08x ACK=0x%08x SEM=0x%08x vmid %u CNTL=0x%08x PTB=0x%08x%08x\n",
++			 i, ring->vm_inv_eng,
++			 RREG32(hub->vm_inv_eng0_req + hub->eng_distance * ring->vm_inv_eng),
++			 RREG32(hub->vm_inv_eng0_ack + hub->eng_distance * ring->vm_inv_eng),
++			 hub->vm_inv_eng0_sem ?
++			 RREG32(hub->vm_inv_eng0_sem + hub->eng_distance * ring->vm_inv_eng) : 0,
++			 job->vmid, RREG32(hub->vm_context0_cntl + hub->ctx_distance * job->vmid),
++			 RREG32(hub->ctx0_ptb_addr_hi32 + hub->ctx_addr_distance * job->vmid),
++			 RREG32(hub->ctx0_ptb_addr_lo32 + hub->ctx_addr_distance * job->vmid));
++	}
++	amdgpu_gfx_off_ctrl(adev, true);
++
++	/* The ring from 64 dwords before the CP's read pointer to the write
++	 * pointer, at most 256 dwords. */
++	first = rptr > 64 ? rptr - 64 : 0;
++	last = wptr > first ? wptr : first;
++	if (last - first > ARRAY_SIZE(words))
++		last = first + ARRAY_SIZE(words);
++	n = last - first;
++	for (i = 0, at = first; i < n; i++, at++)
++		words[i] = ring->ring[at & ring->buf_mask];
++	amdgpu_job_stela_log_words(adev, "ring", ring->gpu_addr + (first & ring->buf_mask) * 4,
++				   words, n);
++
++	amdgpu_job_stela_log_ibs(adev, job);
++
++	if (amdgpu_ip_version(adev, GC_HWIP, 0) >= IP_VERSION(10, 0, 0) &&
++	    amdgpu_ip_version(adev, GC_HWIP, 0) < IP_VERSION(11, 0, 0))
++		gfx_v10_0_stela_log_ip_state(adev);
++}
++
+ static void amdgpu_job_core_dump(struct amdgpu_device *adev,
+ 				 struct amdgpu_job *job)
+ {
+@@ -110,6 +294,7 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
+ 	 */
+ 	if (!amdgpu_sriov_vf(adev))
+ 		amdgpu_job_core_dump(adev, job);
++	amdgpu_job_stela_log_hang(adev, ring, job);
+ 
+ 	if (amdgpu_gpu_recovery &&
+ 	    amdgpu_ring_is_reset_type_supported(ring, AMDGPU_RESET_TYPE_SOFT_RESET) &&
+@@ -148,7 +333,7 @@ static enum drm_gpu_sched_stat amdgpu_job_timedout(struct drm_sched_job *s_job)
+ 					     DRM_WEDGE_RECOVERY_NONE, info);
+ 			goto exit;
+ 		}
+-		dev_err(adev->dev, "Ring %s reset failed\n", ring->sched.name);
++		dev_err(adev->dev, "Ring %s reset failed: %d\n", ring->sched.name, r);
+ 	}
+ 
+ 	if (dma_fence_get_status(&s_job->s_fence->finished) == 0)
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+index a9961d5048333812873eb2c171f7fc56acf3d7ee..52eb6a8c10d838a36f3fa00b53c3380164073759 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.c
+@@ -9714,6 +9714,41 @@ static void gfx_v10_ip_print(struct amdgpu_ip_block *ip_block, struct drm_printe
+ 	}
+ }
+ 
++/* Stela: the core registers and the gfx queues' dumped state in the log,
++ * four registers a line, as a timed-out job leaves them. */
++void gfx_v10_0_stela_log_ip_state(struct amdgpu_device *adev)
++{
++	uint32_t i, q, reg, count, index = 0;
++	char line[256];
++	int used;
++
++	if (!adev->gfx.ip_dump_core)
++		return;
++	count = ARRAY_SIZE(gc_reg_list_10_1);
++	for (i = 0; i < count; i += 4) {
++		used = 0;
++		for (reg = i; reg < count && reg < i + 4; reg++)
++			used += scnprintf(line + used, sizeof(line) - used, " %s=0x%08x",
++					  gc_reg_list_10_1[reg].reg_name + 2,
++					  adev->gfx.ip_dump_core[reg]);
++		dev_info(adev->dev, "STELA HANG gc%s\n", line);
++	}
++	if (!adev->gfx.ip_dump_gfx_queues)
++		return;
++	count = ARRAY_SIZE(gc_gfx_queue_reg_list_10);
++	for (q = 0; q < adev->gfx.me.num_me * adev->gfx.me.num_pipe_per_me *
++		    adev->gfx.me.num_queue_per_pipe; q++, index += count) {
++		for (i = 0; i < count; i += 4) {
++			used = 0;
++			for (reg = i; reg < count && reg < i + 4; reg++)
++				used += scnprintf(line + used, sizeof(line) - used, " %s=0x%08x",
++						  gc_gfx_queue_reg_list_10[reg].reg_name + 2,
++						  adev->gfx.ip_dump_gfx_queues[index + reg]);
++			dev_info(adev->dev, "STELA HANG gfx queue %u%s\n", q, line);
++		}
++	}
++}
++
+ static void gfx_v10_ip_dump(struct amdgpu_ip_block *ip_block)
+ {
+ 	struct amdgpu_device *adev = ip_block->adev;
+diff --git a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.h b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.h
+index b442e50324d09b64234cfb5bb18191bd0936530a..df53472c3d624c9881f6c75b1ab3c096e003ee0b 100644
+--- a/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.h
++++ b/drivers/gpu/drm/amd/amdgpu/gfx_v10_0.h
+@@ -26,4 +26,6 @@
+ 
+ extern const struct amdgpu_ip_block_version gfx_v10_0_ip_block;
+ 
++void gfx_v10_0_stela_log_ip_state(struct amdgpu_device *adev);
++
+ #endif
+diff --git a/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c b/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c
+index 479690c44f0d54375d0b87dba8168d253da7f413..da3b41a451542aded15555f214929cc9d30953a9 100644
+--- a/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c
++++ b/drivers/gpu/drm/amd/amdgpu/psp_v11_0.c
+@@ -484,6 +484,7 @@ static int psp_v11_0_memory_training(struct psp_context *psp, uint32_t ops)
+ 
+ 	if (psp_v11_0_is_sos_alive(psp)) {
+ 		DRM_DEBUG("SOS is alive, skip memory training.\n");
++		dev_info(adev->dev, "STELA memory training skipped: SOS is alive\n");
+ 		return 0;
+ 	}
+ 
+@@ -522,6 +523,7 @@ static int psp_v11_0_memory_training(struct psp_context *psp, uint32_t ops)
+ 	}
+ 
+ 	DRM_DEBUG("Memory training ops:%x.\n", ops);
++	dev_info(adev->dev, "STELA memory training ops=0x%x\n", ops);
+ 
+ 	if (ops & PSP_MEM_TRAIN_SEND_LONG_MSG) {
+ 		/*
+@@ -546,8 +548,12 @@ static int psp_v11_0_memory_training(struct psp_context *psp, uint32_t ops)
+ 		}
+ 
+ 		if (drm_dev_enter(adev_to_drm(adev), &idx)) {
++			ktime_t began = ktime_get(), saved, trained;
++
+ 			memcpy_fromio(buf, adev->mman.aper_base_kaddr, sz);
++			saved = ktime_get();
+ 			ret = psp_v11_0_memory_training_send_msg(psp, PSP_BL__DRAM_LONG_TRAIN);
++			trained = ktime_get();
+ 			if (ret) {
+ 				DRM_ERROR("Send long training msg failed.\n");
+ 				vfree(buf);
+@@ -557,6 +563,9 @@ static int psp_v11_0_memory_training(struct psp_context *psp, uint32_t ops)
+ 
+ 			memcpy_toio(adev->mman.aper_base_kaddr, buf, sz);
+ 			amdgpu_device_flush_hdp(adev, NULL);
++			dev_info(adev->dev, "STELA memory training long: save %lld ms, train %lld ms, restore %lld ms of 0x%x bytes\n",
++				 ktime_ms_delta(saved, began), ktime_ms_delta(trained, saved),
++				 ktime_ms_delta(ktime_get(), trained), sz);
+ 			vfree(buf);
+ 			drm_dev_exit(idx);
+ 		} else {
