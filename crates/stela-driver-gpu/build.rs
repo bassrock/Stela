@@ -1,6 +1,9 @@
 #[cfg(feature = "amdgpu-port")]
 #[path = "build/amdgpu.rs"]
 mod amdgpu;
+#[cfg(feature = "amdgpu-dc")]
+#[path = "build/amdgpu_dc.rs"]
+mod amdgpu_dc;
 #[cfg(feature = "nouveau-port")]
 #[path = "build/image.rs"]
 mod image;
