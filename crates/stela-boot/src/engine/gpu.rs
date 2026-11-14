@@ -1681,6 +1681,8 @@ pub(super) fn serve(
 /// them or failed, as the guest should not start with a half-started GPU
 /// beneath it.
 pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error> {
+    output::arguments(format_args!("GPU Linux: open with {} claimed\n", claimed.len()));
+    output::flush_log();
     // Keep the exact original claims on every partial startup refusal.
     let claimed = ManuallyDrop::new(claimed);
     let Machine {
@@ -1772,6 +1774,8 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
     }
     #[cfg(feature = "nvk")]
     BOOT_CPU.store(host::processor(), Ordering::Relaxed);
+    output::arguments(format_args!("GPU Linux: dispatching\n"));
+    output::flush_log();
     let (owner, threads, job) = work.dispatch_linux(|runtime| {
         Ok(mount_and_start(
             work,
@@ -1852,6 +1856,8 @@ fn mount_and_start(
         })
         .map_err(environment_error)?;
     let started = host::rdtsc();
+    output::arguments(format_args!("GPU Linux: creating the kernel owner\n"));
+    output::flush_log();
     // SAFETY: the enclosing dispatch owns this exact root/CPU/clock and
     // queue. The original heap, executable backing, platform and catalogue
     // stay retained permanently, including any partial kernel publication.
@@ -1869,7 +1875,11 @@ fn mount_and_start(
         .set(addr_of!(*owner.environment()));
     // SAFETY: this same native dispatcher owns the already claimed kernel
     // and no task has been published. The catalogue must retain this owner.
+    output::arguments(format_args!("GPU Linux: registering pages\n"));
+    output::flush_log();
     let pages = unsafe { work.register_linux_pages(owner.as_ref()) }?;
+    output::arguments(format_args!("GPU Linux: installing task runtime\n"));
+    output::flush_log();
     // SAFETY: the permanent, same-owner runtime, catalogue and service
     // domain were installed above. No original child has started yet.
     let threads = unsafe { TaskRuntime::install(owner.clone(), runtime, pages, SLOTS) }
@@ -1877,6 +1887,8 @@ fn mount_and_start(
     let threads = &*Box::leak(Box::new(threads));
     // Reserve the error envelope before Initial can publish native state.
     let initial_failure = Box::new_uninit();
+    output::arguments(format_args!("GPU Linux: starting the initial task\n"));
+    output::flush_log();
     // SAFETY: this exact source, root and broker remain kept on refusal. Each
     // runtime step runs inside the same live native execution segment.
     unsafe { Pin::new(owner.as_ref()).start_initial(work.linux_root(), threads) }
@@ -1884,6 +1896,8 @@ fn mount_and_start(
 
     // SAFETY: submit via this actual original task broker. The service
     // initializes the original resources before dispatching accepted jobs.
+    output::arguments(format_args!("GPU Linux: starting SRCU\n"));
+    output::flush_log();
     let srcu = unsafe { stela_linux::srcu::Bootstrap::start(owner.clone(), threads) }
         .map_err(|failure| Error::SrcuStart(failure.error))?;
     wait_for_child(
@@ -1896,6 +1910,8 @@ fn mount_and_start(
     // SAFETY: the taskless dispatcher observed the original joined job.
     // Only this consuming join can acknowledge public SRCU admission.
     let ready = unsafe { srcu.join() }.map_err(|failure| Error::Srcu(failure.error))?;
+    output::arguments(format_args!("GPU Linux: SRCU ready, submitting the probe\n"));
+    output::flush_log();
     let probing = host::rdtsc();
     START_TICKS[0].store(probing.wrapping_sub(started), Ordering::Relaxed);
     let completed = Rc::new(Cell::new(None));
@@ -1936,6 +1952,9 @@ fn wait_for_child(
         if finished() {
             return Ok(());
         }
+        // Store the USB log on its period while Linux runs, so a probe that
+        // never returns still leaves its LINUX lines on the stick.
+        output::flush_due();
         if time.now_ns().map_err(environment_error)? >= deadline {
             return Err(Error::Timeout);
         }
