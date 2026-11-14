@@ -57,7 +57,7 @@ jobs:
         run: |
           cargo build --release --locked -p stela-cli --target x86_64-pc-windows-msvc
           target/x86_64-pc-windows-msvc/release/stela.exe --version
-          target/x86_64-pc-windows-msvc/release/stela.exe setup --help >/dev/null
+          target/x86_64-pc-windows-msvc/release/stela.exe --help >/dev/null
 
       - uses: actions/upload-artifact@v4
         with:
