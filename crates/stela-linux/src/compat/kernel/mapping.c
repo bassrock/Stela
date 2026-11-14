@@ -162,7 +162,13 @@ int stela_linux_map(int fd, void *space, unsigned long address, size_t size, u64
 	/* Each fault fills from its page on; the next starts past what it filled. */
 	for (unsigned long at = address; at < address + size;
 	     at = max(at + PAGE_SIZE, (*result)->filled)) {
-		if (!stela_linux_refault(*result, at, true)) {
+		vm_fault_t fault = stela_linux_fault(*result, at, true);
+
+		if (!(fault & VM_FAULT_NOPAGE) || (fault & (VM_FAULT_ERROR | VM_FAULT_RETRY))) {
+			/* The client sees only EFAULT: say which page and why. */
+			pr_warn("client map of %zu bytes at offset %#llx: page %lu faulted %#x\n",
+				size, offset, (at - address) >> PAGE_SHIFT,
+				(unsigned int)fault);
 			stela_linux_munmap(*result);
 			return -EFAULT;
 		}
