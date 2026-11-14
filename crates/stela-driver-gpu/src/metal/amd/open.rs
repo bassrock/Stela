@@ -171,16 +171,28 @@ pub unsafe fn open(
     // SAFETY: the caller's guarantees; the stack names no Vulkan driver.
     let (mut backend, compiler) = unsafe { stack(loader, gpu.pci, exporter, compiler) }?;
     (loader.log)(&describe(backend.physical_device(), gpu.gc));
-    match first_submission(&mut backend) {
-        Ok(true) => (loader.log)("RADV first submission signaled"),
+    let failed = match first_submission(&mut backend) {
+        Ok(true) => {
+            (loader.log)("RADV first submission signaled");
+            None
+        }
         Ok(false) => {
             (loader.log)("RADV first submission did not signal within 2 s");
-            return Err(Error::Unsupported("a GPU whose first submission never signaled").into());
+            Some(Error::Unsupported(
+                "a GPU whose first submission never signaled",
+            ))
         }
         Err(error) => {
             (loader.log)(&format!("RADV first submission failed: {error:?}"));
-            return Err(error.into());
+            Some(error)
         }
+    };
+    if let Some(error) = failed {
+        // A GPU whose first work hung is one amdgpu resets, and releasing
+        // the device closes RADV's file, whose close waits, unbounded, for
+        // the VM work that reset holds back. The device stays unreleased.
+        core::mem::forget(backend);
+        return Err(error.into());
     }
     serve(backend, compiler, gpu, epoch)
 }

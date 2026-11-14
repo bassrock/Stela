@@ -102,9 +102,17 @@ pub(super) fn control(fd: c_int, request: u32, input: Option<&Input>, result: i6
     }
 }
 
-/// Reports a mapping of `size` bytes of `fd` at `offset` Linux refused.
+/// Whether a call's `result` is an error: `-4095..=-1`, as Linux's
+/// `IS_ERR_VALUE`. A mapping's address in the upper half of the address
+/// space reads as a negative number and is none.
+pub(super) fn is_error(result: i64) -> bool {
+    (-4095..=-1).contains(&result)
+}
+
+/// Reports a mapping of `size` bytes of `fd` at `offset` Linux refused with
+/// `result`; a mapped address is not reported.
 pub(super) fn map(fd: c_int, offset: u64, size: usize, result: i64) {
-    if turn() {
+    if is_error(result) && turn() {
         output::arguments(format_args!(
             "GPU DRM mmap fd={fd} offset={offset:#x} bytes={size:#x} refused: {}\n",
             Errno(result)
