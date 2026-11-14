@@ -2896,7 +2896,23 @@ fn start_devices(
             }
             host_usb = Some(usb);
             // The guest's controller hangs off the hub of its keyboard.
-            host_bluetooth = host_controller.filter(|_| options.input);
+            host_bluetooth = match host_controller {
+                Some(controller) if options.input => Some(controller),
+                // A controller the guest does not get is closed here: its
+                // drop cancels the USB transfers, which reaches the xHCI's
+                // registers, and those are mapped only in the loader's
+                // identity root. Dropped in the engine's root it page-faults
+                // on the controller's BAR (seen on an AMD X570 board, whose
+                // Intel AX200 Bluetooth shares a chipset xHCI).
+                Some(unused) => {
+                    // SAFETY: the loader's live root on the BSP, with no
+                    // driver guard held, as for `open` above.
+                    let _root = unsafe { storage::RestoreRoot::enter(root) };
+                    drop(unused);
+                    None
+                }
+                None => None,
+            };
             // With no adapter started, the screen names each one found and
             // why it stayed off, before the steps that need one say so.
             if links.devices.is_empty() && (wants_network || options.guest_network) {
