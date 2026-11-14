@@ -13,6 +13,8 @@
 //! pin fails the build until the list follows it. The services the composite
 //! reaches that nothing supplies are pinned in [`OPEN`] and written, with
 //! their importers, to `OUT_DIR/amdgpu-open-imports.txt`.
+#[cfg(feature = "amdgpu-dc")]
+use super::amdgpu_dc as dc;
 use super::image::{self, Port};
 use super::native::{self, Linux};
 use super::nouveau::{Member, members, open_imports, traps};
@@ -590,7 +592,7 @@ const OPEN: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "device model traps: links, which only HDMI audio adds and only APUs' USB-C power link removes, legacy DCE encoders' backlights, and platform devices, as for nouveau",
+        "device model traps: links, which only HDMI audio adds and only APUs' USB-C power link removes, backlights, which legacy DCE encoders and, with DC, eDP and LVDS panels register, and platform devices, as for nouveau",
         &[
             "device_link_add",
             "device_link_del",
@@ -627,10 +629,20 @@ const OPEN: &[(&str, &[&str])] = &[
 /// importers, and compares them with [`OPEN`].
 pub fn port(linux: &Linux) -> Port {
     check_objects();
-    let includes = INCLUDES.map(|directory| format!("amd/{directory}"));
+    #[cfg(feature = "amdgpu-dc")]
+    dc::check_objects(Path::new(AMD));
+    #[cfg_attr(not(feature = "amdgpu-dc"), allow(unused_mut))]
+    let mut includes = INCLUDES.map(|directory| format!("amd/{directory}")).to_vec();
+    // DC's `subdir-ccflags-y` reach every object of amdgpu's directory.
+    #[cfg(feature = "amdgpu-dc")]
+    includes.extend(dc::INCLUDES.iter().map(|directory| format!("amd/{directory}")));
     let includes = includes.iter().map(String::as_str).collect::<Vec<_>>();
     // The registration unit is compiled below, with its registrations captured.
-    let sources = OBJECTS
+    #[cfg_attr(not(feature = "amdgpu-dc"), allow(unused_mut))]
+    let mut objects = OBJECTS.to_vec();
+    #[cfg(feature = "amdgpu-dc")]
+    objects.extend(dc::OBJECTS.iter().filter(|object| !dc::FPU.contains(object)));
+    let sources = objects
         .iter()
         .filter(|object| **object != UNIT)
         .map(|object| Path::new(AMD).join(object).with_extension("c"))
@@ -642,6 +654,15 @@ pub fn port(linux: &Linux) -> Port {
         &native::drm_includes(&includes),
         Some(&MODULE),
     );
+    #[cfg(feature = "amdgpu-dc")]
+    {
+        for option in dc::KCONFIG {
+            build.define(option, "1");
+        }
+        for (name, value) in dc::DEFINES {
+            build.define(name, value);
+        }
+    }
     // The makefiles' `-Wno-override-init` is clang's `-Wno-initializer-overrides`,
     // already in Linux's profile.
     stela_c_build::linux_build::upstream_warnings(&mut build);
@@ -664,18 +685,20 @@ pub fn port(linux: &Linux) -> Port {
         .and_then(|jobs| jobs.parse().ok())
         .unwrap_or(1)
         .max(1);
-    let objects = thread::scope(|scope| {
-        sources
-            .chunks(sources.len().div_ceil(jobs))
-            .map(|chunk| {
-                let build = &build;
-                scope.spawn(move || build.clone().files(chunk).compile_intermediates())
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flat_map(|compiling| compiling.join().expect("a compiling thread"))
-            .collect::<Vec<_>>()
-    });
+    #[cfg_attr(not(feature = "amdgpu-dc"), allow(unused_mut))]
+    let mut objects = compile(&build, &sources, jobs);
+    // DC's floating-point objects, with Linux's CC_FLAGS_FPU after Stela's
+    // `-mgeneral-regs-only`: see `amdgpu_dc.rs`.
+    #[cfg(feature = "amdgpu-dc")]
+    {
+        let mut fpu = build.clone();
+        fpu.flag("-msse").flag("-msse2");
+        let sources = dc::FPU
+            .iter()
+            .map(|object| Path::new(AMD).join(object).with_extension("c"))
+            .collect::<Vec<_>>();
+        objects.extend(compile(&fpu, &sources, jobs));
+    }
     let unit = image::capture(&build, INITCALLS);
     build
         .objects(objects)
@@ -689,7 +712,11 @@ pub fn port(linux: &Linux) -> Port {
     println!("cargo:amdgpu_census={}", report.display());
     let mut open = open;
     let mut stale = Vec::new();
-    for symbol in OPEN.iter().flat_map(|(_, symbols)| symbols.iter()) {
+    #[cfg(not(feature = "amdgpu-dc"))]
+    let expected = OPEN.iter();
+    #[cfg(feature = "amdgpu-dc")]
+    let expected = OPEN.iter().chain(dc::OPEN);
+    for symbol in expected.flat_map(|(_, symbols)| symbols.iter()) {
         if !open.remove(*symbol) {
             stale.push(*symbol);
         }
@@ -703,6 +730,19 @@ pub fn port(linux: &Linux) -> Port {
         spec: INITCALLS,
         unit,
     }
+}
+
+/// `sources` compiled by `build` on `jobs` threads.
+fn compile(build: &cc::Build, sources: &[PathBuf], jobs: usize) -> Vec<PathBuf> {
+    thread::scope(|scope| {
+        sources
+            .chunks(sources.len().div_ceil(jobs))
+            .map(|chunk| scope.spawn(move || build.clone().files(chunk).compile_intermediates()))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|compiling| compiling.join().expect("a compiling thread"))
+            .collect()
+    })
 }
 
 /// Each open service with the composite's members that import it, or
