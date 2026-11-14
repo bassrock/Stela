@@ -102,6 +102,13 @@ u64 notrace ktime_get_mono_fast_ns(void)
 	return (u64)ktime_get();
 }
 
+/* CLOCK_MONOTONIC_RAW: the monotonic clock without NTP's frequency
+ * adjustment. The owner's clock is never slewed, so it is the same reading. */
+ktime_t ktime_get_raw(void)
+{
+	return ktime_get();
+}
+
 /* CLOCK_REALTIME's seconds, the epoch's when the owner has no UTC source. */
 time64_t ktime_get_real_seconds(void)
 {
