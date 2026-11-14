@@ -45,9 +45,8 @@ pub fn refused(vendor: Vendor, address: &str, device: u16, reason: Reason) -> St
              {SUPPORTED}"
         ),
         (Some(chip), Reason::MissingFirmware) => format!(
-            "the USB has no firmware for this PC's NVIDIA {chip} GPU. On another computer, run \
-             `stela setup host-firmware fetch --gpu {chip} --usb USB` (USB: this USB's STELA \
-             volume)"
+            "the USB has no firmware for this PC's NVIDIA {chip} GPU. On another computer, plug \
+             in this USB and run `stela repair`"
         ),
         (Some(chip), Reason::Other) => format!(
             "the NVIDIA {chip} GPU at {address} did not start; the boot log on this USB says why"
@@ -140,10 +139,7 @@ mod tests {
     fn a_refused_gpu_is_named_with_its_fix() {
         let missing = refused(Vendor::Nvidia, "01:00.0", 0x2484, Reason::MissingFirmware);
         assert!(missing.contains("NVIDIA ga104 GPU"), "{missing}");
-        assert!(
-            missing.contains("`stela setup host-firmware fetch --gpu ga104 --usb USB`"),
-            "{missing}"
-        );
+        assert!(missing.ends_with("run `stela repair`"), "{missing}");
         let other = refused(Vendor::Nvidia, "03:00.0", 0x2b85, Reason::Other);
         assert_eq!(
             other,
