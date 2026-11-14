@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Brooks <bass_rock@me.com>
+Date: Sat, 14 Nov 2026 16:33:53 +0000
+Subject: [PATCH] radv: build a stage from
+ VkPipelineShaderStageNirCreateInfoMESA, as for a module made from NIR
+
+A stage given as NIR alone, with no module, SPIR-V or module identifier,
+was skipped. The NIR now becomes the stage's internal NIR, which RADV
+already compiles for its meta shaders' modules; the stage's hash is the
+NIR's, as vk_pipeline_hash_shader_stage takes it.
+---
+ src/amd/vulkan/radv_pipeline.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/amd/vulkan/radv_pipeline.c b/src/amd/vulkan/radv_pipeline.c
+index c73afe08e149f4fbdbce774fbe8afdfd24db54b1..d62f602ab68dc76c823997efa4b7e9ce956d866d 100644
+--- a/src/amd/vulkan/radv_pipeline.c
++++ b/src/amd/vulkan/radv_pipeline.c
+@@ -190,8 +190,13 @@ radv_pipeline_stage_init(VkPipelineCreateFlags2 pipeline_flags, const VkPipeline
+    const VkShaderModuleCreateInfo *minfo = vk_find_struct_const(sinfo->pNext, SHADER_MODULE_CREATE_INFO);
+    const VkPipelineShaderStageModuleIdentifierCreateInfoEXT *iinfo =
+       vk_find_struct_const(sinfo->pNext, PIPELINE_SHADER_STAGE_MODULE_IDENTIFIER_CREATE_INFO_EXT);
++   /* A stage may come as NIR alone, as the runtime's meta shaders and
++    * Stela's Metal device give theirs: the shader is that NIR, as a module's
++    * is for a module made from NIR. */
++   const VkPipelineShaderStageNirCreateInfoMESA *ninfo =
++      vk_find_struct_const(sinfo->pNext, PIPELINE_SHADER_STAGE_NIR_CREATE_INFO_MESA);
+ 
+-   if (sinfo->module == VK_NULL_HANDLE && !minfo && !iinfo)
++   if (sinfo->module == VK_NULL_HANDLE && !minfo && !iinfo && !ninfo)
+       return;
+ 
+    memset(out_stage, 0, sizeof(*out_stage));
+@@ -215,6 +220,8 @@ radv_pipeline_stage_init(VkPipelineCreateFlags2 pipeline_flags, const VkPipeline
+    } else if (minfo) {
+       out_stage->spirv.data = (const char *)minfo->pCode;
+       out_stage->spirv.size = minfo->codeSize;
++   } else if (ninfo) {
++      out_stage->internal_nir = ninfo->nir;
+    }
+ 
+    const VkShaderDescriptorSetAndBindingMappingInfoEXT *mapping =
