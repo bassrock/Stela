@@ -74,7 +74,10 @@ fn from_disk(
     // The automatic Metal plugin repair NVRAM asked for is the manual
     // remedy's boot: single-user, filesystem protection off.
     let maintenance_write = options.maintenance_write || options.bundle_repair;
-    let single_user = options.single_user || options.bundle_repair;
+    let single_user = options.single_user || options.bundle_repair || options.console_diagnose;
+    if options.console_diagnose {
+        bundle_repair::diagnose();
+    }
     if maintenance_write {
         // CSR_ALLOW_UNRESTRICTED_FS; the kext grant and other policy bits stay separate.
         defaults.security.sip_bits |= 2;

@@ -15,6 +15,14 @@ use stela_formats::boot_bundle::Nvram;
 use stela_soc_data::nor::{Image, nvram::Variables};
 
 static BOOT: AtomicU8 = AtomicU8::new(0);
+/// A `--console-diagnose` boot: the console driver types the diagnostic
+/// steps, and nothing of it reaches NVRAM's repair record.
+static DIAGNOSE: AtomicBool = AtomicBool::new(false);
+
+/// Mark this boot a `--console-diagnose` boot, before the guest starts.
+pub(super) fn diagnose() {
+    DIAGNOSE.store(true, Ordering::Relaxed);
+}
 static RECORD: AtomicU8 = AtomicU8::new(0);
 /// The machine state is open, so the stop can write NVRAM.
 static PERSISTENT: AtomicBool = AtomicBool::new(false);
@@ -124,6 +132,9 @@ pub(super) fn missing(attempted: bool) -> String {
 /// How this repair boot went, as its console driver knows it: kept for the
 /// stop, which records it, whether the guest or the engine restarts.
 pub(super) fn outcome(outcome: &Outcome) {
+    if DIAGNOSE.load(Ordering::Relaxed) {
+        return;
+    }
     OUTCOME.store(outcome.encode(), Ordering::Relaxed);
 }
 
@@ -131,7 +142,7 @@ pub(super) fn outcome(outcome: &Outcome) {
 /// (`bundle_repair::Failure::unanswered`): the stop asks for one more
 /// maintenance boot, unless this was it. Whether it does.
 pub(super) fn unanswered() -> bool {
-    if !PERSISTENT.load(Ordering::Relaxed) {
+    if DIAGNOSE.load(Ordering::Relaxed) || !PERSISTENT.load(Ordering::Relaxed) {
         return false;
     }
     let Some(change) = bundle_repair::retry(this_record()) else {
@@ -304,6 +315,12 @@ pub(super) fn restart_refusal() -> Option<String> {
 
 /// The console driver of a repair boot, started with the guest.
 pub(super) fn driver(now_millis: u64) -> Option<Driver> {
+    if DIAGNOSE.load(Ordering::Relaxed) {
+        output::arguments(format_args!(
+            "BUNDLE REPAIR console diagnosis boot: typing the diagnostic steps\n"
+        ));
+        return Some(Driver::new(bundle_repair::diagnose_steps(), now_millis));
+    }
     (this_boot() == Boot::Repair).then(|| {
         output::arguments(format_args!(
             "BUNDLE REPAIR maintenance boot: single-user, filesystem protection off\n"

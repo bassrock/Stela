@@ -38,6 +38,7 @@ impl ParseState<'_> {
             "--profile" => options.profile = true,
             MAINTENANCE_WRITE => options.maintenance_write = true,
             SINGLE_USER => options.single_user = true,
+            CONSOLE_DIAGNOSE => options.console_diagnose = true,
             SCANOUT_MIRROR => options.scanout_mirror = true,
             "--monitor-trace" => options.monitor_trace = true,
             "--display-trace" => options.display_trace = true,

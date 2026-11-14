@@ -400,6 +400,35 @@ pub struct Step {
     pub required: bool,
 }
 
+/// A `--console-diagnose` boot's commands: unlock the Data volume and print
+/// the newest crash reports of WindowServer and the GPU's Metal clients, so
+/// the boot log carries what a missing desktop leaves only on the disk.
+pub fn diagnose_steps() -> Vec<Step> {
+    let optional = |command: &str, seconds| Step {
+        command: command.into(),
+        seconds,
+        required: false,
+    };
+    const REPORTS: &str = "/Library/Logs/DiagnosticReports";
+    Vec::from([
+        optional("/sbin/mount -P 1", 120),
+        optional("/usr/libexec/init_data_protection", 180),
+        optional("/sbin/mount -P 2", 180),
+        optional(&format!("/bin/ls -lt {REPORTS} {REPORTS}/Retired 2>&1 | /usr/bin/head -40"), 30),
+        optional(
+            &format!(
+                "for f in $(/bin/ls -t {REPORTS}/WindowServer* 2>/dev/null | /usr/bin/head -2); do echo \"== $f\"; /usr/bin/head -c 16000 \"$f\"; echo; done"
+            ),
+            120,
+        ),
+        optional(
+            "/bin/ls -la /System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle/Contents /System/Volumes/Data/Library/GPUBundles/StelaGPU.bundle/Contents/MacOS 2>&1",
+            30,
+        ),
+        optional("/usr/sbin/ioreg -l -w0 -r -c StelaGPU 2>&1 | /usr/bin/head -60", 60),
+    ])
+}
+
 /// The repair's commands, in order, each answered by its exit status.
 pub fn steps() -> Vec<Step> {
     let directories = DIRECTORIES

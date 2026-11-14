@@ -41,6 +41,9 @@ pub const DISPLAY_SIZE: &str = "--display-size";
 pub const MAINTENANCE_WRITE: &str = "--maintenance-write";
 /// Boots the installed system to its single-user shell.
 pub const SINGLE_USER: &str = "--single-user";
+/// Boots single-user and has the engine type diagnostic commands (the
+/// newest WindowServer crash reports) at its console, logging what they print.
+pub const CONSOLE_DIAGNOSE: &str = "--console-diagnose";
 /// Keeps the newest presented frame at one logged address.
 pub const SCANOUT_MIRROR: &str = "--scanout-mirror";
 pub const WIFI: &str = "--wifi";
@@ -211,6 +214,8 @@ pub struct System {
     pub maintenance_write: bool,
     /// Boot the installed system single-user, for maintenance at its console.
     pub single_user: bool,
+    /// Single-user, with the engine typing diagnostic commands ([`CONSOLE_DIAGNOSE`]).
+    pub console_diagnose: bool,
     /// This boot is the automatic Metal plugin repair NVRAM asked for
     /// (`--bundle-repair`, never from `stela.cfg`): single-user with
     /// filesystem protection off, its console driven by the engine
@@ -372,6 +377,7 @@ impl Default for System {
             safe_boot: false,
             maintenance_write: false,
             single_user: false,
+            console_diagnose: false,
             bundle_repair: false,
             scanout_mirror: false,
             boot_command: None,
@@ -801,6 +807,7 @@ impl fmt::Display for System {
         line.flag(boot_selection::SAFE_BOOT_OPTION, self.safe_boot)?;
         line.flag(MAINTENANCE_WRITE, self.maintenance_write)?;
         line.flag(SINGLE_USER, self.single_user)?;
+        line.flag(CONSOLE_DIAGNOSE, self.console_diagnose)?;
         line.flag(boot_selection::BUNDLE_REPAIR_OPTION, self.bundle_repair)?;
         line.flag(SCANOUT_MIRROR, self.scanout_mirror)?;
         line.flag(boot_selection::UPGRADE_OPTION, self.upgrade)?;
