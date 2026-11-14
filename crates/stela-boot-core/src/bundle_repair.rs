@@ -409,26 +409,39 @@ pub fn diagnose_steps() -> Vec<Step> {
         seconds,
         required: false,
     };
-    const LOG: &str = "/usr/bin/log show --last 3h --style compact --info --debug";
-    Vec::from([
+    // A LaunchDaemon the next multi-user boot runs once WindowServer has
+    // tried: it prints the accelerators, the framebuffer and WindowServer's
+    // and Metal's unified log to the console, which the boot log keeps.
+    const DIR: &str = "/Library/StelaDiag";
+    const SCRIPT: &str = "/Library/StelaDiag/diag.sh";
+    const PLIST: &str = "/Library/LaunchDaemons/com.stela.diag.plist";
+    let script = [
+        r#"'#!/bin/sh' 'exec > /dev/console 2>&1' 'sleep 100' 'echo STELADIAG begin'"#,
+        r#"'/usr/sbin/ioreg -l -w0 -r -c IOAccelerator | /usr/bin/head -150' '/usr/sbin/ioreg -l -w0 -r -c IOMobileFramebuffer | /usr/bin/grep -i -E "accel|gpu|metal|IOClass" | /usr/bin/head -40'"#,
+        r#"'/usr/bin/log show --last 5m --style compact --predicate "process == \"WindowServer\"" | /usr/bin/grep -v -i "keystore" | /usr/bin/tail -220'"#,
+        r#"'/usr/bin/log show --last 5m --style compact --predicate "subsystem BEGINSWITH \"com.apple.Metal\" OR eventMessage CONTAINS[c] \"StelaGPU\" OR eventMessage CONTAINS[c] \"MTLDevice\"" | /usr/bin/tail -100' 'echo STELADIAG end'"#,
+    ];
+    let mut steps = Vec::from([
         optional("/sbin/mount -P 1", 120),
         optional("/usr/libexec/init_data_protection", 180),
         optional("/sbin/mount -P 2", 180),
-        optional("(/usr/libexec/logd &) ; /bin/sleep 5; /bin/echo logd started", 30),
+        optional(&format!("/bin/mkdir -p {DIR} && /bin/rm -f {SCRIPT}"), 30),
+    ]);
+    for lines in script {
+        steps.push(optional(&format!("/usr/bin/printf '%s\\n' {lines} >> {SCRIPT}"), 30));
+    }
+    steps.extend([
+        optional(&format!("/bin/chmod 755 {SCRIPT} && /bin/cat {SCRIPT}"), 30),
         optional(
             &format!(
-                "{LOG} --predicate 'process == \"WindowServer\" AND (messageType == error OR messageType == fault OR eventMessage CONTAINS[c] \"metal\" OR eventMessage CONTAINS[c] \"device\" OR eventMessage CONTAINS[c] \"accelerator\")' 2>&1 | /usr/bin/tail -120"
+                "/usr/bin/printf '%s\\n' '<?xml version=\"1.0\" encoding=\"UTF-8\"?>' '<plist version=\"1.0\"><dict><key>Label</key><string>com.stela.diag</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>{SCRIPT}</string></array><key>RunAtLoad</key><true/></dict></plist>' > {PLIST}"
             ),
-            600,
+            30,
         ),
-        optional(
-            &format!(
-                "{LOG} --predicate 'eventMessage CONTAINS[c] \"StelaGPU\" OR eventMessage CONTAINS[c] \"GPUBundles\" OR eventMessage CONTAINS[c] \"MTLCopyAllDevices\" OR subsystem == \"com.apple.Metal\"' 2>&1 | /usr/bin/tail -80"
-            ),
-            600,
-        ),
-        optional("/usr/sbin/ioreg -l -w0 -p IODeviceTree 2>&1 | /usr/bin/grep -i -B4 -A40 'stela' | /usr/bin/head -120", 60),
-    ])
+        optional(&format!("/usr/sbin/chown root:wheel {PLIST} && /bin/chmod 644 {PLIST} && /bin/cat {PLIST}"), 30),
+        optional("/bin/sync", 60),
+    ]);
+    steps
 }
 
 /// The repair's commands, in order, each answered by its exit status.
