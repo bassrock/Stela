@@ -228,6 +228,25 @@ fn between_drivers<T>(between: impl FnOnce() -> T) -> T {
     result
 }
 
+/// Store the USB's log from anywhere: where this processor holds the host
+/// drivers' lock (a dispatch, as the GPU's Linux start), as a point between
+/// two drivers' calls with interrupts masked, so the held log partition is
+/// driven directly; elsewhere as [`output::flush_log`].
+pub(crate) fn store_log_held() {
+    if host_drivers_held_here() {
+        let flags: u64;
+        // SAFETY: saves RFLAGS and masks interrupts on this processor only.
+        unsafe { core::arch::asm!("pushfq", "pop {}", "cli", out(reg) flags) };
+        between_drivers(output::store_usb_log);
+        if flags & 0x200 != 0 {
+            // SAFETY: restores the interrupt flag this function cleared.
+            unsafe { core::arch::asm!("sti") };
+        }
+    } else {
+        output::flush_log();
+    }
+}
+
 /// Counter ticks cores waited for [`HOST_DRIVERS`] since the last report,
 /// and the longest wait.
 static HOST_DRIVERS_WAITED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];

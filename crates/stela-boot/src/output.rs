@@ -893,7 +893,7 @@ pub fn terminate(code: u32) -> ! {
     // Why it stopped is at the end of what is queued, and the log's USB disk
     // may be what stopped.
     unqueue_serial();
-    flush_log();
+    crate::engine::store_log_held();
     halt(code)
 }
 
@@ -981,7 +981,7 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
     // The reason is on the screen before the last store, which may be what
     // fails, and the advice after it says whether the log was kept.
     stopped(&message, &|| {
-        flush_log();
+        crate::engine::store_log_held();
         stopped_text()
     });
     terminate(0x11)

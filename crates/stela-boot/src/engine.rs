@@ -1372,6 +1372,11 @@ pub(crate) fn inside_host_drivers() -> bool {
     storage::host_drivers_held_here() && !storage::between_drivers_here()
 }
 
+/// Store the USB's log, also from inside a dispatch ([`storage::store_log_held`]).
+pub(crate) fn store_log_held() {
+    storage::store_log_held()
+}
+
 /// Whether this processor is starting the host's devices, holding their
 /// lock by design rather than stopped inside a driver: the start stores
 /// the USB's log itself between two devices.

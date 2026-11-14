@@ -734,9 +734,13 @@ impl KernelWork {
             return Err(Error::Work(WorkError::Busy));
         }
         self.dispatch(|_| {
+            crate::output::arguments(format_args!("GPU Linux: inside dispatch\n"));
+            super::store_log_held();
             // SAFETY: dispatch entered the kept loader root on the owning
             // BSP. This scope ends after every active frame returns or parks.
             let execution = unsafe { clock.enter_driver_execution()? };
+            crate::output::arguments(format_args!("GPU Linux: entered driver execution\n"));
+            super::store_log_held();
             self.linux_execution.set(Some(NonNull::from(&execution)));
             let _clear = ClearLinuxExecution(&self.linux_execution);
             body(self.executor.runtime())
