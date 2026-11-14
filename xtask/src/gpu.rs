@@ -154,6 +154,6 @@ pub fn default_jobs() -> u16 {
 
 /// Prepare the complete native rendering archive and its guest components.
 pub fn build_nvk(jobs: u16) -> Result<()> {
-    nvk::build(jobs)?;
+    nvk::build(&nvk::NVK, jobs)?;
     crate::guest::run()
 }
