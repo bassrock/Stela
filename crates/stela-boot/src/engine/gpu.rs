@@ -30,6 +30,8 @@ mod kext {
     ));
 }
 #[cfg(feature = "metal-device")]
+mod refused;
+#[cfg(feature = "metal-device")]
 mod slice;
 #[cfg(feature = "metal-device")]
 mod stack;
