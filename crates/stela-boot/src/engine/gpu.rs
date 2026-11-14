@@ -147,6 +147,8 @@ const AMDGPU: Driver = Driver {
 const START_SECONDS: u64 = 600;
 /// The longest idle wait while they do, which the timeout above is checked at.
 const WAIT_MICROS: u64 = 10_000;
+/// How often a long wait in the start says where it is ([`wait_for_child`]).
+const WAIT_REPORT_SECONDS: u64 = 2;
 /// The longest one pump runs Linux between the boot PE's slices. What is
 /// still runnable stays pending for the next, so a busy driver shares the
 /// boot CPU with the guest and the host's devices instead of holding it.
@@ -940,7 +942,7 @@ fn select_firmware<E>(
     }
     if !available {
         output::arguments(format_args!(
-            "GPU {name}: the USB's firmware bundle lacks this chip's files; `stela setup repair` \
+            "GPU {name}: the USB's firmware bundle lacks this chip's files; `stela repair` \
              completes it\n"
         ));
         return Err(ServiceError::Refused(NO_FIRMWARE));
@@ -975,58 +977,67 @@ fn claim(
     adapter: &gpu::Adapter,
     driver: &'static Driver,
     line: u32,
-    gop: Option<crate::pci_io::FramebufferSource>,
+    gop: crate::pci_io::ScreenOwner,
     catalog: Arc<Catalog>,
 ) -> Result<Claimed, ServiceError> {
+    use crate::pci_io::ScreenOwner;
     let address = adapter.address;
     let timer = services.minimum_delay()?;
     let mut requester = services.prepare_requester(address)?;
+    let bus_reset = requester.bus_reset_available();
     let function = requester.function_mut();
     if (function.vendor, function.device, function.class)
         != (driver.vendor, adapter.device, adapter.class)
     {
         return Err(ServiceError::Refused("the GPU's original identity changed"));
     }
-    gpu::cold::check_candidate(function, timer.as_ref())
+    let translated = services.dma_translated(address);
+    gpu::cold::check_candidate(function, timer.as_ref(), translated, bus_reset)
         .map_err(|error| cold_refusal(address, error))?;
-    if let Some(source) = gop.filter(|source| source.address == address) {
-        // amdgpu is built without its display core: it takes the firmware's
-        // screen and puts nothing in its place. On a PC whose only GPU is
-        // this one (a Ryzen without integrated graphics, such as a 5950X
-        // with an RX 6800 XT), there is no other screen to move to, so the
-        // claim goes ahead headless: the screen goes dark here and the boot
-        // log on the USB is the only record from this point.
-        if driver.vendor == AMDGPU.vendor {
-            output::arguments(format_args!(
-                "GPU {address}: the firmware's screen is on this AMD GPU, which amdgpu cannot \
-                 display on yet: claiming it headless, the screen goes dark now and the boot \
-                 log on the USB continues\n"
-            ));
-        }
-        let checked = source.bar.words().try_for_each(|(offset, expected)| {
-            let observed = function
-                .config()
-                .read32(offset)
-                .map_err(ServiceError::Config)?;
-            if observed != expected {
-                return Err(ServiceError::Config(ConfigError::before_effect(
-                    ConfigFailure::Readback {
-                        offset,
-                        width: 4,
-                        expected,
-                        observed,
-                    },
-                )));
+    let owns_screen = match gop {
+        ScreenOwner::Function(source) if source.address == address => {
+            source.bar.words().try_for_each(|(offset, expected)| {
+                let observed = function
+                    .config()
+                    .read32(offset)
+                    .map_err(ServiceError::Config)?;
+                if observed != expected {
+                    return Err(ServiceError::Config(ConfigError::before_effect(
+                        ConfigFailure::Readback {
+                            offset,
+                            width: 4,
+                            expected,
+                            observed,
+                        },
+                    )));
+                }
+                Ok(())
+            })?;
+            // amdgpu is built without its display core: it takes the
+            // firmware's screen and puts nothing in its place. On a PC whose
+            // only GPU is this one (a Ryzen without integrated graphics, such
+            // as a 5950X with an RX 6800 XT), there is no other screen to
+            // move to, so the claim goes ahead headless: the screen goes dark
+            // here and the boot log on the USB is the only record from this
+            // point.
+            if driver.vendor == AMDGPU.vendor {
+                output::arguments(format_args!(
+                    "GPU {address}: the firmware's screen is on this AMD GPU, which amdgpu \
+                     cannot display on yet: claiming it headless, the screen goes dark now and \
+                     the boot log on the USB continues\n"
+                ));
             }
-            Ok(())
-        });
-        // BAR sizing below temporarily turns off memory decode.
-        checked?;
-        if !crate::console::retire_firmware() {
-            return Err(ServiceError::Refused(
-                "a firmware framebuffer writer is still active",
-            ));
+            true
         }
+        // Any GPU may show the screen, so none starts beside its writer.
+        ScreenOwner::Unknown => true,
+        ScreenOwner::Function(_) | ScreenOwner::NoScreen => false,
+    };
+    // BAR sizing below temporarily turns off memory decode.
+    if owns_screen && !crate::console::retire_firmware() {
+        return Err(ServiceError::Refused(
+            "a firmware framebuffer writer is still active",
+        ));
     }
     let mut placement = Placement {
         bus: address.bus,
@@ -1134,7 +1145,7 @@ fn claim(
         alloc::format!("GPU{line}PCIID"),
         alloc::format!("{:04x}:{:04x}", driver.vendor, adapter.device),
     );
-    let ready = gpu::cold::Cold::new(gpu::cold::Inputs {
+    let mut cold = gpu::cold::Cold::new(gpu::cold::Inputs {
         requester,
         views: GpuViews {
             config,
@@ -1143,9 +1154,28 @@ fn claim(
             first,
         },
         timer,
-    })
-    .quiesce_and_bind()
-    .map_err(|failure| cold_refusal(address, failure.error))?;
+    });
+    if translated {
+        // SAFETY: the mount's active remapper translates this requester, and
+        // its private domain is the one the cold attempt binds.
+        cold = unsafe { cold.translated() };
+    }
+    let ready = cold
+        .quiesce_and_bind()
+        .map_err(|failure| cold_refusal(address, failure.error))?;
+    match ready.reset() {
+        None => output::arguments(format_args!(
+            "GPU {address}: no function-local reset; started as firmware left it, DMA translated\n"
+        )),
+        Some(gpu::cold::Reset::SecondaryBus) => output::arguments(format_args!(
+            "GPU {address}: no function-local reset; reset through its bridge's secondary bus\n"
+        )),
+        Some(gpu::cold::Reset::Driver) => output::arguments(format_args!(
+            "GPU {address}: no reset at claim; {} resets it itself\n",
+            driver.name
+        )),
+        Some(gpu::cold::Reset::Function(_)) => {}
+    }
     output::arguments(format_args!("GPU {address}: bound for its driver\n"));
     // SAFETY: both original owners transfer into this retained function
     // lifetime before Linux probe. Only the temporary UC observation is retired.
@@ -1375,7 +1405,7 @@ fn driver_of(adapter: &gpu::Adapter) -> Option<&'static Driver> {
 pub(super) fn claim_all(
     services: &dyn NativeServices,
     adapters: &[gpu::Adapter],
-    gop: Result<Option<crate::pci_io::FramebufferSource>, String>,
+    gop: Result<crate::pci_io::ScreenOwner, String>,
     catalog: Option<&Arc<Catalog>>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::Reason;
@@ -1665,14 +1695,22 @@ pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
     Vec::new()
 }
 
-/// Takes the display for the GPUs [`open`] bound, in the firmware's `screen`
-/// size if it can, and opens their Metal services.
+/// Takes the display for the GPUs [`open`] bound, in the monitor's own mode
+/// or else the firmware's `screen` size, and opens their Metal services. `firmware` names the PCI
+/// function that showed the firmware's picture, `None` when there was a
+/// picture whose function is unknown.
 pub(super) fn serve(
-    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: (usize, usize),
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] screen: Option<(usize, usize)>,
+    #[cfg_attr(not(feature = "nvk"), allow(unused_variables))] firmware: Option<&str>,
 ) {
     #[cfg(feature = "nvk")]
     {
-        display::take(screen);
+        let shown = match (screen, firmware) {
+            (None, _) => display::Shown::Nothing,
+            (Some(_), None) => display::Shown::Unknown,
+            (Some(_), Some(function)) => display::Shown::By(function),
+        };
+        display::take(screen.unwrap_or((0, 0)), shown);
         gate::open_service();
     }
 }
@@ -1682,7 +1720,7 @@ pub(super) fn serve(
 /// beneath it.
 pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error> {
     output::arguments(format_args!("GPU Linux: open with {} claimed\n", claimed.len()));
-    super::store_log_held();
+    output::flush_log();
     // Keep the exact original claims on every partial startup refusal.
     let claimed = ManuallyDrop::new(claimed);
     let Machine {
@@ -1775,7 +1813,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
     #[cfg(feature = "nvk")]
     BOOT_CPU.store(host::processor(), Ordering::Relaxed);
     output::arguments(format_args!("GPU Linux: dispatching\n"));
-    super::store_log_held();
+    output::flush_log();
     let (owner, threads, job) = work.dispatch_linux(|runtime| {
         Ok(mount_and_start(
             work,
@@ -1857,7 +1895,7 @@ fn mount_and_start(
         .map_err(environment_error)?;
     let started = host::rdtsc();
     output::arguments(format_args!("GPU Linux: creating the kernel owner\n"));
-    super::store_log_held();
+    output::flush_log();
     // SAFETY: the enclosing dispatch owns this exact root/CPU/clock and
     // queue. The original heap, executable backing, platform and catalogue
     // stay retained permanently, including any partial kernel publication.
@@ -1876,10 +1914,10 @@ fn mount_and_start(
     // SAFETY: this same native dispatcher owns the already claimed kernel
     // and no task has been published. The catalogue must retain this owner.
     output::arguments(format_args!("GPU Linux: registering pages\n"));
-    super::store_log_held();
+    output::flush_log();
     let pages = unsafe { work.register_linux_pages(owner.as_ref()) }?;
     output::arguments(format_args!("GPU Linux: installing task runtime\n"));
-    super::store_log_held();
+    output::flush_log();
     // SAFETY: the permanent, same-owner runtime, catalogue and service
     // domain were installed above. No original child has started yet.
     let threads = unsafe { TaskRuntime::install(owner.clone(), runtime, pages, SLOTS) }
@@ -1888,7 +1926,7 @@ fn mount_and_start(
     // Reserve the error envelope before Initial can publish native state.
     let initial_failure = Box::new_uninit();
     output::arguments(format_args!("GPU Linux: starting the initial task\n"));
-    super::store_log_held();
+    output::flush_log();
     // SAFETY: this exact source, root and broker remain kept on refusal. Each
     // runtime step runs inside the same live native execution segment.
     unsafe { Pin::new(owner.as_ref()).start_initial(work.linux_root(), threads) }
@@ -1897,7 +1935,7 @@ fn mount_and_start(
     // SAFETY: submit via this actual original task broker. The service
     // initializes the original resources before dispatching accepted jobs.
     output::arguments(format_args!("GPU Linux: starting SRCU\n"));
-    super::store_log_held();
+    output::flush_log();
     let srcu = unsafe { stela_linux::srcu::Bootstrap::start(owner.clone(), threads) }
         .map_err(|failure| Error::SrcuStart(failure.error))?;
     wait_for_child(
@@ -1905,13 +1943,14 @@ fn mount_and_start(
         threads,
         time,
         deadline,
+        "Linux's first tasks",
         || matches!(srcu.status(), stela_linux::srcu::Status::Pending(status) if status.joined),
     )?;
     // SAFETY: the taskless dispatcher observed the original joined job.
     // Only this consuming join can acknowledge public SRCU admission.
     let ready = unsafe { srcu.join() }.map_err(|failure| Error::Srcu(failure.error))?;
     output::arguments(format_args!("GPU Linux: SRCU ready, submitting the probe\n"));
-    super::store_log_held();
+    output::flush_log();
     let probing = host::rdtsc();
     START_TICKS[0].store(probing.wrapping_sub(started), Ordering::Relaxed);
     let completed = Rc::new(Cell::new(None));
@@ -1923,7 +1962,9 @@ fn mount_and_start(
     // SAFETY: the ready original task broker keeps the callback and all
     // original owners until its genuine managed child has joined.
     let pending = unsafe { threads.submit(job) }.map_err(|refusal| Error::Submit(refusal.error))?;
-    wait_for_child(runtime, threads, time, deadline, || pending.status().joined)?;
+    wait_for_child(runtime, threads, time, deadline, "the GPU's probe", || {
+        pending.status().joined
+    })?;
     // SAFETY: physical return on the same dispatcher with the joined status.
     let joined =
         unsafe { pending.try_join() }.map_err(|_| environment_error(WorkError::Pending))?;
@@ -1939,33 +1980,49 @@ fn mount_and_start(
     Ok((owner, threads, job))
 }
 
+/// Wait for `stage` of the start, which Linux's tasks run, until `finished`
+/// or `deadline` on `time`. A long wait says every
+/// [`WAIT_REPORT_SECONDS`] how long it has waited by the counter and by
+/// Linux's clock, and how many service steps it took, and stores the USB's
+/// log: a start that never returns then shows whether this loop still
+/// runs, whether Linux's clock moves, and which stage it waits for. The
+/// counter ends the wait after [`START_SECONDS`] even when the clock
+/// stands still.
 fn wait_for_child(
     runtime: Pin<&stela_drivers::platform::work::Runtime<SLOTS>>,
     threads: &LinuxThreads,
     time: &dyn Clock,
     deadline: u64,
+    stage: &str,
     finished: impl Fn() -> bool,
 ) -> Result<(), Error> {
+    let began = host::rdtsc();
+    let began_ns = time.now_ns().map_err(environment_error)?;
+    let mut steps = 0u64;
+    let mut reports = 0u64;
     loop {
         // SAFETY: runtime is on its dispatcher after real physical return.
         unsafe { threads.dispatcher_step() }.map_err(Error::Threads)?;
         if finished() {
             return Ok(());
         }
-        // Store the USB log on its period while Linux runs, so a probe that
-        // never returns still leaves its LINUX lines on the stick.
-        {
-            static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-            let now = host::rdtsc();
-            if now.wrapping_sub(LAST.load(Ordering::Relaxed)) > 7_000_000_000 {
-                LAST.store(now, Ordering::Relaxed);
-                super::store_log_held();
-            }
-        }
-        if time.now_ns().map_err(environment_error)? >= deadline {
+        let now = time.now_ns().map_err(environment_error)?;
+        let waited_ms = output::millis_since(began);
+        // The counter bounds the wait too, when Linux's clock stands still.
+        if now >= deadline || waited_ms >= START_SECONDS * 1000 {
             return Err(Error::Timeout);
         }
+        if waited_ms / 1000 / WAIT_REPORT_SECONDS > reports {
+            reports = waited_ms / 1000 / WAIT_REPORT_SECONDS;
+            output::arguments(format_args!(
+                "GPU START waiting for {stage}: {waited_ms} ms by the counter, {} ms by \
+                 Linux's clock, {steps} steps\n",
+                now.saturating_sub(began_ns) / 1_000_000,
+            ));
+            super::storage::store_usb_log_in_gpu_start();
+        }
         runtime.step_or_idle().map_err(environment_error)?;
+        steps += 1;
     }
 }
 

@@ -52,11 +52,34 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
                 self.write(offset, 0)?;
             }
         }
-        // Its event and wait bits are cleared by writing them.
+        // Its event and wait bits are cleared by writing them, as are the
+        // hardware errors the firmware saw.
         if status != 0 {
             self.write(STATUS, status)?;
         }
+        if self.hardware_errors {
+            let errors = self.read(HARDWARE_EVENT_STATUS)?;
+            if errors != 0 {
+                self.write(HARDWARE_EVENT_STATUS, errors)?;
+            }
+        }
         Ok(())
+    }
+    /// Whether the unit reads off within its wait: no enable set and
+    /// neither ring running.
+    pub(super) fn stopped(&self) -> bool {
+        let deadline = self.resources.platform.clock().deadline(self.wait_us);
+        loop {
+            if self.read(CONTROL) == Ok(0)
+                && self.read(STATUS).is_ok_and(|status| status & RUNNING == 0)
+            {
+                return true;
+            }
+            if deadline.passed() {
+                return false;
+            }
+            self.resources.platform.relax();
+        }
     }
     pub(super) fn check_cold(&self) -> Result<(), Error> {
         for register in [
@@ -99,14 +122,24 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
         self.write(COMMAND_TAIL, 0)?;
         self.write(EVENT_HEAD, 0)?;
         self.write(EVENT_TAIL, 0)?;
-        self.write(CONTROL, self.control)?;
+        let requested = self.control.get();
+        self.write(CONTROL, requested)?;
         let deadline = self.resources.platform.clock().deadline(self.wait_us);
         loop {
             self.resources.platform.relax();
-            if self.read(CONTROL)? != self.control {
+            // As Linux, which never reads it back, a unit may hard-wire the
+            // IVHD's optional flag bits (HtTunEn, PassPW, ResPassPW, Isoc)
+            // to zero. The enables and Coherent, on which the table and ring
+            // coherence rely, must hold, and no bit may appear that was not
+            // written. The value read is what the health check then holds.
+            let control = self.read(CONTROL)?;
+            if control & STARTED != STARTED || control & !requested != 0 {
                 return Err(Error::Fault);
             }
-            if self.read(STATUS)? == RUNNING {
+            self.control.set(control);
+            // An event bit beside the running bits stops nothing here; the
+            // health check after the first command reads it.
+            if self.read(STATUS)? & RUNNING == RUNNING {
                 break;
             }
             if deadline.passed() {
@@ -120,7 +153,7 @@ impl<P: ColdPlatform, C: UnitConfig> Engine<P, C> {
         // An event is a fault even if its memory record has not reached RAM.
         // Preserve ring/status evidence rather than clear and retry. No PPR/GA/
         // completion IRQ or interrupt mode is enabled in this polled profile.
-        if self.read(CONTROL)? != self.control
+        if self.read(CONTROL)? != self.control.get()
             || self.read(STATUS)? != RUNNING
             || self.read(DEVICE_TABLE)? != self.table_base.get()
             || self.read(EVENT_HEAD)? != 0
