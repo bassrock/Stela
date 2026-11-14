@@ -1057,16 +1057,18 @@ fn claim(
                 }
                 Ok(())
             })?;
-            // amdgpu is built without its display core: it would take the
-            // firmware's screen and put nothing in its place.
+            // amdgpu is built without its display core: it takes the
+            // firmware's screen and puts nothing in its place. On a PC whose
+            // only GPU is this one (a Ryzen without integrated graphics, such
+            // as a 5950X with an RX 6800 XT), there is no other screen to
+            // move to, so the claim goes ahead headless: the screen goes dark
+            // here and the boot log on the USB is the only record from this
+            // point.
             if driver.vendor == AMDGPU.vendor {
                 output::arguments(format_args!(
-                    "GPU {address}: the firmware's screen is on this AMD GPU, which amdgpu cannot \
-                     display on yet: connect the monitor to the motherboard and make the integrated \
-                     GPU the BIOS's first display\n"
-                ));
-                return Err(ServiceError::Refused(
-                    "the firmware's screen is on an AMD GPU amdgpu cannot display on",
+                    "GPU {address}: the firmware's screen is on this AMD GPU, which amdgpu \
+                     cannot display on yet: claiming it headless, the screen goes dark now and \
+                     the boot log on the USB continues\n"
                 ));
             }
             true
