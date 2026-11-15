@@ -6,6 +6,7 @@
 #include <linux/limits.h>
 #include <linux/sched/clock.h>
 #include <linux/timekeeping.h>
+#include <stela/costs.h>
 #include <stela/linux.h>
 #include <stela/time.h>
 
@@ -14,7 +15,11 @@ ktime_t ktime_get(void)
 	const struct stela_linux_owner *owner = stela_linux_owner();
 	if (!owner->services->now_ns)
 		__builtin_trap();
-	return owner->services->now_ns(owner->context);
+	/* Diagnostics (stela/costs.h): one read in 16 timed. */
+	u64 start = stela_linux_cost_start(&stela_linux_costs.clock, 16);
+	ktime_t now = owner->services->now_ns(owner->context);
+	stela_linux_cost_end(&stela_linux_costs.clock, start);
+	return now;
 }
 
 notrace u64 sched_clock(void)

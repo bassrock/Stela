@@ -948,6 +948,10 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
     {
         output::arguments(format_args!("{line}\n"));
     }
+    // Diagnostics: the calls of the Linux environment's hot primitives.
+    if let Some(line) = super::linux_costs_report(tsc_hz) {
+        output::arguments(format_args!("{line}\n"));
+    }
 }
 
 /// `GPU LOCK operation:held_us/waited_us/longest_wait_us/compiled_us/compiles`:

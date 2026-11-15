@@ -10,6 +10,7 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
+#include <stela/costs.h>
 #include <stela/linux.h>
 #include <stela/task.h>
 
@@ -49,7 +50,13 @@ unsigned long raw_copy_from_user(void *to, const void __user *from, unsigned lon
 
 	if (!owner->services->copy_from_user)
 		return n;
-	return owner->services->copy_from_user(owner->context, to, (const void __force *)from, n);
+	/* Diagnostics (stela/costs.h). */
+	u64 start = stela_linux_cost_start(&stela_linux_costs.copy_user, 1);
+	unsigned long left = owner->services->copy_from_user(owner->context, to,
+							     (const void __force *)from, n);
+	stela_linux_cost_end(&stela_linux_costs.copy_user, start);
+	stela_linux_cost_add(&stela_linux_costs.copy_bytes, n);
+	return left;
 }
 
 unsigned long raw_copy_to_user(void __user *to, const void *from, unsigned long n)
@@ -58,7 +65,13 @@ unsigned long raw_copy_to_user(void __user *to, const void *from, unsigned long 
 
 	if (!owner->services->copy_to_user)
 		return n;
-	return owner->services->copy_to_user(owner->context, (void __force *)to, from, n);
+	/* Diagnostics (stela/costs.h). */
+	u64 start = stela_linux_cost_start(&stela_linux_costs.copy_user, 1);
+	unsigned long left = owner->services->copy_to_user(owner->context, (void __force *)to,
+							   from, n);
+	stela_linux_cost_end(&stela_linux_costs.copy_user, start);
+	stela_linux_cost_add(&stela_linux_costs.copy_bytes, n);
+	return left;
 }
 
 /* As Linux's: what a faulting copy did not reach reads as zeroes. */

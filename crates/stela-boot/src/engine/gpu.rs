@@ -2873,6 +2873,84 @@ pub(super) fn amdgpu_cs_report() -> Option<String> {
     (!lines.is_empty()).then(|| lines.join("\n"))
 }
 
+/// `stela/costs.h` (stela-linux's compat layer): `struct stela_linux_costs`,
+/// whose counts the entered Linux owner only grows.
+#[cfg(feature = "metal-device")]
+#[repr(C)]
+struct LinuxCosts {
+    /// `task`, `clock`, `kmalloc`, `kfree`, `cache_alloc`, `cache_free`,
+    /// `copy_user`, `resched`: each calls, calls timed, cycles of those.
+    costs: [[AtomicU64; 3]; LINUX_COSTS.len()],
+    cache_steps: AtomicU64,
+    range_calls: AtomicU64,
+    range_steps: AtomicU64,
+    copy_bytes: AtomicU64,
+}
+
+#[cfg(feature = "metal-device")]
+/// `struct stela_linux_costs`' primitives, in order.
+const LINUX_COSTS: [&str; 8] = [
+    "task",
+    "clock",
+    "kmalloc",
+    "kfree",
+    "cache_alloc",
+    "cache_free",
+    "copy_user",
+    "resched",
+];
+
+#[cfg(feature = "metal-device")]
+/// What [`linux_costs_report`] last read, to report each count's growth.
+static LINUX_COSTS_SEEN: [AtomicU64; LINUX_COSTS.len() * 3 + 4] =
+    [const { AtomicU64::new(0) }; LINUX_COSTS.len() * 3 + 4];
+
+#[cfg(feature = "metal-device")]
+/// Diagnostics: `LINUX COSTS name=calls/us/ns_each … cache_steps=…
+/// range=calls/steps copy_bytes=…`, how often Linux code called each hot
+/// primitive of its environment since the last report and the time they
+/// took, estimated from the calls timed (one in 16 for `task` and `clock`).
+/// None when none ran.
+pub(super) fn linux_costs_report(tsc_hz: u64) -> Option<String> {
+    unsafe extern "C" {
+        /// stela-linux `compat/kernel/costs.c`.
+        static stela_linux_costs: LinuxCosts;
+    }
+    // SAFETY: Linux's static counters, which only its entered owner writes,
+    // each with one aligned store.
+    let counts = unsafe { &stela_linux_costs };
+    let mut seen = LINUX_COSTS_SEEN.iter();
+    let mut grown = |counter: &AtomicU64| {
+        let now = counter.load(Ordering::Relaxed);
+        let last = seen
+            .next()
+            .map_or(0, |last| last.swap(now, Ordering::Relaxed));
+        now.wrapping_sub(last)
+    };
+    let mut line = String::from("LINUX COSTS");
+    let mut any = false;
+    for (name, [calls, timed, cycles]) in LINUX_COSTS.iter().zip(&counts.costs) {
+        let (calls, timed, cycles) = (grown(calls), grown(timed), grown(cycles));
+        any |= calls != 0;
+        // Cycles of every call, at the timed calls' mean.
+        let ns = (u128::from(cycles) * u128::from(calls) * 1_000_000_000)
+            .checked_div(u128::from(timed) * u128::from(tsc_hz))
+            .unwrap_or(0);
+        let each = ns.checked_div(u128::from(calls)).unwrap_or(0);
+        line.push_str(&format!(" {name}={calls}/{}/{each}", ns / 1000));
+    }
+    let (steps, range_calls, range_steps, bytes) = (
+        grown(&counts.cache_steps),
+        grown(&counts.range_calls),
+        grown(&counts.range_steps),
+        grown(&counts.copy_bytes),
+    );
+    line.push_str(&format!(
+        " cache_steps={steps} range={range_calls}/{range_steps} copy_bytes={bytes}"
+    ));
+    any.then_some(line)
+}
+
 /// The function of the timer-list timer due first when Linux last looked,
 /// as an offset in this image, or `-` for none.
 fn next_timer() -> String {

@@ -15,6 +15,7 @@
 #include <linux/string.h>
 #include <stela/cache.h>
 #include <stela/allocation.h>
+#include <stela/costs.h>
 #include <stela/linux.h>
 #include <stela/page.h>
 
@@ -322,7 +323,18 @@ bool stela_linux_cache_prime(struct kmem_cache *cache)
 	return grow_cache(cache, GFP_KERNEL | __GFP_NOWARN) != NULL;
 }
 
+static void *cache_alloc_counted(struct kmem_cache *cache, gfp_t flags);
+
 void *kmem_cache_alloc_noprof(struct kmem_cache *cache, gfp_t flags)
+{
+	/* Diagnostics (stela/costs.h). */
+	u64 start = stela_linux_cost_start(&stela_linux_costs.cache_alloc, 1);
+	void *object = cache_alloc_counted(cache, flags);
+	stela_linux_cost_end(&stela_linux_costs.cache_alloc, start);
+	return object;
+}
+
+static void *cache_alloc_counted(struct kmem_cache *cache, gfp_t flags)
 {
 	cache = require_cache(cache);
 	if (!request_supported(flags))
@@ -338,8 +350,12 @@ void *kmem_cache_alloc_noprof(struct kmem_cache *cache, gfp_t flags)
 	if (cache->live == SIZE_MAX)
 		return NULL;
 	struct cache_slab *slab = cache->slabs;
-	while (slab && !slab->free_count)
+	u64 steps = 0;
+	while (slab && !slab->free_count) {
 		slab = slab->next;
+		steps++;
+	}
+	stela_linux_cost_add(&stela_linux_costs.cache_steps, steps);
 	if (!slab) {
 		if (!gfpflags_allow_blocking(flags))
 			return NULL;
@@ -378,7 +394,17 @@ void *kmem_cache_alloc_lru_noprof(struct kmem_cache *cache, struct list_lru *lru
 	return kmem_cache_alloc_noprof(cache, flags);
 }
 
+static void cache_free_counted(struct kmem_cache *cache, void *object);
+
 void kmem_cache_free(struct kmem_cache *cache, void *object)
+{
+	/* Diagnostics (stela/costs.h). */
+	u64 start = stela_linux_cost_start(&stela_linux_costs.cache_free, 1);
+	cache_free_counted(cache, object);
+	stela_linux_cost_end(&stela_linux_costs.cache_free, start);
+}
+
+static void cache_free_counted(struct kmem_cache *cache, void *object)
 {
 	cache = require_cache(cache);
 	if (!object)
@@ -387,6 +413,7 @@ void kmem_cache_free(struct kmem_cache *cache, void *object)
 	for (struct cache_slab *slab = cache->slabs; slab; slab = slab->next) {
 		unsigned long base = (unsigned long)slab->cpu;
 		size_t used = slab->count * cache->stride;
+		stela_linux_cost_add(&stela_linux_costs.cache_steps, 1);
 		if (address < base || address - base >= used)
 			continue;
 		size_t offset = address - base;
@@ -504,8 +531,10 @@ bool stela_linux_cache_range(const void *pointer, size_t bytes,
 {
  (void)stela_linux_owner();
  unsigned long address = (unsigned long)pointer;
+ stela_linux_cost_add(&stela_linux_costs.range_calls, 1);
  for (struct kmem_cache *cache = caches; cache; cache = cache->next) {
   for (struct cache_slab *slab = cache->slabs; slab; slab = slab->next) {
+   stela_linux_cost_add(&stela_linux_costs.range_steps, 1);
    unsigned long base = (unsigned long)slab->cpu;
    size_t used = slab->count * cache->stride;
    if (address < base || address - base >= used) continue;

@@ -15,6 +15,7 @@
 #include <linux/rbtree.h>
 #include <linux/log2.h>
 #include <stela/allocation.h>
+#include <stela/costs.h>
 #include <linux/string.h>
 #include <stela/linux.h>
 
@@ -98,7 +99,18 @@ static bool request_supported(gfp_t flags)
 	return true;
 }
 
+static void *allocate_counted(size_t size, gfp_t flags, size_t minimum_align);
+
 static void *allocate(size_t size, gfp_t flags, size_t minimum_align)
+{
+	/* Diagnostics (stela/costs.h). */
+	u64 start = stela_linux_cost_start(&stela_linux_costs.kmalloc, 1);
+	void *object = allocate_counted(size, flags, minimum_align);
+	stela_linux_cost_end(&stela_linux_costs.kmalloc, start);
+	return object;
+}
+
+static void *allocate_counted(size_t size, gfp_t flags, size_t minimum_align)
 {
 	if (!size)
 		return ZERO_SIZE_PTR;
@@ -222,10 +234,20 @@ size_t ksize(const void *object)
  return allocation.bytes;
 }
 
+static void free_counted(const void *object);
+
 void kfree(const void *object)
 {
 	if (ZERO_OR_NULL_PTR(object))
 		return;
+	/* Diagnostics (stela/costs.h). */
+	u64 start = stela_linux_cost_start(&stela_linux_costs.kfree, 1);
+	free_counted(object);
+	stela_linux_cost_end(&stela_linux_costs.kfree, start);
+}
+
+static void free_counted(const void *object)
+{
  struct stela_linux_allocation allocation;
  if (!stela_linux_kmalloc_range(object, 1, &allocation) || allocation.object != object) {
   if (stela_linux_cache_range(object, 1, &allocation) && allocation.object == object) {

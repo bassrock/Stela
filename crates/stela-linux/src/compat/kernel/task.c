@@ -31,6 +31,7 @@
 #include <stela/task_bootstrap.h>
 #include <sched/fork_backend.h>
 #include <stela/catalogue.h>
+#include <stela/costs.h>
 #include <stela/counts.h>
 #include <stela/service.h>
 #include <linux/mm_types.h>
@@ -251,9 +252,12 @@ static bool live_here(struct stela_linux_task *task,
 
 static struct stela_linux_task *current_record(void)
 {
+	/* Diagnostics (stela/costs.h): one validation in 16 timed. */
+	u64 start = stela_linux_cost_start(&stela_linux_costs.task, 16);
 	struct stela_linux_task *task = __atomic_load_n(&active, __ATOMIC_ACQUIRE);
 	if (!task || !live_here(task, &task->context))
 		__builtin_trap();
+	stela_linux_cost_end(&stela_linux_costs.task, start);
 	return task;
 }
 
@@ -2071,7 +2075,18 @@ int stela_linux_task_yield(void)
 	return finish_prepared(task, result);
 }
 
+static int cond_resched_counted(void);
+
 int __cond_resched(void)
+{
+	/* Diagnostics (stela/costs.h), a reschedule's switch included. */
+	u64 start = stela_linux_cost_start(&stela_linux_costs.resched, 1);
+	int result = cond_resched_counted();
+	stela_linux_cost_end(&stela_linux_costs.resched, start);
+	return result;
+}
+
+static int cond_resched_counted(void)
 {
 	struct stela_linux_task *task = current_record();
 	(void)stela_linux_owner();
