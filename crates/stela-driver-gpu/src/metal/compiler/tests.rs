@@ -1698,3 +1698,29 @@ fn function_constant_types_follow_their_spelling() {
         );
     }
 }
+
+#[test]
+fn every_target_limit_keys_the_nir_a_compilation_stores() {
+    let base = ffi::Target {
+        nir: ptr::null(),
+        max_instructions: 1,
+        max_threadgroup_bytes: 2,
+        max_private_bytes: 3,
+        max_constant_bytes: 4,
+        max_varying_slots: 5,
+        max_payload_bytes: 6,
+        max_mesh_vertices: 7,
+        max_mesh_primitives: 8,
+        stencil_export: 9,
+        raster_order_groups: 10,
+        fragment_tests: 11,
+    };
+    let limits = target_limits(&base);
+    assert_eq!(limits, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+    // Where the driver's NIR options live is no limit: it differs by boot.
+    let moved = ffi::Target {
+        nir: ptr::dangling(),
+        ..base
+    };
+    assert_eq!(target_limits(&moved), limits);
+}

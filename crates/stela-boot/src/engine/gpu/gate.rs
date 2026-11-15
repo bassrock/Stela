@@ -878,16 +878,25 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         ));
     }
     // Pipelines created through the pipeline store's cache: found there, or
-    // compiled by the driver, and the driver's time for each.
+    // compiled by the driver, and the driver's time for each; then the bytes
+    // of cache the driver was seeded with, its newest snapshot, the
+    // snapshots taken and what the boot wrote back, since the device opened.
     let store = pipeline_store::take_lookups();
     if store.hits != 0 || store.misses != 0 {
+        let totals = pipeline_store::totals();
         output::arguments(format_args!(
-            "GPU STORE hits={} misses={} hit_us={} miss_us={} miss_longest_us={}\n",
+            "GPU STORE hits={} misses={} hit_us={} miss_us={} miss_longest_us={} seeded={} \
+             stored_nir={} cache={} snapshots={} saved={}\n",
             store.hits,
             store.misses,
             store.hit_ns / 1000,
             store.miss_ns / 1000,
             store.miss_longest_ns / 1000,
+            totals.seeded,
+            totals.stored_nir,
+            totals.cache,
+            totals.snapshots,
+            totals.saved,
         ));
     }
     // Pipeline work in turns: the jobs turns left, with what making them

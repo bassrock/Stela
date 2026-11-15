@@ -1486,6 +1486,12 @@ impl AirCompiler {
                 );
             }
             hasher.update(alloc::format!("{names:?}").as_bytes());
+            // The target's limits shape the NIR too, and a build may change
+            // them without changing the compiler archive that keys the
+            // store: NIR an earlier build stored under others is not read.
+            for limit in target_limits(&self.target) {
+                hasher.update(limit.to_le_bytes());
+            }
             let digest: [u8; 32] = hasher.finalize().into();
             digest
         });
@@ -1923,6 +1929,38 @@ unsafe extern "C" {
         reader: *mut BlobReader,
     ) -> *mut c_void;
     fn free(pointer: *mut c_void);
+}
+
+/// Every limit of `target`, which the NIR it compiles depends on, in the
+/// order of its fields; the driver's NIR options are keyed by its build.
+fn target_limits(target: &ffi::Target) -> [u32; 11] {
+    let ffi::Target {
+        nir: _,
+        max_instructions,
+        max_threadgroup_bytes,
+        max_private_bytes,
+        max_constant_bytes,
+        max_varying_slots,
+        max_payload_bytes,
+        max_mesh_vertices,
+        max_mesh_primitives,
+        stencil_export,
+        raster_order_groups,
+        fragment_tests,
+    } = *target;
+    [
+        max_instructions,
+        max_threadgroup_bytes,
+        max_private_bytes,
+        max_constant_bytes,
+        max_varying_slots,
+        max_payload_bytes,
+        max_mesh_vertices,
+        max_mesh_primitives,
+        stencil_export,
+        raster_order_groups,
+        fragment_tests,
+    ]
 }
 
 /// Whether this image serializes NIR: the linked Mesa does.
