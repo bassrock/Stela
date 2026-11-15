@@ -888,9 +888,13 @@ TABLE(maxVertexAttributes, 31)
 	return _capabilities->linear_row_alignment;
 }
 
+/* Rows a texture only reads need hold only whole texels, the device mirroring
+ * those no linear image takes: Core Image makes no texture of a surface whose
+ * rows miss this, and an image processor whose input has none aborts (an MPS
+ * blur's "source may not be nil"). */
 - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes
 {
-	return _capabilities->linear_row_alignment;
+	return _capabilities->surface_read_row_alignment;
 }
 
 /* What wiring a client's pages needs of them. */
