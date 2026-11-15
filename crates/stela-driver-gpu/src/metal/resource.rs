@@ -1018,6 +1018,10 @@ pub struct Mirror {
     pub writes: bool,
     /// Shaders may write it, which no command names.
     pub shader_writes: bool,
+    /// The bytes from the rows' first to their last, from the region's
+    /// offset: the range the CPU and other textures over the same memory
+    /// reach.
+    pub span: u64,
 }
 
 /// `newTextureWithDescriptor:offset:bytesPerRow:` on a buffer: a 2D texture
@@ -1150,7 +1154,18 @@ pub fn buffer_texture(
             && u32::try_from(row_length).is_ok(),
         misaligned,
     )?;
-    attachment_storage(capabilities, descriptor, usage, &mut image);
+    // Every texture over the same rows shares one mirror, whatever usage
+    // each asks for: its image takes every usage the format has, and each
+    // texture's views only its own.
+    let wide = TextureDescriptor {
+        usage: TextureUsage::EMPTY,
+        ..*descriptor
+    };
+    let wide_usage = effective_usage(capabilities, &wide).unwrap_or(usage);
+    let mut image = image_info(descriptor, description, realization, wide_usage);
+    image.flags = image.flags.difference(ImageCreate::CUBE_COMPATIBLE);
+    attachment_storage(capabilities, descriptor, wide_usage, &mut image);
+    let span = end.map_or(0, |end| end - offset);
     let mirror = Mirror {
         region: BufferImageCopy {
             buffer_offset: offset,
@@ -1167,6 +1182,7 @@ pub fn buffer_texture(
         },
         writes: usage.intersects(TextureUsage::RENDER_TARGET | TextureUsage::SHADER_WRITE),
         shader_writes: usage.contains(TextureUsage::SHADER_WRITE),
+        span,
     };
     Ok(BufferTexturePlan::Mirrored(
         TexturePlan {

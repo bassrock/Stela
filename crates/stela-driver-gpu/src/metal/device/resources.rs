@@ -17,7 +17,7 @@ use crate::metal::{
     pass::{AttachmentView, TestedCopy},
     pixel_format::{Description, Encoding},
     resource::{
-        self, CpuAccess, Mirror, ShaderViews, SubresourceLayout, TextureDescriptor, TexturePlan,
+        self, CpuAccess, ShaderViews, SubresourceLayout, TextureDescriptor, TexturePlan,
         TextureViewDescriptor,
     },
     sampler::{self, SamplerDescriptor},
@@ -45,9 +45,13 @@ use core::{num::NonZeroU64, ops::Range};
 use stela_contracts::gate::MemoryRange;
 
 mod extended_planes;
+mod mirrors;
 mod read_back;
 pub(super) use extended_planes::PlaneActions;
 pub use extended_planes::PlaneChanges;
+pub use mirrors::MirrorReport;
+use mirrors::MirrorSlot;
+pub(super) use mirrors::MirrorSyncs;
 pub use read_back::ReadBack;
 
 const TEXTURE_ARRAYS: [HeapArray; 2] = [HeapArray::SampledImages, HeapArray::StorageImages];
@@ -68,9 +72,6 @@ const RECYCLED_TEXTURE_BYTES: u64 = 64 << 20;
 /// Each row of a CPU transfer of a mirrored texture: its offset in the
 /// buffer's memory and its range in the transfer's packed bytes.
 type MirrorRuns = Vec<(u64, Range<usize>)>;
-
-/// Notices kept for the platform's log until a call takes them.
-const NOTICES_KEPT: usize = 16;
 
 /// A destroyed private texture kept whole, with its image, memory, views and
 /// descriptors, for the next `newTexture` of an equal descriptor once the
@@ -143,6 +144,9 @@ struct BufferObject {
     backing: Backing,
     /// Textures over this buffer, which keep it alive.
     dependents: u32,
+    /// A mirror copies through it, in any connection's command buffers,
+    /// which its destruction waits for.
+    mirrored: bool,
 }
 
 #[derive(Debug)]
@@ -172,35 +176,10 @@ struct TextureObject {
     cpu_copy: Option<BufferAllocation>,
     /// A two-plane texture's second plane's image; `image` is its first's.
     second_plane: Option<Image>,
-    /// The images of its planes over a buffer's rows that are mirrored
-    /// ([`resource::Mirror`]), which `image` and `second_plane` name too:
-    /// empty when every plane lies in the rows.
-    mirrors: Vec<MirrorObject>,
-}
-
-/// The copies [`Device::mirror_syncs`] answers for one command buffer.
-#[derive(Debug, Default)]
-pub(super) struct MirrorSyncs {
-    /// The textures synced, whose destruction waits for the command buffer.
-    pub textures: Vec<TextureId>,
-    /// Copies of rows into images, ending in a barrier; empty when no
-    /// texture is mirrored.
-    pub before: Vec<Command>,
-    /// Copies of images back to their rows between barriers, the last
-    /// making them the host's; empty when the work wrote none.
-    pub after: Vec<Command>,
-}
-
-/// A mirrored plane's image of its own, with its memory, and the buffer
-/// whose rows commits copy it from and back to
-/// ([`Device::mirror_syncs`]).
-#[derive(Debug)]
-struct MirrorObject {
-    image: Image,
-    memory: Memory,
-    bytes: u64,
-    buffer: Buffer,
-    mirror: resource::Mirror,
+    /// The shared mirrors of its planes over a buffer's rows that are
+    /// mirrored ([`mirrors`]), whose images `image` and `second_plane` name
+    /// too: empty when every plane lies in the rows.
+    mirrors: Vec<MirrorSlot>,
 }
 
 /// A depth or stencil subresource's storage copy ([`TestedCopy`]): what it
@@ -286,8 +265,9 @@ pub(super) struct Resources {
     /// The times textures encoded into each IOSurface's planes, by surface
     /// ID ([`extended_planes`]).
     extended_generations: BTreeMap<u32, u64>,
-    /// Live textures with mirrored planes, which every commit syncs.
-    mirrored: alloc::collections::BTreeSet<TextureId>,
+    /// The mirrors of rows no linear image takes, which textures over the
+    /// same rows share.
+    mirrors: mirrors::Mirrors,
     /// Destroyed private textures kept for reuse, oldest first, and their
     /// bytes.
     recycled: VecDeque<Recycled>,
@@ -350,6 +330,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         self.book_memory(memory, bytes, || {
             format!("imported memory of {bytes} bytes")
         });
+        self.note_import(memory, ranges);
         Ok(MemoryId(
             self.resources
                 .imports
@@ -393,7 +374,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
 
     pub fn texture_bytes(&self, id: TextureId) -> u64 {
         self.resources.textures.get(id.0).map_or(0, |texture| {
-            let mirrors: u64 = texture.mirrors.iter().map(|mirror| mirror.bytes).sum();
+            let mirrors: u64 = texture.mirrors.iter().map(|slot| slot.bytes).sum();
             owned_bytes(texture.backing) + mirrors
         })
     }
@@ -479,6 +460,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             options,
             backing: Backing::Owned(allocation.allocated),
             dependents: 0,
+            mirrored: false,
         }))
     }
 
@@ -539,7 +521,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 .is_some_and(|end| end <= buffer.length),
             "range extends past the buffer",
         )?;
-        let (memory, base) = (buffer.memory, buffer.memory_offset);
+        let (memory, base, vk_buffer) = (buffer.memory, buffer.memory_offset, buffer.buffer);
+        self.mirror_rows_written(vk_buffer);
         self.backend.flush_memory(memory, base + offset, length)
     }
 
@@ -563,8 +546,16 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "textures still alias the buffer",
         )?;
         let buffer = self.resources.buffers.remove(id.0)?;
-        self.defer(Object::Buffer(buffer.buffer));
-        self.release_backing(buffer.backing, Some(buffer.memory))
+        // Any connection's commits may have copied a mirror through it.
+        let scope = if buffer.mirrored {
+            super::pins::Scope::DEVICE
+        } else {
+            self.scope.clone()
+        };
+        self.release_for(scope, |device| {
+            device.defer(Object::Buffer(buffer.buffer));
+            device.release_backing(buffer.backing, Some(buffer.memory))
+        })
     }
 
     /// `newTextureWithDescriptor:`.
@@ -974,7 +965,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 offset,
                 bytes_per_row,
             )?;
-            let rows = (vk_buffer, memory, memory_offset);
+            let rows = (memory, memory_offset);
             let layout = resource::PlaneLayout {
                 offset,
                 bytes_per_row,
@@ -984,9 +975,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             let (id, views) = match self.shader_views(image, &plan.plan().views) {
                 Ok(created) => created,
                 Err(error) => {
-                    self.backend.destroy(Object::Image(image));
-                    if let Some(mirror) = mirror {
-                        self.free_mirror(mirror);
+                    match mirror {
+                        Some(slot) => self.abandon_mirrors(&[slot]),
+                        None => self.backend.destroy(Object::Image(image)),
                     }
                     return Err(error);
                 }
@@ -1012,31 +1003,30 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
         self.book_texture_over(buffer_id, descriptor);
-        Ok(self.insert_over_buffer(texture))
+        self.insert_over_buffer(texture)
     }
 
-    /// Keeps a texture made over a buffer's rows, noting it among the
-    /// mirrored when a plane is.
-    fn insert_over_buffer(&mut self, texture: TextureObject) -> TextureId {
-        let mirrored = !texture.mirrors.is_empty();
+    /// Keeps a texture made over a buffer's rows, a user of the mirrors
+    /// its planes claimed.
+    fn insert_over_buffer(&mut self, texture: TextureObject) -> Result<TextureId> {
         let id = TextureId(self.resources.textures.insert(texture));
-        if mirrored {
-            self.resources.mirrored.insert(id);
-        }
-        id
+        self.join_mirrors(id)?;
+        Ok(id)
     }
 
     /// The image of one plane, of `format`, over the rows of a buffer (its
-    /// buffer, memory and the memory's offset in its allocation): a linear
-    /// image placed in the memory, or a mirrored plan's image of its own
-    /// and its mirror, which commits copy from and back to the rows.
+    /// memory and the memory's offset in its allocation): a linear image
+    /// placed in the memory, or a mirrored plan's shared mirror, which
+    /// commits copy from and back to the rows, with its slot. The caller
+    /// destroys only a linear image, and gives back an unused slot
+    /// ([`Self::abandon_mirrors`]).
     fn buffer_image(
         &mut self,
-        (buffer, memory, memory_offset): (Buffer, Memory, u64),
+        (memory, memory_offset): (Memory, u64),
         plan: &resource::BufferTexturePlan,
         format: crate::metal::pixel_format::PixelFormat,
         layout: resource::PlaneLayout,
-    ) -> Result<(Image, Option<MirrorObject>)> {
+    ) -> Result<(Image, Option<MirrorSlot>)> {
         let (plan, mirror) = match plan {
             resource::BufferTexturePlan::Linear(plan) => {
                 // The plan checked that the place is aligned.
@@ -1048,38 +1038,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             }
             resource::BufferTexturePlan::Mirrored(plan, mirror) => (plan, *mirror),
         };
-        let (image, own, bytes) = self.backend.create_image(&plan.image, plan.memory)?;
-        self.allocated += bytes;
-        let [width, height, _] = plan.image.extent;
-        let (rows, offsets) = self.capabilities.linear_texture_alignments();
-        self.book_memory(own, bytes, || {
-            format!("mirror of a {width}x{height} {format:?} texture's rows")
-        });
-        // Each creation is logged, up to a bound no call drains.
-        if self.notices.len() < NOTICES_KEPT {
-            self.notices.push(format!(
-                "texture {width}x{height} {format:?} at bytesPerRow {} offset {} mirrored: \
-                 the device's linear images take rows of multiples of {rows} bytes at \
-                 multiples of {offsets}",
-                layout.bytes_per_row, layout.offset,
-            ));
-        }
-        Ok((
-            image,
-            Some(MirrorObject {
-                image,
-                memory: own,
-                bytes,
-                buffer,
-                mirror,
-            }),
-        ))
-    }
-
-    /// Frees a mirrored plane's memory, once no submitted work copies it;
-    /// its image goes with the texture's.
-    fn free_mirror(&mut self, mirror: MirrorObject) {
-        self.release_memory(mirror.memory, mirror.bytes);
+        let start = memory_offset + mirror.region.buffer_offset;
+        let slot = self.claim_mirror((memory, start), plan, mirror, format, layout)?;
+        Ok((slot.image, Some(slot)))
     }
 
     /// Names the texture `descriptor` made over buffer `id` as what owns
@@ -1181,7 +1142,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             });
         }
         let buffer = self.resources.buffers.get(buffer_id.0)?;
-        let rows = (buffer.buffer, buffer.memory, buffer.memory_offset);
+        let rows = (buffer.memory, buffer.memory_offset);
         let plans = resource::two_plane_texture(
             &self.capabilities,
             descriptor,
@@ -1232,11 +1193,11 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     self.backend.destroy(Object::ImageView(view));
                 }
                 for image in images {
-                    self.backend.destroy(Object::Image(image));
+                    if !mirrors.iter().any(|slot: &MirrorSlot| slot.image == image) {
+                        self.backend.destroy(Object::Image(image));
+                    }
                 }
-                for mirror in mirrors {
-                    self.free_mirror(mirror);
-                }
+                self.abandon_mirrors(&mirrors);
                 return Err(error);
             }
         };
@@ -1260,7 +1221,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
         self.book_texture_over(buffer_id, descriptor);
-        Ok(self.insert_over_buffer(texture))
+        self.insert_over_buffer(texture)
     }
 
     /// The view a render pass attaches, created on first use and kept with
@@ -1831,6 +1792,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             "texture buffers are written through their buffer",
         ))?;
         if let Some((memory, rows)) = self.mirror_rows(texture, region, bytes.len())? {
+            let buffer = match texture.backing {
+                Backing::Buffer(buffer) => self.resources.buffers.get(buffer.0)?.buffer,
+                _ => return Err(Error::Invalid("a mirrored texture lies over a buffer")),
+            };
+            // The next commit fills the image from the rows written.
+            self.mirror_rows_written(buffer);
             for (offset, packed) in rows {
                 self.backend.write_memory(memory, offset, &bytes[packed])?;
             }
@@ -2081,91 +2048,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         commands
     }
 
-    /// The texture with mirrored planes that `id` is or views, which a pass
-    /// attaching `id` renders to.
-    pub(super) fn mirrored_root(&self, id: TextureId) -> Option<TextureId> {
+    /// The texture that `id` is or views, when a pass attaching `id` may
+    /// change rows a mirror holds: one with mirrored planes, whose image it
+    /// renders to, or an extended-range one, which encodes into its rows.
+    pub(super) fn synced_root(&self, id: TextureId) -> Option<TextureId> {
         let texture = self.resources.textures.get(id.0).ok()?;
         let root = texture.parent.unwrap_or(id);
-        self.resources.mirrored.contains(&root).then_some(root)
-    }
-
-    /// The copies that keep every live mirrored texture's images and rows
-    /// the same around one command buffer of `work`, whose passes attach
-    /// the mirrored textures `rendered`: each image is filled from its rows
-    /// before the work, as a linear image in them would hold them, and an
-    /// image the work may have written goes back to its rows after it, so
-    /// they hold what it wrote once the command buffer completes. The work
-    /// may have written an image it renders to, copies or clears into, or
-    /// whose shaders may write it, which nothing names.
-    pub(super) fn mirror_syncs<'a>(
-        &self,
-        rendered: &[TextureId],
-        work: impl Iterator<Item = &'a Command>,
-    ) -> MirrorSyncs {
-        let mut syncs = MirrorSyncs::default();
-        if self.resources.mirrored.is_empty() {
-            return syncs;
-        }
-        let textures = &self.resources.textures;
-        let mirrors: Vec<(TextureId, &MirrorObject)> = self
-            .resources
-            .mirrored
-            .iter()
-            .filter_map(|&id| Some((id, textures.get(id.0).ok()?)))
-            .flat_map(|(id, texture)| texture.mirrors.iter().map(move |mirror| (id, mirror)))
-            .collect();
-        let mut copied: Vec<Image> = Vec::new();
-        for command in work {
-            let dst = match command {
-                Command::CopyBufferToImage { dst, .. }
-                | Command::CopyImage { dst, .. }
-                | Command::BlitImage { dst, .. } => *dst,
-                Command::ClearColorImage { image, .. } => *image,
-                _ => continue,
-            };
-            if !copied.contains(&dst) && mirrors.iter().any(|(_, mirror)| mirror.image == dst) {
-                copied.push(dst);
-            }
-        }
-        for &(id, object) in &mirrors {
-            let Mirror {
-                region,
-                writes,
-                shader_writes,
-            } = object.mirror;
-            syncs.before.push(Command::CopyBufferToImage {
-                src: object.buffer,
-                dst: object.image,
-                region,
-            });
-            if shader_writes || writes && rendered.contains(&id) || copied.contains(&object.image) {
-                syncs.after.push(Command::CopyImageToBuffer {
-                    src: object.image,
-                    dst: object.buffer,
-                    region,
-                });
-            }
-            if syncs.textures.last() != Some(&id) {
-                syncs.textures.push(id);
-            }
-        }
-        syncs.before.push(Command::Barrier(FULL));
-        if !syncs.after.is_empty() {
-            syncs.after.insert(0, Command::Barrier(FULL));
-            // The host reads the rows once the command buffer completes.
-            syncs
-                .after
-                .push(Command::Barrier(crate::metal::vulkan::command::Barrier {
-                    dst_stages: FULL
-                        .dst_stages
-                        .union(crate::metal::vulkan::PipelineStages::HOST),
-                    dst_access: FULL
-                        .dst_access
-                        .union(crate::metal::vulkan::Access::HOST_READ),
-                    ..FULL
-                }));
-        }
-        syncs
+        let mirrored = !self.resources.textures.get(root.0).ok()?.mirrors.is_empty();
+        (mirrored || self.has_extended_planes(root)).then_some(root)
     }
 
     /// The decode of a decoded format's whole subresource from its blocks,
@@ -2237,8 +2127,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         )?;
         let texture = self.resources.textures.remove(id.0)?;
         self.forget_extended_planes(id);
-        // Commits stop syncing it; those in flight that do carry it.
-        self.resources.mirrored.remove(&id);
+        // Commits stop syncing its mirrors through it; those in flight that
+        // do carry it.
+        self.leave_mirrors(id, &texture.mirrors);
         // Its decodes would write a view destroyed with it, and its uploads
         // would go to whatever texture takes its slot next.
         self.resources
@@ -2370,18 +2261,18 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         match texture.parent {
             Some(parent) => self.resources.textures.get_mut(parent.0)?.dependents -= 1,
             None => {
-                if let Some(image) = texture.image {
+                // A mirror's image goes with its last texture
+                // ([`Self::leave_mirrors`]).
+                let own = |image: &Image| !texture.mirrors.iter().any(|slot| slot.image == *image);
+                if let Some(image) = texture.image.filter(own) {
                     self.release_sparse(image)?;
                     self.defer(Object::Image(image));
                 }
-                if let Some(image) = texture.second_plane {
+                if let Some(image) = texture.second_plane.filter(own) {
                     self.defer(Object::Image(image));
                 }
                 if let Some(copy) = texture.cpu_copy {
                     self.destroy_cpu_copy(copy);
-                }
-                for mirror in texture.mirrors {
-                    self.free_mirror(mirror);
                 }
                 self.release_backing(texture.backing, texture.memory)?;
             }
@@ -2796,6 +2687,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             options,
             backing,
             dependents: 0,
+            mirrored: false,
         })))
     }
 

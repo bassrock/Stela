@@ -217,6 +217,8 @@ pub struct DeviceMemory {
     pub recycled: resources::RecycleReport,
     /// Resources automatic heaps answered nil for, by cause.
     pub heap_refusals: resources::HeapRefusals,
+    /// The mirrors of rows no linear image takes, and their copies.
+    pub mirrors: resources::MirrorReport,
     /// The backend's memory blocks and the resources placed in them.
     pub blocks: crate::metal::vulkan::backend::MemoryBlocks,
     /// Each descriptor array's use, in [`HeapArray`] order.
@@ -302,6 +304,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             completed: self.completed,
             recycled: self.recycled(),
             heap_refusals: self.heap_refusals(),
+            mirrors: self.mirror_report(),
             blocks: self.backend.memory_blocks(),
             descriptors: core::array::from_fn(|index| {
                 let array = HeapArray::ALL[index];
@@ -550,6 +553,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     }
 
     fn release_memory(&mut self, memory: Memory, bytes: u64) {
+        self.forget_import(memory);
         self.defer_allocation(Object::Memory(memory), bytes);
     }
 

@@ -202,7 +202,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             ));
         }
         let buffer = self.resources.buffers.get(buffer_id.0)?;
-        let rows = (buffer.buffer, buffer.memory, buffer.memory_offset);
+        let rows = (buffer.memory, buffer.memory_offset);
         let (memory_offset, length) = (buffer.memory_offset, buffer.length);
         // Passes encode into the planes through their addresses, so a
         // mirrored plane's image is only read.
@@ -258,11 +258,14 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                     self.backend.destroy(Object::ImageView(view));
                 }
                 for image in images {
-                    self.backend.destroy(Object::Image(image));
+                    if !mirrors
+                        .iter()
+                        .any(|slot: &super::MirrorSlot| slot.image == image)
+                    {
+                        self.backend.destroy(Object::Image(image));
+                    }
                 }
-                for mirror in mirrors {
-                    self.free_mirror(mirror);
-                }
+                self.abandon_mirrors(&mirrors);
                 return Err(error);
             }
         };
@@ -285,7 +288,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             mirrors,
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
-        let id = self.insert_over_buffer(texture);
+        let id = self.insert_over_buffer(texture)?;
         self.resources.extended_planes.insert(
             id.0,
             PlaneState {
@@ -818,9 +821,9 @@ mod tests {
 
     /// WindowServer's surface whose alpha rows a linear image cannot take
     /// (RADV's are multiples of 256 bytes; NVK's, here, of 32): the alpha
-    /// plane is mirrored and filled from its rows before each command
+    /// plane is mirrored and filled from its rows before the command
     /// buffer, and as passes encode into the rows themselves, never copied
-    /// back.
+    /// back but filled again after a pass that may have encoded.
     #[test]
     fn surface_textures_mirror_an_unaligned_alpha_plane() {
         let mut device = device();
@@ -860,10 +863,19 @@ mod tests {
                 )
             })
             .collect();
-        let [Command::CopyBufferToImage { src, dst, region }] = copies[..] else {
+        let [
+            Command::CopyBufferToImage { src, dst, region },
+            Command::CopyBufferToImage {
+                src: again,
+                dst: refreshed,
+                region: same,
+            },
+        ] = copies[..]
+        else {
             panic!("{copies:?}");
         };
         assert_eq!((*src, *dst), (rows, image));
+        assert_eq!((again, refreshed, same), (src, dst, region));
         assert_eq!(region.buffer_offset, alpha.offset);
         assert_eq!(region.buffer_row_length, 1288);
         assert_eq!(region.extent, [1280, 790, 1]);

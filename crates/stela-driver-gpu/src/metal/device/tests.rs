@@ -796,7 +796,9 @@ fn commits_copy_written_mirrors_back_to_their_rows() {
     commands.end_encoding(&mut device.resolver()).unwrap();
     device.commit(commands).unwrap();
     let (segments, into, back) = copied(&mut device);
-    assert_eq!(images(&into), [read, written, rendered]);
+    // Rows unchanged since their images were filled are not copied again;
+    // those an image went back to are.
+    assert_eq!(images(&into), [written]);
     assert_eq!(images(&back), [written, rendered]);
     let began = segments[0]
         .commands
@@ -839,7 +841,9 @@ fn commits_copy_written_mirrors_back_to_their_rows() {
         .unwrap();
     commands.end_encoding(&mut device.resolver()).unwrap();
     device.commit(commands).unwrap();
-    let (_, _, back) = copied(&mut device);
+    let (_, into, back) = copied(&mut device);
+    // The mirrors' copies, then the work's own.
+    assert_eq!(images(&into), [written, rendered, read]);
     assert_eq!(images(&back), [read, written]);
 }
 
@@ -907,6 +911,303 @@ fn destroyed_mirrors_are_freed_after_the_work_that_copies_them() {
     let segments = device.backend().submissions.last().unwrap().clone();
     assert!(image_copies(&segments).is_empty());
     device.destroy_buffer(buffer).unwrap();
+}
+
+/// A texture of `usage` over [`MIRRORED_ROWS`] of a shared buffer over
+/// imported guest `ranges`, as each connection imports a surface's pages
+/// itself, with its buffer and image.
+fn imported_mirror(
+    device: &mut TestDevice,
+    ranges: &[stela_contracts::gate::MemoryRange],
+    usage: TextureUsage,
+) -> (BufferId, TextureId, Image) {
+    let shared = options(StorageMode::Shared);
+    let token = core::num::NonZeroU64::new(7).unwrap();
+    let memory = device.import_memory(ranges, token).unwrap();
+    let bytes = ranges.iter().map(|range| range.bytes).sum();
+    let buffer = device.new_imported_buffer(memory, bytes, shared).unwrap();
+    let mut descriptor = texture(PixelFormat::Bgra8Unorm, usage);
+    descriptor.width = 100;
+    descriptor.height = 10;
+    descriptor.options = shared;
+    let (offset, bytes_per_row) = MIRRORED_ROWS;
+    let texture = device
+        .new_texture_from_buffer(buffer, &descriptor, offset, bytes_per_row)
+        .unwrap();
+    let image = device.texture_image(texture).unwrap();
+    (buffer, texture, image)
+}
+
+/// The guest pages of one surface, as one range or two.
+const SURFACE: u64 = 0x8_0010_0000;
+
+fn surface_pages(split: bool) -> Vec<stela_contracts::gate::MemoryRange> {
+    let range = |address, bytes| stela_contracts::gate::MemoryRange { address, bytes };
+    if split {
+        alloc::vec![range(SURFACE, 0x2000), range(SURFACE + 0x2000, 0x2000)]
+    } else {
+        alloc::vec![range(SURFACE, 0x4000)]
+    }
+}
+
+/// A pass that loads and stores `texture`.
+fn color_pass(texture: TextureId) -> RenderPassRequest {
+    let mut colors = [None; MAX_COLOR_ATTACHMENTS];
+    colors[0] = Some(AttachmentRequest {
+        texture,
+        level: 0,
+        slice: 0,
+        depth_plane: 0,
+        resolve: None,
+        load_action: LoadAction::Load,
+        store_action: StoreAction::Store,
+        store_action_options: StoreActionOptions::EMPTY,
+        clear: [0.0; 4],
+        surface: None,
+    });
+    RenderPassRequest {
+        color_attachments: colors,
+        depth_attachment: None,
+        depth_resolve_filter: MultisampleDepthResolveFilter::Sample0,
+        stencil_attachment: None,
+        stencil_resolve_filter: MultisampleStencilResolveFilter::Sample0,
+        visibility_result_buffer: None,
+        visibility_result_type: VisibilityResultType::Reset,
+        render_target_array_length: 0,
+        render_target_width: 0,
+        render_target_height: 0,
+        default_raster_sample_count: 0,
+        tile_memory: Default::default(),
+        sample_positions: Vec::new(),
+        rasterization_rate_map: false,
+        counter_samples: Vec::new(),
+    }
+}
+
+/// The images the last submission fills from rows and copies back.
+fn mirror_copies(device: &mut TestDevice) -> (Vec<Image>, Vec<Image>) {
+    let segments = device.backend().submissions.last().unwrap().clone();
+    let mut into = Vec::new();
+    let mut back = Vec::new();
+    for (.., command) in image_copies(&segments) {
+        match command {
+            Command::CopyBufferToImage { dst, .. } => into.push(dst),
+            Command::CopyImageToBuffer { src, .. } => back.push(src),
+            _ => {}
+        }
+    }
+    (into, back)
+}
+
+/// Two connections' textures over the same guest rows, whatever usage
+/// each asks for and however each imports the pages, share one mirror,
+/// made and logged once; other pages get their own.
+#[test]
+fn textures_over_the_same_rows_share_one_mirror() {
+    let mut device = device();
+    let (_, writer, image) = imported_mirror(
+        &mut device,
+        &surface_pages(false),
+        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
+    );
+    assert!(device.take_notice().unwrap().contains("mirrored"));
+    let (_, reader, same) =
+        imported_mirror(&mut device, &surface_pages(true), TextureUsage::SHADER_READ);
+    assert_eq!(same, image, "the reader samples the writer's image");
+    assert_eq!(
+        device.take_notice(),
+        None,
+        "a shared mirror is not logged again"
+    );
+    let report = device.memory().mirrors;
+    assert_eq!((report.live, report.created, report.shared), (1, 1, 1));
+    assert_ne!(
+        device.texture_resource_id(writer).unwrap(),
+        device.texture_resource_id(reader).unwrap(),
+        "each texture keeps its own views"
+    );
+    let other = [stela_contracts::gate::MemoryRange {
+        address: SURFACE + 0x10_0000,
+        bytes: 0x4000,
+    }];
+    let (_, _, elsewhere) = imported_mirror(&mut device, &other, TextureUsage::SHADER_READ);
+    assert_ne!(elsewhere, image);
+    assert_eq!(device.memory().mirrors.live, 2);
+    // One commit fills each mirror once.
+    submit(&mut device);
+    let (into, back) = mirror_copies(&mut device);
+    assert_eq!(into, [image, elsewhere]);
+    assert!(back.is_empty());
+}
+
+/// What one connection renders into a shared mirror the other samples in
+/// its next command buffer: the image itself, which goes back to the rows
+/// for the CPU. No upload of the rows overtakes it: the reader's commit
+/// fills the image only behind the writer's submitted work, on the one
+/// queue, and not at all while the writer's copy back is held.
+#[test]
+fn a_write_in_one_connection_reaches_the_others_reads_without_a_stale_upload() {
+    let mut device = device();
+    let (_, writer, image) = imported_mirror(
+        &mut device,
+        &surface_pages(false),
+        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
+    );
+    let (_, _, _) = imported_mirror(&mut device, &surface_pages(true), TextureUsage::SHADER_READ);
+    let empty = |device: &mut TestDevice, key| {
+        let commands = device.new_command_buffer();
+        device.commit_for(key, commands).unwrap()
+    };
+    empty(&mut device, 2);
+    assert_eq!(mirror_copies(&mut device), (alloc::vec![image], Vec::new()));
+    empty(&mut device, 2);
+    assert_eq!(mirror_copies(&mut device), (Vec::new(), Vec::new()));
+
+    // The writer renders and copies the image back to the rows.
+    let mut commands = device.new_command_buffer();
+    device
+        .begin_render(&mut commands, &color_pass(writer))
+        .unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    device.commit_for(1, commands).unwrap();
+    let written = device.backend().submissions.len();
+    assert_eq!(mirror_copies(&mut device), (Vec::new(), alloc::vec![image]));
+    // The reader's next command buffer follows it on the queue and fills
+    // the image from the rows it wrote, the same texels; then nothing.
+    empty(&mut device, 2);
+    assert_eq!(device.backend().submissions.len(), written + 1);
+    assert_eq!(mirror_copies(&mut device), (alloc::vec![image], Vec::new()));
+    empty(&mut device, 2);
+    assert_eq!(mirror_copies(&mut device), (Vec::new(), Vec::new()));
+
+    // The writer renders, then waits for an event: the copy back is held
+    // behind the wait while the pass is submitted.
+    let event = device.new_event().unwrap();
+    let semaphore = device.event_semaphore(event).unwrap();
+    let mut commands = device.new_command_buffer();
+    device
+        .begin_render(&mut commands, &color_pass(writer))
+        .unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    commands
+        .encode_wait_for_event(&mut device.resolver(), semaphore, 1)
+        .unwrap();
+    device.commit_for(1, commands).unwrap();
+    assert!(device.holds());
+    // The reader's command buffers leave the image alone meanwhile: rows
+    // copied into it would overwrite the pass's texels with older ones.
+    let skipped = device.memory().mirrors.skipped;
+    empty(&mut device, 2);
+    assert_eq!(mirror_copies(&mut device), (Vec::new(), Vec::new()));
+    assert_eq!(device.memory().mirrors.skipped, skipped + 1);
+    // Once the copy back is submitted, the next fills the image behind it.
+    device.set_signaled_value(event, 1).unwrap();
+    assert_eq!(mirror_copies(&mut device), (Vec::new(), alloc::vec![image]));
+    empty(&mut device, 2);
+    assert_eq!(mirror_copies(&mut device), (alloc::vec![image], Vec::new()));
+}
+
+/// A mirror's rows are copied into its image only when they may have
+/// changed: the guest's CPU writing them (seen by their digest), a CPU
+/// write through the device, or `didModifyRange:`.
+#[test]
+fn mirror_uploads_are_skipped_while_the_rows_are_unchanged() {
+    let mut device = device();
+    let (buffer, texture, image) = mirrored_texture(&mut device, TextureUsage::SHADER_READ);
+    let uploaded = |device: &mut TestDevice| {
+        submit(device);
+        let (into, back) = mirror_copies(device);
+        assert!(back.is_empty());
+        match into[..] {
+            [] => false,
+            [one] if one == image => true,
+            _ => panic!("{into:?}"),
+        }
+    };
+    assert!(uploaded(&mut device), "a new mirror is filled");
+    assert!(!uploaded(&mut device));
+    assert!(!uploaded(&mut device));
+    // The guest's CPU writes a texel of the rows' memory.
+    let (memory, base, _) = device.buffer_memory(buffer).unwrap();
+    let (offset, bytes_per_row) = MIRRORED_ROWS;
+    let texel = base + offset + 5 * bytes_per_row + 40;
+    device
+        .backend()
+        .write_memory(memory, texel, &[1, 2, 3, 4])
+        .unwrap();
+    assert!(uploaded(&mut device));
+    assert!(!uploaded(&mut device));
+    // Bytes outside the rows change nothing.
+    device
+        .backend()
+        .write_memory(memory, base + 8192, &[9; 4])
+        .unwrap();
+    assert!(!uploaded(&mut device));
+    // A write through the device, of the same bytes.
+    let region = Region {
+        slice: 0,
+        level: 0,
+        origin: [10, 5, 0],
+        size: [1, 1, 1],
+    };
+    let tight = Strides {
+        bytes_per_row: 4,
+        bytes_per_image: 0,
+    };
+    device
+        .replace_region(texture, &region, &[1, 2, 3, 4], tight)
+        .unwrap();
+    assert!(uploaded(&mut device));
+    assert!(!uploaded(&mut device));
+    let report = device.memory().mirrors;
+    assert_eq!((report.uploads, report.skipped), (3, 5));
+}
+
+/// A shared mirror outlives every texture but the last, and is freed once
+/// the last is destroyed and the work submitted until then completes, any
+/// connection's.
+#[test]
+fn a_shared_mirror_is_freed_after_its_last_texture_and_the_work() {
+    let mut device = device();
+    let (first_buffer, first, image) = imported_mirror(
+        &mut device,
+        &surface_pages(false),
+        TextureUsage::SHADER_READ,
+    );
+    let (second_buffer, second, _) =
+        imported_mirror(&mut device, &surface_pages(true), TextureUsage::SHADER_READ);
+    let memory = crate::metal::vulkan::object::Memory(image.0 - 1);
+    let freed = |device: &mut TestDevice| {
+        let destroyed = &device.backend().destroyed;
+        (
+            destroyed.contains(&Object::Image(image)),
+            destroyed.contains(&Object::Memory(memory)),
+        )
+    };
+    let commands = device.new_command_buffer();
+    let serial = device.commit_for(1, commands).unwrap();
+    device.destroy_texture(first).unwrap();
+    device.destroy_buffer(first_buffer).unwrap();
+    assert_eq!(freed(&mut device), (false, false));
+    assert_eq!(device.memory().mirrors.live, 1);
+    // The second texture's commits copy through its own buffer.
+    let commands = device.new_command_buffer();
+    let later = device.commit_for(2, commands).unwrap();
+    complete(&mut device, serial);
+    assert_eq!(freed(&mut device), (false, false));
+    // Its connection is not the one whose work is in flight; the mirror
+    // still waits for it.
+    let commands = device.new_command_buffer();
+    let last = device.commit_for(1, commands).unwrap();
+    device.destroy_texture(second).unwrap();
+    device.destroy_buffer(second_buffer).unwrap();
+    assert_eq!(device.memory().mirrors.live, 0);
+    complete(&mut device, later);
+    assert_eq!(freed(&mut device), (false, false));
+    complete(&mut device, last);
+    assert_eq!(freed(&mut device), (true, true));
+    submit(&mut device);
+    assert_eq!(mirror_copies(&mut device), (Vec::new(), Vec::new()));
 }
 
 /// A pixel-coordinate sampler, bicubic or not, says so in its ID: shaders

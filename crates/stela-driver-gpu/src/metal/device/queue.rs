@@ -388,6 +388,12 @@ impl Queue {
             .any(|flight| release.read_by(flight.key, flight.serial))
     }
 
+    /// Whether any of command buffer `serial`'s work is still held, not
+    /// submitted.
+    pub(super) fn holds(&self, serial: u64) -> bool {
+        self.held.iter().any(|held| held.serial == serial)
+    }
+
     /// The connections of unfinished command buffers that carry uploads or
     /// decodes of `texture`.
     pub(super) fn carriers(&self, texture: TextureId) -> impl Iterator<Item = u64> + '_ {
@@ -473,7 +479,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // created.
         let textures = self.pass_textures(request)?;
         for &(id, _) in &textures {
-            if let Some(root) = self.mirrored_root(id)
+            if let Some(root) = self.synced_root(id)
                 && !commands.rendered.contains(&root)
             {
                 commands.rendered.push(root);
@@ -859,24 +865,23 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 .sum();
         }
         let mut times = None;
-        let mut mirrored = Vec::new();
+        let mut syncs = super::resources::MirrorSyncs::default();
         let prepared = (|| {
             let mut held =
                 self.hold(serial, [key, queue], recording.segments, recording.mappings)?;
             times = self.time(held.as_mut_slice())?;
-            // Mirrored textures' rows reach their images after the opening
-            // barrier, and the images the work wrote go back to the rows
-            // before its completion is marked, both outside its GPU times.
+            // Mirrors' rows reach their images with the CPU-copy uploads,
+            // and the images the work wrote go back to the rows before its
+            // completion is marked, both outside its GPU times.
             let work = held.as_mut_slice();
             let segments = work.iter().flat_map(|held| &held.segments);
-            let syncs =
-                self.mirror_syncs(&rendered, segments.flat_map(|segment| &segment.commands));
-            if !syncs.textures.is_empty() {
-                work[0].segments[0].commands.splice(1..1, syncs.before);
+            syncs = self.mirror_syncs(&rendered, segments.flat_map(|segment| &segment.commands));
+            if !syncs.after.is_empty() {
                 let last = work.last_mut().and_then(|held| held.segments.last_mut());
-                last.expect("a segment").commands.extend(syncs.after);
+                last.expect("a segment")
+                    .commands
+                    .extend(core::mem::take(&mut syncs.after));
             }
-            mirrored = syncs.textures;
             if let Some(marker) = self.marker_buffer() {
                 for work in held.as_mut_slice() {
                     mark_completion(&mut work.segments, completion, marker, serial);
@@ -914,9 +919,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // available for the next commit until preparation succeeds.
         let mut carried = self.cpu_copy_textures();
         let mut uploads = self.take_cpu_copy_uploads();
+        // Mirrors' uploads go first too, so that a command buffer held for
+        // an event leaves no later work reading images they would fill.
+        uploads.append(&mut syncs.before);
         let leads = !uploads.is_empty();
-        let carries = leads || !mirrored.is_empty();
-        carried.extend(mirrored);
+        let carries = leads || !syncs.textures.is_empty();
+        carried.append(&mut syncs.textures);
         carried.sort_unstable();
         carried.dedup();
         // They ride the command buffer only when it reaches the queue now.
@@ -945,6 +953,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let start = self.timing.since(Phase::CommitUpload, start);
         self.submitted = serial;
         self.apply_plane_changes(planes);
+        self.apply_mirror_syncs(serial, &syncs);
         self.queue.in_flight.push_back(InFlight {
             serial,
             key,

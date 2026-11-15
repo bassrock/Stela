@@ -2977,6 +2977,18 @@ impl Backend for NativeBackend {
         Ok(())
     }
 
+    fn digest_memory(&mut self, memory: Memory, offset: u64, length: u64) -> Result<u64> {
+        let mapped = self.mapping(memory, offset, length)?;
+        if !mapped.coherent {
+            self.invalidate_range(mapped.memory, mapped.offset, length)?;
+        }
+        let mut digest = crate::metal::vulkan::backend::RowsDigest::new();
+        // SAFETY: `mapped` covers the range; the guest may write it
+        // meanwhile, as it may any surface the GPU reads.
+        unsafe { digest.update_from(mapped.pointer.as_ptr(), length as usize) };
+        Ok(digest.finish())
+    }
+
     fn flush_memory(&mut self, memory: Memory, offset: u64, size: u64) -> Result<()> {
         let resolved = self.resolve(memory)?;
         self.flush_range(resolved.memory, resolved.offset + offset, size)
