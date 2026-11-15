@@ -382,6 +382,9 @@ pub struct Service<B: Backend, C: Compiler> {
     read_back_started: Option<StartedReadBack>,
     reopen: Option<Reopen<B, C>>,
     prepare: Option<Prepare<B, C>>,
+    /// Whether a lost device the reopened one replaces is kept unreleased
+    /// ([`Self::keep_lost_devices`]).
+    keep_lost: bool,
     /// DIAGNOSTIC (vector glyphs): the vector renderer's draws logged and
     /// the pass encoding now ([`diagnose`]).
     vector_draws: diagnose::VectorDraws,
@@ -416,6 +419,7 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             read_back_started: None,
             reopen: None,
             prepare: None,
+            keep_lost: false,
             vector_draws: diagnose::VectorDraws::default(),
             missing_functions: 0,
         }
@@ -424,6 +428,15 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     /// Serves a new device from `reopen` once a lost one's connections close.
     pub fn with_reopen(mut self, reopen: Reopen<B, C>) -> Self {
         self.reopen = Some(reopen);
+        self
+    }
+
+    /// Keeps each lost device unreleased once a reopened one replaces it,
+    /// for a driver whose release of a device the kernel lost may wait
+    /// without bound: RADV's closes its file, whose close waits for the VM
+    /// work an amdgpu reset holds back, in the turn every client waits on.
+    pub fn keep_lost_devices(mut self) -> Self {
+        self.keep_lost = true;
         self
     }
 
@@ -529,7 +542,12 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                     prepare(&mut device);
                 }
                 let clock = self.device.clock();
-                self.device = device;
+                let lost = core::mem::replace(&mut self.device, device);
+                if self.keep_lost {
+                    core::mem::forget(lost);
+                } else {
+                    drop(lost);
+                }
                 self.device.set_clock(clock);
                 self.epoch = epoch;
                 self.shares = sharing::Shares::default();
