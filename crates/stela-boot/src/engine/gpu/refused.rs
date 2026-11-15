@@ -11,7 +11,7 @@ use core::{
 };
 
 /// How many refusals are shown; one more line says that more were not.
-const SHOWN: u32 = 24;
+const SHOWN: u32 = 96;
 static REFUSED: AtomicU32 = AtomicU32::new(0);
 
 /// DRM's ioctl type, `'d'`, and its first driver command.
@@ -24,6 +24,9 @@ const EINTR: i64 = -4;
 const EAGAIN: i64 = -11;
 /// Linux's `ERESTARTSYS`, which a client may see from an interrupted wait.
 const ERESTARTSYS: i64 = -512;
+/// Linux's `ETIME`: a bounded wait that ran out, as the completion
+/// waiter's idle waits all do; never a refusal.
+const ETIME: i64 = -62;
 
 /// An ioctl argument's first bytes as the caller passed them: the kernel
 /// writes its answer over the same structure. Only amdgpu's are decoded.
@@ -80,7 +83,13 @@ fn turn() -> bool {
 
 /// Reports ioctl `request` on `fd` if Linux refused it with `result`.
 pub(super) fn control(fd: c_int, request: u32, input: Option<&Input>, result: i64) {
-    if result >= 0 || matches!(result, EINTR | EAGAIN | ERESTARTSYS) || !turn() {
+    if result >= 0 || matches!(result, EINTR | EAGAIN | ERESTARTSYS) {
+        return;
+    }
+    if result == ETIME && request & 0xff == 0xca && (request >> 8) & 0xff == DRM {
+        return;
+    }
+    if !turn() {
         return;
     }
     let number = request & 0xff;
