@@ -78,8 +78,37 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             archives: self.archives(connection, &mut *memory, &request.archives)?,
         };
         self.noted = Some(self.describe_render_pipeline(&pipeline));
+        let targets = pipeline.targets;
         let pipeline = self.device.new_render_pipeline(&pipeline)?;
+        self.note_vector_targets(pipeline, &targets);
         self.adopt_render_pipeline(call, pipeline)
+    }
+
+    /// DIAGNOSTIC (vector glyphs): joins a vector renderer pipeline's
+    /// targets and fragment accesses to its `PIPELINE` line
+    /// ([`diagnose::targets`](super::diagnose::targets)).
+    fn note_vector_targets(&mut self, pipeline: RenderPipelineId, targets: &RenderTargets) {
+        let Some((vertex, fragment)) = self.device.render_pipeline_entries(pipeline) else {
+            return;
+        };
+        if !super::diagnose::vector_pipeline(vertex, fragment) {
+            return;
+        }
+        let Ok(state) = self.device.render_pipeline_state(pipeline) else {
+            return;
+        };
+        let fragment = state
+            .interfaces
+            .iter()
+            .find(|interface| interface.stage == crate::metal::shader::Stage::Fragment);
+        let text = super::diagnose::targets(targets, &state.plan, fragment);
+        match &mut self.noted {
+            Some(noted) => {
+                noted.push_str("; ");
+                noted.push_str(&text);
+            }
+            None => self.noted = Some(text),
+        }
     }
 
     /// A render pipeline's functions and vertex fetch, for the platform's

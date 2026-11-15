@@ -43,6 +43,7 @@ use stela_contracts::gate::MemoryRange;
 use wire::{Fault, Handle, NegotiateRequest, NegotiateResponse, Operation, Record, Span, Status};
 
 mod commands;
+mod diagnose;
 mod gate;
 pub mod identity;
 mod indirect;
@@ -378,7 +379,16 @@ pub struct Service<B: Backend, C: Compiler> {
     read_back_started: Option<StartedReadBack>,
     reopen: Option<Reopen<B, C>>,
     prepare: Option<Prepare<B, C>>,
+    /// DIAGNOSTIC (vector glyphs): the vector renderer's draws logged and
+    /// the pass encoding now ([`diagnose`]).
+    vector_draws: diagnose::VectorDraws,
+    /// DIAGNOSTIC: the names `newFunctionWithName:` found no function of,
+    /// logged up to [`MISSING_FUNCTIONS_NOTED`].
+    missing_functions: usize,
 }
+
+/// DIAGNOSTIC: the missing functions a service names in the log.
+const MISSING_FUNCTIONS_NOTED: usize = 32;
 
 impl<B: Backend, C: Compiler> Service<B, C> {
     /// Serves `device` in its `epoch`, which a device the gate registers
@@ -403,6 +413,8 @@ impl<B: Backend, C: Compiler> Service<B, C> {
             read_back_started: None,
             reopen: None,
             prepare: None,
+            vector_draws: diagnose::VectorDraws::default(),
+            missing_functions: 0,
         }
     }
 

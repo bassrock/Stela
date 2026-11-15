@@ -64,11 +64,14 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                     }
                     return Err(error.into());
                 }
+                // DIAGNOSTIC (vector glyphs): the pass its draws are logged in.
+                self.vector_draws.pass = self.vector_draws.open().then_some(request);
             }
             RenderCode::SetPipeline => {
                 let SetPipeline { pipeline } = payload.record()?;
                 let pipeline = self.object::<RenderPipelineId>(connection, pipeline)?;
                 commands.set_render_pipeline_state(self.device.render_pipeline_state(pipeline)?)?;
+                self.note_vector_draw(pipeline);
             }
             RenderCode::SetBuffer => {
                 let StageBuffer {
@@ -513,6 +516,48 @@ impl<B: Backend, C: Compiler> Service<B, C> {
     /// A refused pass, for the platform's log: why, its color attachments
     /// (each texture and resolve texture as it was made, and the actions)
     /// and its tile memory where the pass sets any.
+    /// DIAGNOSTIC (vector glyphs): logs the first binding of a vector
+    /// renderer pipeline in a pass of attachments of a new kind
+    /// ([`diagnose::draw`](crate::metal::service::diagnose::draw)).
+    fn note_vector_draw(&mut self, pipeline: RenderPipelineId) {
+        use crate::metal::service::diagnose;
+        let Some(pass) = &self.vector_draws.pass else {
+            return;
+        };
+        let Some((vertex, fragment)) = self.device.render_pipeline_entries(pipeline) else {
+            return;
+        };
+        if !diagnose::vector_pipeline(vertex, fragment) {
+            return;
+        }
+        let describe = |id: TextureId| self.device.texture_descriptor(id).ok().copied();
+        let kind = diagnose::pass_kind(pass, describe);
+        if !self.vector_draws.is_new(pipeline.0, kind) {
+            return;
+        }
+        let storage = self
+            .device
+            .render_pipeline_state(pipeline)
+            .ok()
+            .and_then(|state| {
+                state
+                    .interfaces
+                    .iter()
+                    .find(|interface| interface.stage == crate::metal::shader::Stage::Fragment)
+            })
+            .map_or(0, |fragment| fragment.storage_attachments);
+        let routes = |id: TextureId| self.device.attachment_routes(id);
+        let text = diagnose::draw(vertex, fragment, storage, pass, describe, routes);
+        self.vector_draws.record(pipeline.0, kind);
+        match &mut self.noted {
+            Some(noted) => {
+                noted.push_str("; ");
+                noted.push_str(&text);
+            }
+            None => self.noted = Some(text),
+        }
+    }
+
     fn describe_pass(&self, request: &RenderPassRequest, error: Error) -> String {
         use core::fmt::Write;
         let texture = |id: TextureId| {

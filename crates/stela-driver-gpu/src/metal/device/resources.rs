@@ -1453,6 +1453,21 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// NVK does unless every attachment of the instance is linear: a storage
     /// view of the image then reads what the instance began with, and the
     /// shadow's store where it ends overwrites the storage writes.
+    /// DIAGNOSTIC (vector glyphs): whether a texture lies in a mirror of
+    /// buffer rows no linear image takes ([`mirrors`]), and whether its
+    /// framebuffer reads go through a copy of it.
+    pub fn attachment_routes(&self, id: TextureId) -> (bool, bool) {
+        let mirrored = self
+            .resources
+            .textures
+            .get(id.0)
+            .is_ok_and(|texture| !texture.mirrors.is_empty());
+        (
+            mirrored,
+            self.reads_attachment_through_copy(id).unwrap_or(false),
+        )
+    }
+
     pub fn reads_attachment_through_copy(&self, id: TextureId) -> Result<bool> {
         let mut texture = self.resources.textures.get(id.0)?;
         let mut root = id;

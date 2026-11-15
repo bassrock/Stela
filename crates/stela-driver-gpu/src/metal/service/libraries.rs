@@ -204,13 +204,21 @@ impl<B: Backend, C: Compiler> Service<B, C> {
         );
         // A name the library lacks is Metal's nil answer, not a refusal:
         // Core Image looks for its kernels library by library.
-        let function =
-            self.device
-                .new_function(library, &name, values)
-                .map_err(|error| match error {
-                    NO_FUNCTION => Fault::new(Status::Declined, "no function of that name"),
-                    error => error.into(),
-                })?;
+        let function = match self.device.new_function(library, &name, values) {
+            Err(NO_FUNCTION) => {
+                // DIAGNOSTIC: which names find no function, as a crashing
+                // process may have expected one.
+                if self.missing_functions < super::MISSING_FUNCTIONS_NOTED {
+                    self.missing_functions += 1;
+                    self.noted = Some(alloc::format!(
+                        "no function named {name} in library {}",
+                        library.0
+                    ));
+                }
+                return Err(Fault::new(Status::Declined, "no function of that name"));
+            }
+            function => function?,
+        };
         if let Some(specialized) = &specialized {
             self.device.name_function(function, specialized)?;
         }

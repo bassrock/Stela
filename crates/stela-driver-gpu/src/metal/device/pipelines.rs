@@ -1564,6 +1564,17 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         Ok(&self.pipelines.render.get(id.0)?.state)
     }
 
+    /// DIAGNOSTIC (vector glyphs): the vertex and fragment entries a render
+    /// pipeline was made of; `None` for a mesh pipeline or an unknown id.
+    pub fn render_pipeline_entries(&self, id: RenderPipelineId) -> Option<(&str, Option<&str>)> {
+        let request = self.pipelines.render.get(id.0).ok()?.request.as_ref()?;
+        let vertex = self.function_entry(request.vertex_function).ok()?;
+        let fragment = request
+            .fragment_function
+            .and_then(|fragment| self.function_entry(fragment).ok());
+        Some((vertex, fragment))
+    }
+
     /// The vertex pipeline whose vertex and fragment stages filter the
     /// samplers at `bicubic` bicubically, for draws binding bicubic samplers
     /// there; compiled on first use.
