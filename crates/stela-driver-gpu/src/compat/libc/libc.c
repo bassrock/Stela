@@ -1069,12 +1069,16 @@ ssize_t write(int fd, const void *buffer, size_t size)
 	return (ssize_t)size;
 }
 
+/* Linux's own descriptors seek there: libdrm sizes a dma-buf it imports by
+ * seeking to its end. */
 off_t lseek(int fd, off_t offset, int whence)
 {
-	(void)fd;
-	(void)offset;
-	(void)whence;
-	return fail(EBADF);
+	if (fd < 0 || fd >= STELA_LIBC_FILE_BASE || text_file(fd))
+		return fail(EBADF);
+	long long result = stela_libc_drm_seek(fd, (long long)offset, whence);
+	if (result < 0)
+		return fail((int)-result);
+	return (off_t)result;
 }
 
 int flock(int fd, int operation)

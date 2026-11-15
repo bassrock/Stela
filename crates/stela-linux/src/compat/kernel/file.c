@@ -248,6 +248,21 @@ long stela_linux_fd_device(int fd)
 	return device;
 }
 
+long long stela_linux_fd_seek(int fd, long long offset, int whence)
+{
+	struct file *file = fget((unsigned int)fd);
+	long long result;
+
+	if (!file)
+		return -EBADF;
+	if (file->f_op && file->f_op->llseek)
+		result = file->f_op->llseek(file, offset, whence);
+	else
+		result = -ESPIPE;
+	fput(file);
+	return result;
+}
+
 static DECLARE_WAIT_QUEUE_HEAD(stela_linux_waiters);
 
 void stela_linux_wait(const volatile unsigned int *word, unsigned int value, u64 nanoseconds)
