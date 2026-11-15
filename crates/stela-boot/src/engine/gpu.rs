@@ -153,8 +153,9 @@ const METAL_DRIVER: &Driver = &NOUVEAU;
 #[cfg(feature = "radv")]
 const METAL_DRIVER: &Driver = &AMDGPU;
 
-/// How long the GPUs may take to boot their firmware before the guest starts.
-const START_SECONDS: u64 = 600;
+/// How long the GPUs may take to boot their firmware before the guest starts:
+/// a Navi 21 takes about 31 s, 28 of them saving its memory training.
+const START_SECONDS: u64 = 120;
 /// The longest idle wait while they do, which the timeout above is checked at.
 const WAIT_MICROS: u64 = 10_000;
 /// How often a long wait in the start says where it is ([`wait_for_child`]).

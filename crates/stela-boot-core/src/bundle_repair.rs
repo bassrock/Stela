@@ -409,45 +409,32 @@ pub fn diagnose_steps() -> Vec<Step> {
         seconds,
         required: false,
     };
-    // A LaunchDaemon the next multi-user boot runs once WindowServer has
-    // tried: it prints the accelerators, the framebuffer and WindowServer's
-    // and Metal's unified log to the console, which the boot log keeps.
-    const DIR: &str = "/Library/StelaDiag";
-    const SCRIPT: &str = "/Library/StelaDiag/diag.sh";
-    const PLIST: &str = "/Library/LaunchDaemons/com.stela.diag.plist";
-    let script = [
-        r#"'#!/bin/sh' 'exec > /dev/console 2>&1' 'sleep 100' 'echo STELADIAG begin'"#,
-        r#"'/usr/sbin/ioreg -l -w0 -r -c IOAccelerator | /usr/bin/head -150' '/usr/sbin/ioreg -l -w0 -r -c IOMobileFramebuffer | /usr/bin/grep -i -E "accel|gpu|metal|IOClass" | /usr/bin/head -40'"#,
-        r#"'/usr/bin/log show --last 5m --style compact --predicate "process == \"WindowServer\"" | /usr/bin/grep -v -i "keystore" | /usr/bin/tail -220'"#,
-        r#"'/usr/bin/log show --last 5m --style compact --predicate "subsystem BEGINSWITH \"com.apple.Metal\" OR eventMessage CONTAINS[c] \"StelaGPU\" OR eventMessage CONTAINS[c] \"MTLDevice\"" | /usr/bin/tail -100' 'echo STELADIAG end'"#,
-    ];
-    let mut steps = Vec::from([
+    const REPORTS: &str = "/Library/Logs/DiagnosticReports";
+    Vec::from([
         optional("/sbin/mount -P 1", 120),
         optional("/usr/libexec/init_data_protection", 180),
         optional("/sbin/mount -P 2", 180),
+        // What an earlier diagnosis left to run at multi-user boots.
+        optional(
+            "/bin/rm -rf /Library/LaunchDaemons/com.stela.diag.plist /Library/StelaDiag",
+            30,
+        ),
         // A stale plugin executable the kext cannot overwrite (EIO): gone,
         // the next boot's kext writes this stela.efi's afresh.
-        optional(
-            &format!("/bin/rm -f {PLUGINS}/StelaGPU.bundle/Contents/MacOS/StelaGPU; /bin/ls -la {PLUGINS}/StelaGPU.bundle/Contents/MacOS"),
-            30,
-        ),
-        optional(&format!("/bin/mkdir -p {DIR} && /bin/rm -f {SCRIPT}"), 30),
-    ]);
-    for lines in script {
-        steps.push(optional(&format!("/usr/bin/printf '%s\\n' {lines} >> {SCRIPT}"), 30));
-    }
-    steps.extend([
-        optional(&format!("/bin/chmod 755 {SCRIPT} && /bin/cat {SCRIPT}"), 30),
+        optional(&format!("/bin/rm -f {PLUGINS}/StelaGPU.bundle/Contents/MacOS/StelaGPU"), 30),
+        optional(&format!("/bin/ls -lt {REPORTS} 2>&1 | /usr/bin/head -40"), 30),
         optional(
             &format!(
-                "/usr/bin/printf '%s\\n' '<?xml version=\"1.0\" encoding=\"UTF-8\"?>' '<plist version=\"1.0\"><dict><key>Label</key><string>com.stela.diag</string><key>ProgramArguments</key><array><string>/bin/sh</string><string>{SCRIPT}</string></array><key>RunAtLoad</key><true/></dict></plist>' > {PLIST}"
+                "for f in $(/bin/ls -t {REPORTS}/WindowServer* 2>/dev/null | /usr/bin/head -2); do echo \"== $f\"; /usr/bin/head -c 16000 \"$f\"; echo; done"
             ),
+            120,
+        ),
+        optional(
+            &format!("/bin/ls -la {PLUGINS}/StelaGPU.bundle/Contents {PLUGINS}/StelaGPU.bundle/Contents/MacOS 2>&1"),
             30,
         ),
-        optional(&format!("/usr/sbin/chown root:wheel {PLIST} && /bin/chmod 644 {PLIST} && /bin/cat {PLIST}"), 30),
         optional("/bin/sync", 60),
-    ]);
-    steps
+    ])
 }
 
 /// The repair's commands, in order, each answered by its exit status.
