@@ -160,9 +160,14 @@ int atexit(void (*function)(void))
 	return 0;
 }
 
+/* RADV runs with color compression (DCC) off: under the unified image
+ * layouts Stela's Metal device requires, an image a copy fills and a shader
+ * then samples read back blank with DCC on (app icons and widgets drew
+ * empty on an RX 6800 XT). */
 char *getenv(const char *name)
 {
-	(void)name;
+	if (name && !strcmp(name, "RADV_DEBUG"))
+		return (char *)"nodcc";
 	return NULL;
 }
 
