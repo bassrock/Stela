@@ -422,6 +422,9 @@ pub fn diagnose_steps() -> Vec<Step> {
         // A stale plugin executable the kext cannot overwrite (EIO): gone,
         // the next boot's kext writes this stela.efi's afresh.
         optional(&format!("/bin/rm -f {PLUGINS}/StelaGPU.bundle/Contents/MacOS/StelaGPU"), 30),
+        // Icons iconservices rendered while the GPU drew them blank stay
+        // cached blank: the system store goes, the next login renders anew.
+        optional("/bin/rm -rf /Library/Caches/com.apple.iconservices.store", 60),
         optional(&format!("/bin/ls -lt {REPORTS} 2>&1 | /usr/bin/head -40"), 30),
         optional(
             &format!(
