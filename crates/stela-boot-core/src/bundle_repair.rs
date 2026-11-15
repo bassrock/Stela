@@ -425,6 +425,12 @@ pub fn diagnose_steps() -> Vec<Step> {
         optional("/sbin/mount -P 1", 120),
         optional("/usr/libexec/init_data_protection", 180),
         optional("/sbin/mount -P 2", 180),
+        // A stale plugin executable the kext cannot overwrite (EIO): gone,
+        // the next boot's kext writes this stela.efi's afresh.
+        optional(
+            &format!("/bin/rm -f {PLUGINS}/StelaGPU.bundle/Contents/MacOS/StelaGPU; /bin/ls -la {PLUGINS}/StelaGPU.bundle/Contents/MacOS"),
+            30,
+        ),
         optional(&format!("/bin/mkdir -p {DIR} && /bin/rm -f {SCRIPT}"), 30),
     ]);
     for lines in script {

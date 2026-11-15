@@ -73,7 +73,8 @@ fn from_disk(
     defaults.boot_args.push_str(&lock_timeout_arguments(tsc_hz));
     // The automatic Metal plugin repair NVRAM asked for is the manual
     // remedy's boot: single-user, filesystem protection off.
-    let maintenance_write = options.maintenance_write || options.bundle_repair;
+    let maintenance_write =
+        options.maintenance_write || options.bundle_repair || options.console_diagnose;
     let single_user = options.single_user || options.bundle_repair || options.console_diagnose;
     if options.console_diagnose {
         bundle_repair::diagnose();
@@ -95,7 +96,7 @@ fn from_disk(
     }
     bundle_repair::boot(if options.bundle_repair {
         stela_boot_core::bundle_repair::Boot::Repair
-    } else if options.single_user {
+    } else if options.single_user || options.console_diagnose {
         stela_boot_core::bundle_repair::Boot::SingleUser
     } else {
         stela_boot_core::bundle_repair::Boot::Normal
