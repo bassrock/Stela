@@ -425,7 +425,7 @@ pub fn diagnose_steps() -> Vec<Step> {
         optional(&format!("/bin/ls -lt {REPORTS} 2>&1 | /usr/bin/head -40"), 30),
         optional(
             &format!(
-                "for f in $(/bin/ls -t {REPORTS}/WindowServer* 2>/dev/null | /usr/bin/head -2); do echo \"== $f\"; /usr/bin/head -c 16000 \"$f\"; echo; done"
+                "for f in $(/bin/ls -t {REPORTS}/iconservicesagent* {REPORTS}/WindowServer* 2>/dev/null | /usr/bin/head -3); do echo \"== $f\"; /usr/bin/head -c 16000 \"$f\"; echo; done"
             ),
             120,
         ),
