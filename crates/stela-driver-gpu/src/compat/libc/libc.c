@@ -160,9 +160,12 @@ int atexit(void (*function)(void))
 	return 0;
 }
 
+/* Experiment: RADV with color compression off, to test whether images a
+ * copy fills and a shader samples read back wrong under unified layouts. */
 char *getenv(const char *name)
 {
-	(void)name;
+	if (name && !strcmp(name, "RADV_DEBUG"))
+		return (char *)"nodcc";
 	return NULL;
 }
 
