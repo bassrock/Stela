@@ -80,6 +80,7 @@ unsafe extern "C" {
     /// `compat/mesa/radv_nir_options.c`.
     fn stela_radv_nir_options(physical: vk::PhysicalDevice) -> *const c_void;
     /// `compat/mesa/radv_submit.c`.
+    fn stela_radv_submit_thread(queue: vk::Queue) -> vk::Result;
     fn stela_radv_submit_failure(
         queue: vk::Queue,
         semaphore: vk::Semaphore,
@@ -1205,11 +1206,10 @@ fn loader() -> (Loader, fn(vk::PhysicalDevice) -> compiler::Service) {
     (loader, compiler)
 }
 
-/// RADV's loader: its NIR options and its refusals. A commit's submission
-/// runs on its PE, whose ioctls wait for the boot CPU. A submission amdgpu
-/// refuses short of losing the context fails its command buffer, not the
-/// device (Mesa patch 0034); a lost context loses the device, which the
-/// service reopens.
+/// RADV's loader: its NIR options, its submit thread and its refusals. A
+/// submission amdgpu refuses short of losing the context fails its command
+/// buffer, not the device (Mesa patch 0034); a lost context loses the
+/// device, which the service reopens.
 #[cfg(feature = "radv")]
 fn loader() -> (Loader, fn(vk::PhysicalDevice) -> compiler::Service) {
     let compiler = |physical| {
@@ -1220,7 +1220,8 @@ fn loader() -> (Loader, fn(vk::PhysicalDevice) -> compiler::Service) {
     let loader = Loader {
         get_instance_proc_addr: entry,
         log: driver_message,
-        submit_thread: None,
+        // A commit's submission runs where Linux does, not on its PE.
+        submit_thread: Some(stela_radv_submit_thread),
         // A refused submission fails its command buffer, not the device.
         refusals: Some(Refusals {
             take: stela_radv_submit_failure,
