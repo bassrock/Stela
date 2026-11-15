@@ -882,10 +882,15 @@ TABLE(maxVertexAttributes, 31)
 }
 
 /* Core Animation holds a surface's rows to this as well as its base. A base is
- * always a page, so only a row's alignment limits a surface. */
+ * always a page, so only a row's alignment limits a surface. Rows no linear
+ * image takes are mirrored for writes as for reads (an image the texture
+ * renders, copied back), so they too need hold only whole texels: Core Image
+ * makes no texture of a surface whose rows miss this, and an image processor
+ * whose output has none aborts (an MPS blur's "destination may not be nil",
+ * from RADV's 256-byte linear rows against an icon's 64- to 384-byte ones). */
 - (NSUInteger)iosurfaceTextureAlignmentBytes
 {
-	return _capabilities->linear_row_alignment;
+	return _capabilities->surface_read_row_alignment;
 }
 
 /* Rows a texture only reads need hold only whole texels, the device mirroring
