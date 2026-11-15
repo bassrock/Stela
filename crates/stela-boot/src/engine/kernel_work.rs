@@ -337,6 +337,9 @@ unsafe impl Cpu for NativeCpu {
     fn fatal(&self, error: WorkError) -> ! {
         self.reservation.identity.fatal(error)
     }
+    fn check_process(&self) -> Result<(), WorkError> {
+        self.reservation.identity.check_process_cpu()
+    }
 }
 /// !Send/!Sync executor: producers may eventually receive owned mailbox views,
 /// never an Arc wrapping this Runtime or a foreign-CPU task-switch permission.
