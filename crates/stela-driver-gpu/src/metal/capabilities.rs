@@ -268,6 +268,11 @@ impl TexelBufferAlignment {
     }
 }
 
+/// The row alignment a texture over a buffer's or surface's rows needs once
+/// rows no linear image takes are mirrored: the widest uncompressed texel's
+/// bytes ([`Capabilities::surface_read_row_alignment`]).
+pub const MIRRORED_ROW_ALIGNMENT: u64 = 16;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Capabilities {
     pub name: String,
@@ -486,6 +491,20 @@ impl Capabilities {
         } else {
             0
         }
+    }
+
+    /// `iosurfaceReadOnlyTextureAlignmentBytes`: what the rows of a surface
+    /// a texture only reads must be a multiple of. Rows no linear image
+    /// takes lie in a mirror the texture samples ([`resource::Mirror`]),
+    /// which needs them only to hold whole texels; Metal answers one value
+    /// for every format, the widest texel's 16 bytes, as Apple's GPUs do.
+    /// Core Image makes no texture of a surface whose rows miss it, so a
+    /// coarser answer, as RADV's 256-byte linear rows were, leaves its image
+    /// processors' inputs without textures.
+    ///
+    /// [`resource::Mirror`]: crate::metal::resource::Mirror
+    pub fn surface_read_row_alignment(&self) -> u64 {
+        self.linear_row_alignment.min(MIRRORED_ROW_ALIGNMENT)
     }
 
     /// Row-pitch and offset alignments of linear textures inside buffers.
