@@ -1074,6 +1074,16 @@ fn claim(
             // move to, so the claim goes ahead headless: the screen goes dark
             // here and the boot log on the USB is the only record from this
             // point.
+            // With its display core, amdgpu lights the screen again once the
+            // Metal device's display takes it.
+            #[cfg(feature = "amdgpu-dc")]
+            if driver.vendor == AMDGPU.vendor {
+                output::arguments(format_args!(
+                    "GPU {address}: the firmware's screen is on this AMD GPU: claiming it, the \
+                     screen goes dark until amdgpu's display core lights it again\n"
+                ));
+            }
+            #[cfg(not(feature = "amdgpu-dc"))]
             if driver.vendor == AMDGPU.vendor {
                 output::arguments(format_args!(
                     "GPU {address}: the firmware's screen is on this AMD GPU, which amdgpu \

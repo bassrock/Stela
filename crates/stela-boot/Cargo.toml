@@ -42,7 +42,8 @@ radv = ["metal-device", "amdgpu", "stela-mesa/radv"]
 # and `radv` have in common. Not chosen on its own.
 metal-device = ["dep:stela-mesa", "stela-drivers/metal-linked"]
 # amdgpu with its Display Core (CONFIG_DRM_AMD_DC, CONFIG_DRM_AMD_DC_FP): DC
-# binds the display hardware in the composite, as yet without a KMS consumer.
+# binds the display hardware in the composite; with `radv`, the Mac's display
+# scans out through it.
 amdgpu-dc = ["amdgpu", "stela-drivers/amdgpu-dc"]
 
 [dependencies]

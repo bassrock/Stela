@@ -133,8 +133,8 @@ pub enum Command {
         radv: bool,
         /// Carry amdgpu with its Display Core (CONFIG_DRM_AMD_DC and
         /// CONFIG_DRM_AMD_DC_FP), which `--amdgpu` leaves out; implies
-        /// `--amdgpu`. DC binds the display hardware but nothing yet scans
-        /// out through it.
+        /// `--amdgpu`. With `--radv`, the Mac's display scans out through
+        /// it.
         #[arg(long)]
         amdgpu_dc: bool,
     },
