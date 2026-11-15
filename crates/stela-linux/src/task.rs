@@ -771,13 +771,19 @@ impl<const N: usize> TaskBinding<N> {
         // Validate CPU/IRQ/RSP independently BEFORE dereferencing any
         // mutable C task/context field. ops/binding stay immutable and kept
         // throughout attached lifetime, including taskless/IRQ rejection.
-        let Ok(handle) = this.current_wake() else {
+        // These are current_wake's checks without the handle it would build
+        // and drop, whose references and second process check C pays on
+        // every current and preempt_count.
+        let Ok(first) = this.first() else {
+            return false;
+        };
+        let Ok(sequence) = first.current_sequence() else {
             return false;
         };
         // SAFETY: same-CPU current has now been established. C supplies
         // copied primitive metadata, not a temporary Runtime view.
         let view = unsafe { &*context };
-        handle.context_id().get() == view.context_id && handle.sequence() == view.sequence
+        first.context_id().get() == view.context_id && sequence == view.sequence
     }
 
     /// Run C with a shared Runtime capability on this stack.

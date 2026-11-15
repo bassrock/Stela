@@ -248,6 +248,17 @@ pub unsafe trait Cpu: Send + Sync {
     unsafe fn restore(&self, flags: u64);
     fn ticks(&self) -> u64;
     fn fatal(&self, error: WorkError) -> !;
+    /// `check_cpu`, then a refusal in interrupt context: process work's
+    /// admission. An adapter may override it to share the identity check
+    /// both make, provided the result is the same as this.
+    fn check_process(&self) -> Result<(), WorkError> {
+        self.check_cpu()?;
+        if self.in_interrupt() {
+            Err(WorkError::InterruptContext)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// The exclusively owned task RAM, guard and all-root mapping lease.
@@ -515,12 +526,7 @@ impl<const N: usize> Queue<N> {
         Ok(Guard { queue: self, flags })
     }
     fn process(&self) -> Result<(), WorkError> {
-        self.cpu.check_cpu()?;
-        if self.cpu.in_interrupt() {
-            Err(WorkError::InterruptContext)
-        } else {
-            Ok(())
-        }
+        self.cpu.check_process()
     }
     /// Read the executing owned work context, never a Runtime/Task
     /// pointer. CPU/IRQ metadata is checked before active metadata or
@@ -907,11 +913,12 @@ impl<const N: usize> WakeHandle<N> {
         self.signal.pending.store(true, Ordering::Release);
         Ok(())
     }
-    /// Refresh only from this same executing continuation. Reused-job
-    /// arrive can replace an old handle without a Runtime pointer. Runtime's
-    /// active binding keeps Queue/signal, so such replacement decrements only
-    /// nonfinal Arc references; it cannot release any owner/code/stack backing.
-    pub fn renew_current(&self) -> Result<Self, WorkError> {
+    /// The sequence [`Self::renew_current`] would give its handle, after the
+    /// same checks that this is the executing continuation, without taking
+    /// the handle's references: for a caller that only compares it, as
+    /// Linux's validation of its current task does on every preemption-count
+    /// change.
+    pub fn current_sequence(&self) -> Result<u64, WorkError> {
         if self.queue.current_id()? != self.id {
             return Err(WorkError::Unavailable);
         }
@@ -919,6 +926,14 @@ impl<const N: usize> WakeHandle<N> {
         if sequence == 0 {
             return Err(WorkError::Closed);
         }
+        Ok(sequence)
+    }
+    /// Refresh only from this same executing continuation. Reused-job
+    /// arrive can replace an old handle without a Runtime pointer. Runtime's
+    /// active binding keeps Queue/signal, so such replacement decrements only
+    /// nonfinal Arc references; it cannot release any owner/code/stack backing.
+    pub fn renew_current(&self) -> Result<Self, WorkError> {
+        let sequence = self.current_sequence()?;
         Ok(Self {
             queue: self.queue.clone(),
             signal: self.signal.clone(),

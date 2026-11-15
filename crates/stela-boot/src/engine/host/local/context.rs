@@ -229,6 +229,17 @@ impl RootIdentity {
     pub(crate) fn in_interrupt(&self) -> bool {
         self.affinity().is_err() || irq_active()
     }
+    /// [`Self::check_irq_cpu`], then a refusal in IRQ context: `Cpu`'s
+    /// process admission. `check_irq_cpu` has just checked the affinity that
+    /// [`Self::in_interrupt`] would check again, so only the IRQ record is left.
+    pub(crate) fn check_process_cpu(&self) -> Result<(), WorkError> {
+        self.check_irq_cpu()?;
+        if irq_active() {
+            Err(WorkError::InterruptContext)
+        } else {
+            Ok(())
+        }
+    }
     /// Immutable-root identity admission for process work, without a RAM grant.
     /// A native/helper frame cannot suspend its independent guest-state/code
     /// loan by starting a separate work executor underneath it.

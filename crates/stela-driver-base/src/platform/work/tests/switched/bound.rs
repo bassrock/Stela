@@ -170,6 +170,12 @@ unsafe impl SwitchBinding for Binding {
             let mut handle = self.handle.try_lock().unwrap();
             let renewed = handle.as_ref().unwrap().renew_current()?;
             assert_eq!(renewed.sequence(), context.sequence);
+            // The handle-free check sees the same continuation and job.
+            assert_eq!(
+                handle.as_ref().unwrap().current_sequence(),
+                Ok(context.sequence)
+            );
+            assert_eq!(renewed.current_sequence(), Ok(context.sequence));
             *handle = Some(renewed); // nonfinal Arc decrements only
             self.sequence.store(context.sequence, Ordering::Release);
             self.saved_preempt.store(0, Ordering::Release);
@@ -392,6 +398,10 @@ fn blocked_task_cancel_and_retirement() {
         handle.renew_current().err(),
         Some(WorkError::InterruptContext)
     );
+    assert_eq!(
+        handle.current_sequence(),
+        Err(WorkError::InterruptContext)
+    );
     handle.wake().unwrap();
     handle.wake().unwrap();
     assert_eq!(f.cpu.flags.load(Ordering::Acquire), 2);
@@ -575,6 +585,7 @@ fn wake_races_and_worker_reuse() {
         .clone();
     assert_eq!(old.wake(), Err(WorkError::Closed));
     assert_eq!(old.renew_current().err(), Some(WorkError::Unavailable));
+    assert_eq!(old.current_sequence(), Err(WorkError::Unavailable));
     // SAFETY: The context is the queue-kept fixture Arc pointer for this callback.
     // The Executor keeps its pinned runtime and guarded stacks through join or quarantine.
     unsafe { r.call_foreground(reused_worker, p, 10000) }.unwrap();
