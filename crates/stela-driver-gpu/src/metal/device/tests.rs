@@ -9,17 +9,17 @@ use super::{
 };
 use crate::metal::{
     abi::{
-        ConversionRounding, CpuCacheMode, DataType, DispatchType, FunctionType, HazardTrackingMode,
-        HeapType, IndirectCommandType, LoadAction, MultisampleDepthResolveFilter,
-        MultisampleStencilResolveFilter, PrimitiveTopologyClass, PrimitiveType, ResourceOptions,
-        SparsePageSize, SparseTextureMappingMode, StorageMode, StoreAction, StoreActionOptions,
-        SwizzleChannels, TessellationPartitionMode, TextureType, TextureUsage,
-        VisibilityResultType,
+        BlitOption, ConversionRounding, CpuCacheMode, DataType, DispatchType, FunctionType,
+        HazardTrackingMode, HeapType, IndirectCommandType, LoadAction,
+        MultisampleDepthResolveFilter, MultisampleStencilResolveFilter, PrimitiveTopologyClass,
+        PrimitiveType, ResourceOptions, SparsePageSize, SparseTextureMappingMode, StorageMode,
+        StoreAction, StoreActionOptions, SwizzleChannels, TessellationPartitionMode, TextureType,
+        TextureUsage, VisibilityResultType,
     },
     capabilities::Size,
     command_buffer::{
-        BufferRef,
-        blit::Region,
+        BufferRef, Segment,
+        blit::{BlitTexture, BufferLayout, Region},
         counters::{COUNTER_ERROR_VALUE, CounterSample},
         device_generated::{GeneratedLayoutKey, GeneratedWork},
         indirect::ExecutionRange,
@@ -32,7 +32,7 @@ use crate::metal::{
         TessellationDescriptor,
     },
     pixel_format::{BlockKernel, PixelFormat, extended_range},
-    resource::TextureDescriptor,
+    resource::{self, TextureDescriptor},
     sampler::SamplerDescriptor,
     shader::{DYNAMIC_BICUBIC, LinkedFunction, Linking, Specialization, Stage},
     sparse::{MappingUpdate, SparseRegion},
@@ -40,7 +40,7 @@ use crate::metal::{
         MemoryProperties, PipelineStages, PrimitiveTopology, ShaderStages,
         backend::{Descriptor, Object},
         command::Command,
-        object::{Buffer, MemoryRequest, Pipeline, PipelineSource, QueryType, Semaphore},
+        object::{Buffer, Image, MemoryRequest, Pipeline, PipelineSource, QueryType, Semaphore},
     },
 };
 use alloc::{string::String, sync::Arc, vec::Vec};
@@ -597,6 +597,316 @@ fn heap_buffers_start_where_a_linear_texture_over_them_binds() {
     device
         .new_texture_from_buffer(second, &descriptor, 0, 256)
         .unwrap();
+}
+
+/// Rows a linear image cannot take, 404 bytes apart where NVK's are
+/// multiples of 32, at an offset of whole texels.
+const MIRRORED_ROWS: (u64, u64) = (64, 404);
+
+/// A shared buffer and a 100x10 `Bgra8Unorm` texture of `usage` over its
+/// [`MIRRORED_ROWS`], with the texture's image.
+fn mirrored_texture(device: &mut TestDevice, usage: TextureUsage) -> (BufferId, TextureId, Image) {
+    let shared = options(StorageMode::Shared);
+    let buffer = device.new_buffer(1 << 16, shared).unwrap();
+    let mut descriptor = texture(PixelFormat::Bgra8Unorm, usage);
+    descriptor.width = 100;
+    descriptor.height = 10;
+    descriptor.options = shared;
+    let (offset, bytes_per_row) = MIRRORED_ROWS;
+    let texture = device
+        .new_texture_from_buffer(buffer, &descriptor, offset, bytes_per_row)
+        .unwrap();
+    let image = device.texture_image(texture).unwrap();
+    (buffer, texture, image)
+}
+
+/// The copies of a submission between buffers and images, in order, with
+/// their command's index in its segment.
+fn image_copies(segments: &[Segment]) -> Vec<(usize, usize, Command)> {
+    segments
+        .iter()
+        .enumerate()
+        .flat_map(|(at, segment)| {
+            segment
+                .commands
+                .iter()
+                .enumerate()
+                .filter(|(_, command)| {
+                    matches!(
+                        command,
+                        Command::CopyBufferToImage { .. } | Command::CopyImageToBuffer { .. }
+                    )
+                })
+                .map(move |(index, command)| (at, index, command.clone()))
+        })
+        .collect()
+}
+
+/// A texture over rows a linear image cannot take is made, not refused:
+/// an image of its own mirrors the rows, which the CPU reaches as it
+/// would a linear image's and each commit copies into the image first.
+#[test]
+fn unaligned_rows_are_mirrored_instead_of_refused() {
+    let mut device = device();
+    let (buffer, texture, image) = mirrored_texture(&mut device, TextureUsage::SHADER_READ);
+    let (offset, bytes_per_row) = MIRRORED_ROWS;
+    assert!(device.texture_bytes(texture) > 0, "the mirror's memory");
+    let notice = device.take_notice().unwrap();
+    assert!(
+        notice.contains("100x10 Bgra8Unorm at bytesPerRow 404 offset 64 mirrored"),
+        "{notice}"
+    );
+    assert_eq!(device.take_notice(), None);
+    assert!(!device.reads_attachment_through_copy(texture).unwrap());
+
+    // The CPU writes and reads the rows.
+    let (memory, base, _) = device.buffer_memory(buffer).unwrap();
+    let region = Region {
+        slice: 0,
+        level: 0,
+        origin: [3, 2, 0],
+        size: [2, 2, 1],
+    };
+    let tight = Strides {
+        bytes_per_row: 8,
+        bytes_per_image: 0,
+    };
+    let written: Vec<u8> = (0..16).collect();
+    device
+        .replace_region(texture, &region, &written, tight)
+        .unwrap();
+    let row = |y: u64| base + offset + y * bytes_per_row + 3 * 4;
+    let writes = &device.backend().writes;
+    let writes = writes[writes.len() - 2..].to_vec();
+    assert_eq!(
+        writes,
+        [
+            (memory, row(2), written[..8].to_vec()),
+            (memory, row(3), written[8..].to_vec())
+        ]
+    );
+    let mut read = [0; 16];
+    device
+        .get_bytes(texture, &region, &mut read, tight)
+        .unwrap();
+    assert_eq!(read[..], written[..]);
+
+    // A commit copies the rows into the image after its opening barrier,
+    // and copies nothing back: the work cannot write the image.
+    submit(&mut device);
+    let segments = device.backend().submissions.last().unwrap().clone();
+    let rows = device.buffer(buffer).unwrap().buffer;
+    let copies = image_copies(&segments);
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let (at, index, Command::CopyBufferToImage { src, dst, region }) = &copies[0] else {
+        panic!("{copies:?}");
+    };
+    assert_eq!((*at, *index, *src, *dst), (0, 1, rows, image));
+    assert_eq!(region.buffer_offset, offset);
+    assert_eq!(region.buffer_row_length, 101);
+    assert_eq!(region.extent, [100, 10, 1]);
+    assert!(matches!(segments[0].commands[2], Command::Barrier(_)));
+}
+
+/// Images the work may have written go back to their rows after it: a
+/// shader-written texture's always, a render target's when a pass renders
+/// to it and any texture's when a copy writes it.
+#[test]
+fn commits_copy_written_mirrors_back_to_their_rows() {
+    let mut device = device();
+    let (_, read_id, read) = mirrored_texture(&mut device, TextureUsage::SHADER_READ);
+    let (_, _, written) = mirrored_texture(&mut device, TextureUsage::SHADER_WRITE);
+    let (_, target, rendered) = mirrored_texture(
+        &mut device,
+        TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET,
+    );
+    let copied = |device: &mut TestDevice| {
+        let segments = device.backend().submissions.last().unwrap().clone();
+        let copies = image_copies(&segments);
+        let into: Vec<_> = copies
+            .iter()
+            .filter_map(|(at, index, command)| match command {
+                Command::CopyBufferToImage { dst, .. } => Some((*at, *index, *dst)),
+                _ => None,
+            })
+            .collect();
+        let back: Vec<_> = copies
+            .iter()
+            .filter_map(|(at, index, command)| match command {
+                Command::CopyImageToBuffer { src, .. } => Some((*at, *index, *src)),
+                _ => None,
+            })
+            .collect();
+        (segments, into, back)
+    };
+    let images = |copies: &[(usize, usize, Image)]| -> Vec<Image> {
+        copies.iter().map(|&(.., image)| image).collect()
+    };
+
+    submit(&mut device);
+    let (segments, into, back) = copied(&mut device);
+    assert_eq!(images(&into), [read, written, rendered]);
+    assert_eq!(images(&back), [written]);
+    // Back at the end of the last segment, before the completion is marked
+    // and after the work's last timestamp, between barriers.
+    let (at, index, _) = back[0];
+    let last = &segments[at].commands;
+    assert_eq!(at, segments.len() - 1);
+    assert!(matches!(last[index - 1], Command::Barrier(_)));
+    assert!(matches!(last[index + 1], Command::Barrier(_)));
+    let stamped = last
+        .iter()
+        .rposition(|command| matches!(command, Command::WriteTimestamp { .. }))
+        .unwrap();
+    assert!(stamped < index);
+
+    // A pass on the render target.
+    let mut colors = [None; MAX_COLOR_ATTACHMENTS];
+    colors[0] = Some(AttachmentRequest {
+        texture: target,
+        level: 0,
+        slice: 0,
+        depth_plane: 0,
+        resolve: None,
+        load_action: LoadAction::Load,
+        store_action: StoreAction::Store,
+        store_action_options: StoreActionOptions::EMPTY,
+        clear: [0.0; 4],
+        surface: None,
+    });
+    let request = RenderPassRequest {
+        color_attachments: colors,
+        depth_attachment: None,
+        depth_resolve_filter: MultisampleDepthResolveFilter::Sample0,
+        stencil_attachment: None,
+        stencil_resolve_filter: MultisampleStencilResolveFilter::Sample0,
+        visibility_result_buffer: None,
+        visibility_result_type: VisibilityResultType::Reset,
+        render_target_array_length: 0,
+        render_target_width: 0,
+        render_target_height: 0,
+        default_raster_sample_count: 0,
+        tile_memory: Default::default(),
+        sample_positions: Vec::new(),
+        rasterization_rate_map: false,
+        counter_samples: Vec::new(),
+    };
+    let mut commands = device.new_command_buffer();
+    device.begin_render(&mut commands, &request).unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    device.commit(commands).unwrap();
+    let (segments, into, back) = copied(&mut device);
+    assert_eq!(images(&into), [read, written, rendered]);
+    assert_eq!(images(&back), [written, rendered]);
+    let began = segments[0]
+        .commands
+        .iter()
+        .position(|command| matches!(command, Command::BeginRendering(_)))
+        .unwrap();
+    assert!(into.iter().all(|&(at, index, _)| at == 0 && index < began));
+
+    // A copy into the read-only texture.
+    let source = device
+        .new_buffer(1 << 16, options(StorageMode::Shared))
+        .unwrap();
+    let source = device.buffer(source).unwrap();
+    let descriptor = *device.texture_descriptor(read_id).unwrap();
+    let mut commands = device.new_command_buffer();
+    commands.begin_blit().unwrap();
+    commands
+        .copy_buffer_to_texture(
+            &mut device.resolver(),
+            BufferLayout {
+                buffer: source,
+                offset: 0,
+                bytes_per_row: 400,
+                bytes_per_image: 0,
+            },
+            BlitTexture {
+                image: read,
+                descriptor: &descriptor,
+                storage: ResourceId::NULL,
+                blocks: None,
+            },
+            Region {
+                slice: 0,
+                level: 0,
+                origin: [0; 3],
+                size: [100, 10, 1],
+            },
+            BlitOption::EMPTY,
+        )
+        .unwrap();
+    commands.end_encoding(&mut device.resolver()).unwrap();
+    device.commit(commands).unwrap();
+    let (_, _, back) = copied(&mut device);
+    assert_eq!(images(&back), [read, written]);
+}
+
+/// A two-plane texture mirrors only the plane whose rows need it.
+#[test]
+fn two_plane_textures_mirror_their_unaligned_plane() {
+    let mut device = device();
+    let buffer = device
+        .new_buffer(1 << 20, options(StorageMode::Shared))
+        .unwrap();
+    let mut descriptor = texture(PixelFormat::Rgb8_420_2p, TextureUsage::SHADER_READ);
+    descriptor.width = 101;
+    descriptor.height = 11;
+    descriptor.options = options(StorageMode::Shared);
+    let layout = |offset, bytes_per_row| resource::PlaneLayout {
+        offset,
+        bytes_per_row,
+    };
+    let planes = [layout(0, 128), layout(1 << 16, 102)];
+    let texture = device
+        .new_two_plane_texture(buffer, &descriptor, planes, 0)
+        .unwrap();
+    let pair = device.second_plane(texture).unwrap().unwrap();
+    submit(&mut device);
+    let segments = device.backend().submissions.last().unwrap().clone();
+    let copies: Vec<_> = image_copies(&segments)
+        .into_iter()
+        .map(|(.., command)| command)
+        .collect();
+    let rows = device.buffer(buffer).unwrap().buffer;
+    let [Command::CopyBufferToImage { src, dst, region }] = &copies[..] else {
+        panic!("{copies:?}");
+    };
+    assert_eq!((*src, *dst), (rows, pair));
+    assert_eq!(region.buffer_offset, 1 << 16);
+    assert_eq!(region.buffer_row_length, 51);
+    assert_eq!(region.extent, [51, 6, 1]);
+}
+
+/// A destroyed mirrored texture frees its image and the mirror's memory
+/// once the work that copies them completes, and later commits copy
+/// nothing.
+#[test]
+fn destroyed_mirrors_are_freed_after_the_work_that_copies_them() {
+    let mut device = device();
+    let (buffer, texture, image) = mirrored_texture(&mut device, TextureUsage::SHADER_READ);
+    let bytes = device.texture_bytes(texture);
+    // The fixture allocates an image's memory just before making it.
+    let memory = crate::metal::vulkan::object::Memory(image.0 - 1);
+    let allocated = device.memory().allocated;
+    let serial = submit(&mut device);
+    device.destroy_texture(texture).unwrap();
+    let freed = |device: &mut TestDevice| {
+        let destroyed = &device.backend().destroyed;
+        (
+            destroyed.contains(&Object::Image(image)),
+            destroyed.contains(&Object::Memory(memory)),
+        )
+    };
+    assert_eq!(freed(&mut device), (false, false));
+    complete(&mut device, serial);
+    assert_eq!(freed(&mut device), (true, true));
+    assert_eq!(device.memory().allocated, allocated - bytes);
+    submit(&mut device);
+    let segments = device.backend().submissions.last().unwrap().clone();
+    assert!(image_copies(&segments).is_empty());
+    device.destroy_buffer(buffer).unwrap();
 }
 
 /// A pixel-coordinate sampler, bicubic or not, says so in its ID: shaders

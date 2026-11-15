@@ -138,11 +138,11 @@ struct InFlight {
     submits: u64,
     segments: u64,
     /// It carries the device's own commands for objects it does not own:
-    /// CPU-copy uploads and block decodes of any connection's textures,
-    /// which a lost device's report names.
+    /// CPU-copy uploads, block decodes and mirror syncs of any connection's
+    /// textures, which a lost device's report names.
     carries: bool,
-    /// The textures whose uploads or decodes it carries: their destruction
-    /// waits for it too ([`super::pins`]).
+    /// The textures whose uploads, decodes or mirror syncs it carries: their
+    /// destruction waits for it too ([`super::pins`]).
     carried: Vec<TextureId>,
     /// The event values its submitted segments signal, reached once it is
     /// done.
@@ -472,6 +472,13 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // Copy the descriptors so the pass can borrow them while views are
         // created.
         let textures = self.pass_textures(request)?;
+        for &(id, _) in &textures {
+            if let Some(root) = self.mirrored_root(id)
+                && !commands.rendered.contains(&root)
+            {
+                commands.rendered.push(root);
+            }
+        }
         let lookup = |id: TextureId| {
             textures
                 .iter()
@@ -837,6 +844,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             .and_then(|()| commands.finish(&mut self.resolver(), completion));
         // Applied once the recording reaches the queue.
         let planes = core::mem::take(&mut commands.planes);
+        let rendered = core::mem::take(&mut commands.rendered);
         let recording = commands.into_recording();
         if let Err(error) = finished.and_then(|()| self.check_mappings(&recording.mappings)) {
             self.recycle(recording.uploads, recording.query_pools);
@@ -851,10 +859,24 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 .sum();
         }
         let mut times = None;
+        let mut mirrored = Vec::new();
         let prepared = (|| {
             let mut held =
                 self.hold(serial, [key, queue], recording.segments, recording.mappings)?;
             times = self.time(held.as_mut_slice())?;
+            // Mirrored textures' rows reach their images after the opening
+            // barrier, and the images the work wrote go back to the rows
+            // before its completion is marked, both outside its GPU times.
+            let work = held.as_mut_slice();
+            let segments = work.iter().flat_map(|held| &held.segments);
+            let syncs =
+                self.mirror_syncs(&rendered, segments.flat_map(|segment| &segment.commands));
+            if !syncs.textures.is_empty() {
+                work[0].segments[0].commands.splice(1..1, syncs.before);
+                let last = work.last_mut().and_then(|held| held.segments.last_mut());
+                last.expect("a segment").commands.extend(syncs.after);
+            }
+            mirrored = syncs.textures;
             if let Some(marker) = self.marker_buffer() {
                 for work in held.as_mut_slice() {
                     mark_completion(&mut work.segments, completion, marker, serial);
@@ -890,15 +912,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         // CPU-copy writes reach the images first, after the opening barrier
         // and outside the command buffer's GPU times. Keep pending copies
         // available for the next commit until preparation succeeds.
-        let carried = self.cpu_copy_textures();
+        let mut carried = self.cpu_copy_textures();
         let mut uploads = self.take_cpu_copy_uploads();
-        let carries = !uploads.is_empty();
+        let leads = !uploads.is_empty();
+        let carries = leads || !mirrored.is_empty();
+        carried.extend(mirrored);
+        carried.sort_unstable();
+        carried.dedup();
         // They ride the command buffer only when it reaches the queue now.
         // Behind held work they go ahead in a submission of their own that
         // waits for nothing: any connection's later work then follows them,
         // and closing the carrier's connection cannot drop them.
         let first = &mut held.as_mut_slice()[0];
-        let leading = if carries && !self.submits_now(first) {
+        let leading = if leads && !self.submits_now(first) {
             uploads.insert(0, Command::Barrier(crate::metal::hazard::FULL));
             let segment = Segment {
                 commands: uploads,
@@ -1585,7 +1611,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 in_flight.track,
                 self.timing.now().wrapping_sub(in_flight.committed),
                 if in_flight.carries {
-                    ", carrying CPU-copy uploads or decodes"
+                    ", carrying CPU-copy uploads, decodes or mirror syncs"
                 } else {
                     ""
                 }

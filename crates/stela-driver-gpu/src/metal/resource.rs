@@ -21,6 +21,7 @@ use super::{
     vulkan::{
         BufferCreate, BufferUsage, ComponentSwizzle, Format, ImageAspects, ImageCreate,
         ImageTiling, ImageType, ImageUsage, ImageViewType, MemoryProperties as M, SampleCounts,
+        command::{BufferImageCopy, Subresource},
         object::{
             BufferInfo, BufferViewInfo, ImageInfo, ImageViewInfo, LinearLayout, MemoryRequest,
             SubresourceRange,
@@ -986,15 +987,53 @@ fn view_type_compatible(parent: TextureType, view: TextureType) -> bool {
     }
 }
 
-/// `newTextureWithDescriptor:offset:bytesPerRow:` on a buffer: a 2D linear
-/// texture over the buffer's memory, bound at `offset`.
-pub fn linear_texture(
+/// A texture over a buffer's rows ([`buffer_texture`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BufferTexturePlan {
+    /// A linear image placed in the buffer's memory at the texture's offset.
+    Linear(TexturePlan),
+    /// Rows whose pitch or place the device's linear images cannot take:
+    /// an optimal image of the texture's own, which every commit fills from
+    /// the rows before its work and, when the GPU may write it, copies back
+    /// to them after ([`Mirror`]).
+    Mirrored(TexturePlan, Mirror),
+}
+
+impl BufferTexturePlan {
+    pub fn plan(&self) -> &TexturePlan {
+        match self {
+            Self::Linear(plan) | Self::Mirrored(plan, _) => plan,
+        }
+    }
+}
+
+/// Where a mirrored texture's rows lie in its buffer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Mirror {
+    /// The copy between the rows and the image's one level and slice, at
+    /// the texture's offset in the buffer.
+    pub region: BufferImageCopy,
+    /// The GPU may write the image: it renders to it or shaders write it.
+    /// Copies into it write it whatever its usage.
+    pub writes: bool,
+    /// Shaders may write it, which no command names.
+    pub shader_writes: bool,
+}
+
+/// `newTextureWithDescriptor:offset:bytesPerRow:` on a buffer: a 2D texture
+/// over the buffer's rows from `offset`, the buffer's memory starting
+/// `memory_offset` into its allocation. A linear image lies in the rows
+/// when their pitch and place meet [`Capabilities::linear_texture_alignments`];
+/// rows that do not, but that a buffer-image copy describes (whole texels
+/// of a format whose image holds its bytes), are mirrored.
+pub fn buffer_texture(
     capabilities: &Capabilities,
     descriptor: &TextureDescriptor,
     buffer_length: u64,
+    memory_offset: u64,
     offset: u64,
     bytes_per_row: u64,
-) -> Result<TexturePlan> {
+) -> Result<BufferTexturePlan> {
     let description = descriptor.pixel_format.describe();
     ensure(
         descriptor.pixel_format.planes().is_none(),
@@ -1033,14 +1072,18 @@ pub fn linear_texture(
         "texture dimensions",
     )?;
     let (row_alignment, offset_alignment) = capabilities.linear_texture_alignments();
-    ensure(
-        bytes_per_row.is_multiple_of(row_alignment),
-        "bytesPerRow is not aligned",
-    )?;
-    ensure(
-        offset.is_multiple_of(offset_alignment),
-        "offset is not aligned",
-    )?;
+    let misaligned = if !bytes_per_row.is_multiple_of(row_alignment) {
+        Some("bytesPerRow is not aligned")
+    } else if !offset.is_multiple_of(offset_alignment) {
+        Some("offset is not aligned")
+    } else if !memory_offset
+        .checked_add(offset)
+        .is_some_and(|place| place.is_multiple_of(offset_alignment))
+    {
+        Some("the buffer's memory is not aligned for a texture")
+    } else {
+        None
+    };
     ensure(
         bytes_per_row >= description.row_bytes(descriptor.width),
         "bytesPerRow is smaller than a row",
@@ -1066,10 +1109,6 @@ pub fn linear_texture(
         usage = usage.difference(TextureUsage::SHADER_WRITE);
     }
     let mut image = image_info(descriptor, description, realization, usage);
-    image.tiling = ImageTiling::DrmFormatModifier;
-    image.linear = Some(LinearLayout {
-        row_pitch: bytes_per_row,
-    });
     image.flags = image.flags.difference(ImageCreate::CUBE_COMPATIBLE);
     let range = full_range(descriptor, description);
     let views = shader_views(
@@ -1081,17 +1120,67 @@ pub fn linear_texture(
         image.usage,
         0.0,
     );
+    let cpu_access = if descriptor.options.storage_mode == StorageMode::Private {
+        CpuAccess::None
+    } else {
+        CpuAccess::Linear
+    };
+    let Some(misaligned) = misaligned else {
+        image.tiling = ImageTiling::DrmFormatModifier;
+        image.linear = Some(LinearLayout {
+            row_pitch: bytes_per_row,
+        });
+        attachment_storage(capabilities, descriptor, usage, &mut image);
+        return Ok(BufferTexturePlan::Linear(TexturePlan {
+            image,
+            memory: memory(descriptor.options)?,
+            views,
+            cpu_access,
+        }));
+    };
+    // A copy's rows are whole texels of the image's own bytes, which it
+    // starts on.
+    let texel = u64::from(description.block.bytes);
+    let row_length = bytes_per_row / texel * u64::from(description.block.width);
+    ensure(
+        description.encoding().is_exact()
+            && u64::from(description.stored_block_bytes()) == texel
+            && bytes_per_row.is_multiple_of(texel)
+            && offset.is_multiple_of(texel)
+            && u32::try_from(row_length).is_ok(),
+        misaligned,
+    )?;
     attachment_storage(capabilities, descriptor, usage, &mut image);
-    Ok(TexturePlan {
-        image,
-        memory: memory(descriptor.options)?,
-        views,
-        cpu_access: if descriptor.options.storage_mode == StorageMode::Private {
-            CpuAccess::None
-        } else {
-            CpuAccess::Linear
+    let mirror = Mirror {
+        region: BufferImageCopy {
+            buffer_offset: offset,
+            buffer_row_length: row_length as u32,
+            buffer_image_height: 0,
+            subresource: Subresource {
+                aspects: description.image_aspects(),
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            offset: [0; 3],
+            extent: [descriptor.width as u32, descriptor.height as u32, 1],
         },
-    })
+        writes: usage.intersects(TextureUsage::RENDER_TARGET | TextureUsage::SHADER_WRITE),
+        shader_writes: usage.contains(TextureUsage::SHADER_WRITE),
+    };
+    Ok(BufferTexturePlan::Mirrored(
+        TexturePlan {
+            image,
+            memory: MemoryRequest {
+                required: M::DEVICE_LOCAL,
+                preferred: M::EMPTY,
+                mapped: false,
+            },
+            views,
+            cpu_access,
+        },
+        mirror,
+    ))
 }
 
 /// One plane of a two-plane texture: where it starts in the buffer and its
@@ -1104,7 +1193,8 @@ pub struct PlaneLayout {
 
 /// An IOSurface's two-plane texture, of a [`PixelFormat::planes`] format:
 /// its first plane's linear image and its second's, at the second's own
-/// size, of [`PixelFormat::plane_formats`]. Shaders sample and read them; a render target
+/// size, of [`PixelFormat::plane_formats`], each mirrored when its rows
+/// need it ([`buffer_texture`]). Shaders sample and read them; a render target
 /// of a format that renders ([`C::COLOR`]) attaches the first plane's raw
 /// texels and writes both planes' as storage. Other usages are reported by
 /// the caller.
@@ -1112,8 +1202,9 @@ pub fn two_plane_texture(
     capabilities: &Capabilities,
     descriptor: &TextureDescriptor,
     buffer_length: u64,
+    memory_offset: u64,
     planes: [PlaneLayout; 2],
-) -> Result<[TexturePlan; 2]> {
+) -> Result<[BufferTexturePlan; 2]> {
     let (Some(ratio), Some([first, second])) = (
         descriptor.pixel_format.planes(),
         descriptor.pixel_format.plane_formats(),
@@ -1145,10 +1236,11 @@ pub fn two_plane_texture(
             swizzle: SwizzleChannels::IDENTITY,
             ..*descriptor
         };
-        linear_texture(
+        buffer_texture(
             capabilities,
             &plane,
             buffer_length,
+            memory_offset,
             layout.offset,
             layout.bytes_per_row,
         )

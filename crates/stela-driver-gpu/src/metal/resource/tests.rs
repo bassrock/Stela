@@ -554,33 +554,126 @@ fn stencil_views_read_the_stencil_aspect() {
     assert_eq!(depth.range.aspects, ImageAspects::DEPTH);
 }
 
+/// The plan of a linear image in the buffer's rows, which `plan` must be.
+fn linear(plan: BufferTexturePlan) -> TexturePlan {
+    match plan {
+        BufferTexturePlan::Linear(plan) => plan,
+        mirrored => panic!("a mirror where rows were aligned: {mirrored:?}"),
+    }
+}
+
 #[test]
 fn linear_textures_alias_buffer_rows_with_nvk_alignment() {
     let capabilities = capabilities();
-    let mut linear = descriptor(TextureType::D2, PixelFormat::Bgra8Unorm);
-    linear.width = 100;
-    linear.height = 10;
-    linear.options = options(StorageMode::Shared);
-    let plan = linear_texture(&capabilities, &linear, 1 << 20, 8192, 416).unwrap();
+    let mut descriptor = descriptor(TextureType::D2, PixelFormat::Bgra8Unorm);
+    descriptor.width = 100;
+    descriptor.height = 10;
+    descriptor.options = options(StorageMode::Shared);
+    let plan = linear(buffer_texture(&capabilities, &descriptor, 1 << 20, 0, 8192, 416).unwrap());
     assert_eq!(plan.image.tiling, ImageTiling::DrmFormatModifier);
     assert_eq!(plan.image.linear, Some(LinearLayout { row_pitch: 416 }));
     assert_eq!(plan.cpu_access, CpuAccess::Linear);
 
     let refused = |offset, bytes_per_row, length| {
-        linear_texture(&capabilities, &linear, length, offset, bytes_per_row).is_err()
+        buffer_texture(&capabilities, &descriptor, length, 0, offset, bytes_per_row).err()
     };
-    assert!(refused(8192, 400, 1 << 20), "rows need 32-byte alignment");
-    assert!(refused(8192, 384, 1 << 20), "a row is 400 bytes");
-    assert!(refused(4100, 416, 1 << 20), "offsets need page alignment");
-    assert!(refused(0, 416, 9 * 416 + 399), "the last row must fit");
-    assert!(!refused(0, 416, 9 * 416 + 400));
-    let mut d1 = linear;
+    assert_eq!(
+        refused(8192, 384, 1 << 20),
+        Some(Error::Invalid("bytesPerRow is smaller than a row"))
+    );
+    assert_eq!(
+        refused(0, 416, 9 * 416 + 399),
+        Some(Error::Invalid("texture extends past the buffer"))
+    );
+    assert_eq!(refused(0, 416, 9 * 416 + 400), None);
+    // Rows no copy describes: they split a texel.
+    assert_eq!(
+        refused(8192, 402, 1 << 20),
+        Some(Error::Invalid("bytesPerRow is not aligned"))
+    );
+    assert_eq!(
+        refused(4098, 416, 1 << 20),
+        Some(Error::Invalid("offset is not aligned"))
+    );
+    let mut d1 = descriptor;
     d1.texture_type = TextureType::D1;
     d1.height = 1;
     assert_eq!(
-        linear_texture(&capabilities, &d1, 1 << 20, 0, 416),
+        buffer_texture(&capabilities, &d1, 1 << 20, 0, 0, 416),
         Err(Error::Unsupported("1D textures inside buffers"))
     );
+}
+
+/// Rows whose pitch or place a linear image cannot take are mirrored: an
+/// optimal image of the texture's own, and the copy between it and them.
+#[test]
+fn unaligned_rows_are_mirrored_by_an_image_of_their_own() {
+    let capabilities = capabilities();
+    let (rows, _) = capabilities.linear_texture_alignments();
+    let mut descriptor = descriptor(TextureType::D2, PixelFormat::Bgra8Unorm);
+    descriptor.width = 100;
+    descriptor.height = 10;
+    descriptor.options = options(StorageMode::Shared);
+    descriptor.usage = TextureUsage::SHADER_READ;
+    // 404 bytes a row, at an offset no linear image starts at, of a buffer
+    // whose memory starts where one may.
+    assert_ne!(404 % rows, 0);
+    for (memory_offset, offset, bytes_per_row) in [(0, 8192, 404), (0, 4100, 416), (4, 8188, 416)] {
+        let plan = buffer_texture(
+            &capabilities,
+            &descriptor,
+            1 << 20,
+            memory_offset,
+            offset,
+            bytes_per_row,
+        )
+        .unwrap();
+        let BufferTexturePlan::Mirrored(plan, mirror) = plan else {
+            panic!("rows of {bytes_per_row} at {offset} lie in the buffer");
+        };
+        assert_eq!(plan.image.tiling, ImageTiling::Optimal);
+        assert_eq!(plan.image.linear, None);
+        assert!(
+            plan.image.usage.contains(
+                ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED
+            )
+        );
+        assert!(plan.memory.required.contains(M::DEVICE_LOCAL));
+        assert_eq!(plan.cpu_access, CpuAccess::Linear);
+        assert_eq!(
+            mirror.region,
+            BufferImageCopy {
+                buffer_offset: offset,
+                buffer_row_length: bytes_per_row as u32 / 4,
+                buffer_image_height: 0,
+                subresource: Subresource {
+                    aspects: ImageAspects::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                offset: [0; 3],
+                extent: [100, 10, 1],
+            }
+        );
+        assert!(!mirror.writes && !mirror.shader_writes);
+    }
+    // A render target's image goes back to its rows; a shader-written one's
+    // whatever its commands name.
+    descriptor.usage = TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET;
+    let Ok(BufferTexturePlan::Mirrored(_, mirror)) =
+        buffer_texture(&capabilities, &descriptor, 1 << 20, 0, 0, 404)
+    else {
+        panic!("unaligned rows lie in the buffer");
+    };
+    assert!(mirror.writes && !mirror.shader_writes);
+    descriptor.usage = TextureUsage::SHADER_WRITE;
+    let Ok(BufferTexturePlan::Mirrored(_, mirror)) =
+        buffer_texture(&capabilities, &descriptor, 1 << 20, 0, 0, 404)
+    else {
+        panic!("unaligned rows lie in the buffer");
+    };
+    assert!(mirror.writes && mirror.shader_writes);
 }
 
 #[test]
@@ -603,9 +696,11 @@ fn two_plane_textures_are_a_full_plane_and_a_subsampled_pair() {
             &capabilities,
             &surface,
             1 << 20,
+            0,
             [layout(0, 128), layout(1 << 16, 256)],
         )
-        .unwrap();
+        .unwrap()
+        .map(linear);
         assert_eq!(first.image.format, Format::R8Unorm, "{format:?}");
         assert_eq!(first.image.extent, [101, 11, 1]);
         assert_eq!(first.image.linear, Some(LinearLayout { row_pitch: 128 }));
@@ -613,8 +708,43 @@ fn two_plane_textures_are_a_full_plane_and_a_subsampled_pair() {
         assert_eq!(pair.image.extent, [second[0], second[1], 1], "{format:?}");
         assert_eq!(pair.image.linear, Some(LinearLayout { row_pitch: 256 }));
         assert!(texture(&capabilities, &surface).is_err());
-        assert!(linear_texture(&capabilities, &surface, 1 << 20, 0, 128).is_err());
+        assert!(buffer_texture(&capabilities, &surface, 1 << 20, 0, 0, 128).is_err());
     }
+}
+
+/// A plane whose rows a linear image cannot take is mirrored alone.
+#[test]
+fn a_two_plane_texture_mirrors_only_its_unaligned_plane() {
+    let capabilities = capabilities();
+    let mut surface = descriptor(TextureType::D2, PixelFormat::Rgb8_420_2p);
+    surface.width = 101;
+    surface.height = 11;
+    surface.options = options(StorageMode::Shared);
+    let layout = |offset, bytes_per_row| PlaneLayout {
+        offset,
+        bytes_per_row,
+    };
+    // The pair plane's 51 RG8 texels a row, packed.
+    let [first, pair] = two_plane_texture(
+        &capabilities,
+        &surface,
+        1 << 20,
+        0,
+        [layout(0, 128), layout(1 << 16, 102)],
+    )
+    .unwrap();
+    assert_eq!(
+        linear(first).image.linear,
+        Some(LinearLayout { row_pitch: 128 })
+    );
+    let BufferTexturePlan::Mirrored(pair, mirror) = pair else {
+        panic!("the pair plane's rows lie in the buffer");
+    };
+    assert_eq!(pair.image.format, Format::R8G8Unorm);
+    assert_eq!(pair.image.tiling, ImageTiling::Optimal);
+    assert_eq!(mirror.region.buffer_offset, 1 << 16);
+    assert_eq!(mirror.region.buffer_row_length, 51);
+    assert_eq!(mirror.region.extent, [51, 6, 1]);
 }
 
 #[test]
@@ -638,9 +768,11 @@ fn ten_bit_two_plane_textures_are_planes_of_16_bit_words() {
             &capabilities,
             &surface,
             1 << 20,
+            0,
             [layout(0, 256), layout(1 << 16, 512)],
         )
-        .unwrap();
+        .unwrap()
+        .map(linear);
         assert_eq!(first.image.format, Format::R16Unorm, "{format:?}");
         assert_eq!(first.image.extent, [101, 11, 1]);
         assert_eq!(pair.image.format, Format::R16G16Unorm);
