@@ -45,9 +45,12 @@ use stela_linux::{
 use stela_loader::{apple_device_tree::DeviceTree, stela_gpu};
 
 #[cfg(feature = "radv")]
-use stela_drivers::gpu::metal::amd::{
-    Attachment, GcVersion,
-    open::{Gpu, OpenError, open, reopen},
+use stela_drivers::gpu::metal::{
+    amd::{
+        Attachment, GcVersion,
+        open::{Gpu, OpenError, open, reopen},
+    },
+    native::Refusals,
 };
 #[cfg(feature = "nvk")]
 use stela_drivers::gpu::metal::{
@@ -76,6 +79,14 @@ static SERVICES: AtomicPtr<Vec<Arc<Shared>>> = AtomicPtr::new(ptr::null_mut());
 unsafe extern "C" {
     /// `compat/mesa/radv_nir_options.c`.
     fn stela_radv_nir_options(physical: vk::PhysicalDevice) -> *const c_void;
+    /// `compat/mesa/radv_submit.c`.
+    fn stela_radv_submit_failure(
+        queue: vk::Queue,
+        semaphore: vk::Semaphore,
+        value: u64,
+    ) -> vk::Result;
+    fn stela_radv_forget_failures(queue: vk::Queue) -> u32;
+    fn stela_radv_count_failures(queue: vk::Queue, outstanding: *mut u32);
 }
 
 #[cfg(feature = "nvk")]
@@ -1170,9 +1181,11 @@ fn loader() -> (Loader, fn(vk::PhysicalDevice) -> compiler::Service) {
     (loader, compiler)
 }
 
-/// RADV's loader. It has neither of NVK's hooks yet: a commit's submission
-/// runs on its PE, whose ioctls wait for the boot CPU, and a submission
-/// amdgpu refuses loses the device, which the service reopens.
+/// RADV's loader: its NIR options and its refusals. A commit's submission
+/// runs on its PE, whose ioctls wait for the boot CPU. A submission amdgpu
+/// refuses short of losing the context fails its command buffer, not the
+/// device (Mesa patch 0034); a lost context loses the device, which the
+/// service reopens.
 #[cfg(feature = "radv")]
 fn loader() -> (Loader, fn(vk::PhysicalDevice) -> compiler::Service) {
     let compiler = |physical| {
@@ -1184,7 +1197,12 @@ fn loader() -> (Loader, fn(vk::PhysicalDevice) -> compiler::Service) {
         get_instance_proc_addr: entry,
         log: driver_message,
         submit_thread: None,
-        refusals: None,
+        // A refused submission fails its command buffer, not the device.
+        refusals: Some(Refusals {
+            take: stela_radv_submit_failure,
+            forget: stela_radv_forget_failures,
+            count: stela_radv_count_failures,
+        }),
         // An import's driver work after its turn may wait for Linux here.
         relax,
     };
@@ -1210,6 +1228,12 @@ fn service(gpu: &Gpu, stack: u64) -> Result<Arc<Shared>, OpenError> {
     let service = service.with_reopen(Box::new(move || unsafe {
         reopen(loader, Box::new(Exporter), compiler, &gpu)
     }));
+    // RADV loses its device only with a context amdgpu reset, and releasing
+    // it closes RADV's file, whose close waits for the VM work that reset
+    // holds back: the lost device stays unreleased, as an open whose first
+    // submission hung leaves it.
+    #[cfg(feature = "radv")]
+    let service = service.keep_lost_devices();
     Ok(Arc::new(SharedService::new(
         service,
         ServiceHost {
