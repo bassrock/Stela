@@ -327,7 +327,12 @@ pub fn step() {
             None => {}
             Some(Ok(false)) => {}
             Some(Ok(true)) => {
+                let bytes = running.execution.plan().blobs.iter().map(Blob::length).sum::<u64>();
                 writer.finish();
+                let generation = writer.committed.as_ref().map_or(0, |commit| commit.generation);
+                output::arguments(format_args!(
+                    "PIPELINES saved bytes={bytes} generation={generation} while running\n"
+                ));
                 writer.quiet_until = now + super::host::COUNTER_HZ / 1000 * QUIET_MILLIS;
             }
             Some(Err(error)) => writer.fail(&error),

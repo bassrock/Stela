@@ -316,3 +316,78 @@ fn lookups_count_hits_and_compiles_apart_and_clear_when_taken() {
     );
     assert_eq!(lookups.take(), LookupCounts::default());
 }
+
+#[test]
+fn totals_report_the_seed_the_snapshots_and_each_write_once() {
+    let gpu = gpu();
+    let key = Key::new(COMPILER, &gpu);
+    let mut nir = Vec::new();
+    push_entry(&mut nir, &[1; 32], b"stored nir");
+    let bytes = sealed(&key, &[5; 40], &nir);
+    let mut store = Store::new(bytes, COMPILER, MAX_BYTES);
+    assert_eq!(store.totals(), Totals::default());
+
+    let claim = store.claim(&gpu).unwrap();
+    assert_eq!(claim.seed.bytes().len(), 40);
+    store.seeded(&claim, claim.seed.bytes().len());
+    assert_eq!(
+        store.totals(),
+        Totals {
+            seeded: 40,
+            stored_nir: 1,
+            ..Totals::default()
+        }
+    );
+
+    store.keep(&claim, vec![6; 64]);
+    store.add_nir([2; 32], b"new");
+    let update = store.update().unwrap();
+    store.written(&update);
+    // Written again, nothing more is saved.
+    store.written(&update);
+    let totals = store.totals();
+    assert_eq!(totals.cache, 64);
+    assert_eq!(totals.snapshots, 1);
+    assert_eq!(totals.saved, 64 + 36 + 3);
+
+    // A newer snapshot counts once it is written.
+    store.keep(&claim, vec![7; 80]);
+    assert_eq!(store.totals().saved, 103);
+    let update = store.update().unwrap();
+    assert!(update.nir.is_empty(), "the NIR is written");
+    store.written(&update);
+    assert_eq!(store.totals().saved, 103 + 80);
+    assert_eq!(store.totals().snapshots, 2);
+}
+
+#[test]
+fn a_store_of_another_pipeline_cache_uuid_seeds_nothing_and_is_replaced() {
+    let gpu = gpu();
+    let mut before = gpu.clone();
+    before.pipeline_cache_uuid[0] ^= 0xff;
+    let mut nir = Vec::new();
+    push_entry(&mut nir, &[1; 32], b"stale nir");
+    let bytes = sealed(&Key::new(COMPILER, &before), &[5; 40], &nir);
+    let mut store = Store::new(bytes, COMPILER, MAX_BYTES);
+    let claim = store.claim(&gpu).unwrap();
+    assert_eq!(claim.refused, Some(Rejection::Stale));
+    assert!(claim.seed.bytes().is_empty());
+    store.seeded(&claim, claim.seed.bytes().len());
+    // Its NIR is not read either, and what this boot adds is this key's.
+    assert_eq!(store.stored_nir().count(), 0);
+    assert_eq!(store.totals().stored_nir, 0);
+    assert_eq!(store.totals().seeded, 0);
+    store.add_nir([1; 32], b"fresh nir");
+    store.keep(&claim, vec![6; 8]);
+    let update = store.update().unwrap();
+    assert_eq!(update.key, Key::new(COMPILER, &gpu));
+    assert_eq!(
+        NirEntries(&update.nir).collect::<Vec<_>>(),
+        [([1; 32], &b"fresh nir"[..])]
+    );
+    assert_eq!(
+        NirEntries(&store.all_nir(&update.key)).count(),
+        1,
+        "a rewrite keeps no stale entry"
+    );
+}

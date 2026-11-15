@@ -22,7 +22,9 @@
 //! serialized NIR, the pipeline state and the layout, so a function's AIR,
 //! constants, formats and linked functions select their own entries. A store
 //! of another key, a damaged one or one past the bound is reported once and
-//! ignored: its pipelines compile again.
+//! ignored: its pipelines compile again. What a device was seeded with, its
+//! snapshots and what the boot wrote back are reported beside the lookups
+//! through the cache ([`totals`], [`take_lookups`]).
 use crate::metal::vulkan::physical::Identity;
 use alloc::{sync::Arc, vec::Vec};
 use ash::vk;
@@ -324,6 +326,25 @@ pub struct Store {
     /// NIR compiled this boot, by key, and its bytes.
     nir: alloc::collections::BTreeMap<[u8; 32], Vec<u8>>,
     nir_bytes: u64,
+    /// Bytes of cache the driver took at the newest holder's open.
+    seeded: u64,
+    /// Bytes of cache snapshots and NIR made durable this boot.
+    saved: u64,
+}
+
+/// What the boot's store loaded and saved so far ([`totals`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Totals {
+    /// Bytes of pipeline cache the newest holder's driver was seeded with.
+    pub seeded: u64,
+    /// Stored NIR entries of the key the store matched.
+    pub stored_nir: u64,
+    /// Bytes of the newest snapshot kept this boot, zero for none.
+    pub cache: u64,
+    /// Snapshots kept this boot.
+    pub snapshots: u64,
+    /// Bytes of snapshots and NIR the boot wrote back to the file.
+    pub saved: u64,
 }
 
 impl Store {
@@ -345,6 +366,26 @@ impl Store {
             stored_keys: alloc::collections::BTreeSet::new(),
             nir: alloc::collections::BTreeMap::new(),
             nir_bytes: 0,
+            seeded: 0,
+            saved: 0,
+        }
+    }
+
+    /// `claim`'s driver took `bytes` of its seed: none when it refused it.
+    pub fn seeded(&mut self, claim: &Claim, bytes: usize) {
+        if self.holds(claim) {
+            self.seeded = bytes as u64;
+        }
+    }
+
+    /// What the store loaded and saved so far.
+    pub fn totals(&self) -> Totals {
+        Totals {
+            seeded: self.seeded,
+            stored_nir: self.stored_keys.len() as u64,
+            cache: self.kept.as_ref().map_or(0, |(_, kept)| kept.len() as u64),
+            snapshots: self.kept_version,
+            saved: self.saved,
         }
     }
 
@@ -477,10 +518,17 @@ impl Store {
 
     /// `update` is durable: what it holds is not offered again.
     pub fn written(&mut self, update: &Update) {
-        if update.cache.is_some() {
-            self.written_version = self.written_version.max(update.cache_version);
+        if let Some(cache) = &update.cache
+            && update.cache_version > self.written_version
+        {
+            self.written_version = update.cache_version;
+            self.saved += cache.len() as u64;
         }
-        self.written_nir.extend(update.nir_keys.iter().copied());
+        for key in &update.nir_keys {
+            if self.written_nir.insert(*key) {
+                self.saved += self.nir.get(key).map_or(0, |blob| blob.len() as u64 + 36);
+            }
+        }
     }
 
     /// Every NIR entry the store holds for `key`, stored and added, as one
@@ -623,6 +671,12 @@ pub fn provide(stored: &'static [u8], compiler: &[u8], bound: u64) {
     with_store(|slot| *slot = Some(store));
 }
 
+/// What the boot's store loaded and saved so far: what the platform reports
+/// beside its lookups (`GPU STORE`).
+pub fn totals() -> Totals {
+    with_store(|slot| slot.as_ref().map(Store::totals).unwrap_or_default())
+}
+
 /// What the boot's store added since it was last written, for the boot to
 /// write while the guest runs and as it stops ([`Store::update`]).
 pub fn update() -> Option<Update> {
@@ -714,6 +768,7 @@ impl Persisted {
             // driver ignores data whose header is not its own.
             unsafe { device.create_pipeline_cache(&info, None) }
         };
+        let mut seeded = seed.bytes().len();
         let cache = create(seed.bytes()).or_else(|error| {
             if seed.bytes().is_empty() {
                 return Err(error);
@@ -721,15 +776,34 @@ impl Persisted {
             log(&alloc::format!(
                 "pipeline store refused by the driver ({error:?}); its pipelines compile again"
             ));
+            seeded = 0;
             create(&[])
         });
         match cache {
-            Ok(cache) => Self {
-                policy: Policy::new(claim.bound),
-                claim: Some(claim),
-                cache,
-                log,
-            },
+            Ok(cache) => {
+                let stored_nir = with_store(|slot| {
+                    let store = slot.as_mut()?;
+                    store.seeded(&claim, seeded);
+                    Some(store.totals().stored_nir)
+                })
+                .unwrap_or(0);
+                let from = match &seed {
+                    Seed::Empty => "nothing",
+                    Seed::Stored(_) => "the boot's file",
+                    Seed::Kept(_) => "the previous device's cache",
+                };
+                log(&alloc::format!(
+                    "pipeline store seeded={seeded} bytes from {from}, stored_nir={stored_nir} \
+                     entries, bound={}",
+                    claim.bound
+                ));
+                Self {
+                    policy: Policy::new(claim.bound),
+                    claim: Some(claim),
+                    cache,
+                    log,
+                }
+            }
             Err(error) => {
                 log(&alloc::format!(
                     "pipeline store unused: no pipeline cache ({error:?}); pipelines compile \
