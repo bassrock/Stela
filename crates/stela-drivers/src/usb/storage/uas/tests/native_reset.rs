@@ -40,6 +40,8 @@ fn native_root_reset_rebind_preserves_old_alias_quarantine_and_reprobes_geometry
                 media: unit.media.clone(),
                 running: None,
                 next_tag: 0,
+                cache_refused: false,
+                first_blocks: None,
                 removable: unit.removable,
             }),
         };

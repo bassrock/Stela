@@ -735,16 +735,19 @@ impl Host for BareHost<'_> {
         }
         // The wait may last until the armed one-shot count runs out.
         const MASKED: u32 = 1 << 16;
-        let budget = || {
+        let budget = {
             let state = state();
             let remaining = state.apic.read(apic::CURRENT);
             (state.apic_hz != 0 && state.apic.read(apic::LVT_TIMER) & MASKED == 0 && remaining != 0)
                 .then(|| u64::from(remaining) * 1_000_000 / state.apic_hz)
         };
         let ring = state().ring;
+        // Halted, it uses no window translation: shootdowns count it as
+        // acknowledged until it wakes, and it flushes first then.
+        let _idle = crate::native_mmio::shootdown::idle();
         // SAFETY: interrupts are disabled and the host IDT takes the wake;
         // the ring is this processor's.
-        unsafe { crate::native_idle::wait_with(budget, ring) };
+        unsafe { crate::native_idle::wait_with(|| budget, ring) };
     }
 
     fn relax(&mut self) {
@@ -770,7 +773,11 @@ impl Host for BareHost<'_> {
     }
 
     fn host_work_due(&mut self) -> bool {
-        super::super::storage::signalled()
+        // Frames a host network adapter signalled (`network_interrupt`): the
+        // service moves them now rather than at its next tick, about 4 ms
+        // on. Taken either way, as a disk's due service moves them too.
+        let frames = super::take_network_signal();
+        super::super::storage::signalled() || frames
     }
 
     fn report(&mut self, event: &stela_engine::machine::Event) {

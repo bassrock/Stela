@@ -256,29 +256,36 @@ fn nir_compiled_this_boot_is_offered_once_and_read_back_after_the_cache() {
 fn nir_is_kept_only_while_the_file_can_hold_it_beside_the_cache() {
     let gpu = gpu();
     let key = Key::new(COMPILER, &gpu);
-    // A file of the header, a 100-byte cache, a stored entry of 4 bytes and
-    // room for one more of 64.
+    // The cache's half of the file, then a stored entry of 4 bytes, the
+    // alignment of both blobs and room for one more entry of 64.
     let mut nir = Vec::new();
     push_entry(&mut nir, &[1; 32], &[1; 4]);
     let bytes = sealed(&key, &[5; 100], &nir);
-    let bound = bytes.len() as u64 + 36 + 64;
+    let half = 3 * BLOB_ALIGN;
+    let bound = 2 * half;
+    let room = bound - half - 2 * BLOB_ALIGN - nir.len() as u64;
+    let filler = room as usize - 36 - (36 + 64);
     let mut store = Store::new(bytes, COMPILER, bound);
     let claim = store.claim(&gpu).unwrap();
-    store.add_nir([2; 32], &[2; 64]);
-    store.add_nir([3; 32], &[3; 1]);
+    assert_eq!(claim.bound, half, "the cache's snapshots take half");
+    store.add_nir([2; 32], &vec![2; filler]);
+    store.add_nir([3; 32], &[3; 64]);
+    store.add_nir([4; 32], &[4; 1]);
     let update = store.update().unwrap();
     let keys: Vec<_> = NirEntries(&update.nir).map(|(key, _)| key).collect();
-    assert_eq!(keys, [[2; 32]]);
-    // A larger newest cache leaves less room.
-    let mut blank = Store::new(&[], COMPILER, HEADER_BYTES as u64 + 200);
+    assert_eq!(keys, [[2; 32], [3; 32]]);
+    // A larger newest cache takes nothing from the NIR's room, which a
+    // snapshot of the whole bound still fits beside.
+    let mut blank = Store::new(&[], COMPILER, bound);
     let claim_blank = blank.claim(&gpu).unwrap();
-    blank.keep(&claim_blank, vec![0; 150]);
-    blank.add_nir([4; 32], &[4; 20]);
-    blank.add_nir([5; 32], &[5; 1]);
-    let keys: Vec<_> = NirEntries(&blank.update().unwrap().nir)
-        .map(|(key, _)| key)
-        .collect();
-    assert_eq!(keys, [[5; 32]]);
+    blank.keep(&claim_blank, vec![0; half as usize - HEADER_BYTES]);
+    let mut policy = Policy::new(claim_blank.bound);
+    assert!(policy.snapshotted(half as usize - HEADER_BYTES));
+    blank.add_nir([5; 32], &vec![5; room as usize - 36]);
+    let nir = blank.update().unwrap().nir;
+    assert_eq!(nir.len() as u64, room, "the whole NIR room is kept");
+    let aligned = |bytes: u64| bytes.div_ceil(BLOB_ALIGN) * BLOB_ALIGN;
+    assert!(aligned(half) + aligned(nir.len() as u64) <= bound);
     drop(claim);
 }
 
@@ -390,4 +397,29 @@ fn a_store_of_another_pipeline_cache_uuid_seeds_nothing_and_is_replaced() {
         1,
         "a rewrite keeps no stale entry"
     );
+}
+
+/// The store's lock, which a job's NIR restore takes ([`recall_nir`]) and
+/// whose holder allocates, counts as held for as long as it is: a platform
+/// that runs jobs in slices ends none inside it.
+#[test]
+fn the_store_lock_counts_as_held_while_a_job_could_reach_it() {
+    extern crate std;
+    use core::cell::Cell;
+    std::thread_local! {
+        static HELD: Cell<u32> = const { Cell::new(0) };
+    }
+    fn enter() {
+        HELD.with(|held| held.set(held.get() + 1));
+    }
+    fn leave() {
+        HELD.with(|held| held.set(held.get() - 1));
+    }
+    crate::metal::deferred::set_lock_hooks(enter, leave);
+    let inside = with_store(|_| HELD.with(Cell::get));
+    assert_eq!(inside, 1);
+    assert_eq!(HELD.with(Cell::get), 0);
+    // The job's own path through it.
+    assert_eq!(recall_nir(&[9; 32]), None);
+    assert_eq!(HELD.with(Cell::get), 0);
 }

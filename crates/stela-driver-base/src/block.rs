@@ -15,8 +15,10 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+mod bounded;
 mod layers;
 mod shared;
+pub use bounded::{Bounded, ReadBound};
 #[cfg(any(test, feature = "ram-disk"))]
 pub use layers::RamDisk;
 pub use layers::{Ahead, ReadAhead, Runs, Volatile};
@@ -67,13 +69,43 @@ pub enum BlockError {
         step: &'static str,
         error: Box<BlockError>,
     },
+    /// A command or register wait reached its deadline: what it waited
+    /// for, and the registers' last values.
+    Expired(Box<Expired>),
+}
+
+/// A wait that reached its deadline ([`BlockError::Expired`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Expired {
+    /// The command or wait, with the register and the value it waited for.
+    pub step: &'static str,
+    /// How long it waited.
+    pub waited_us: u64,
+    /// The registers read once the deadline passed, by name.
+    pub registers: Vec<(&'static str, u32)>,
+}
+
+impl fmt::Display for Expired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: not done after {} ms",
+            self.step,
+            self.waited_us / 1000
+        )?;
+        for (index, (name, value)) in self.registers.iter().enumerate() {
+            let separator = if index == 0 { "; " } else { " " };
+            write!(f, "{separator}{name}={value:#x}")?;
+        }
+        Ok(())
+    }
 }
 impl BlockError {
     /// This error as met at `step`. One that already names its step keeps
     /// it: the innermost name is the command that failed.
     pub fn at(self, step: &'static str) -> Self {
         match self {
-            Self::Step { .. } => self,
+            Self::Step { .. } | Self::Expired(_) => self,
             error => Self::Step {
                 step,
                 error: Box::new(error),
@@ -250,6 +282,7 @@ impl fmt::Display for BlockError {
             Self::PciPower(error) => write!(f, "PCI power/timing: {error}"),
             Self::Unsupported(what) => write!(f, "unsupported: {what}"),
             Self::Step { step, error } => write!(f, "{step}: {error}"),
+            Self::Expired(expired) => expired.fmt(f),
         }
     }
 }
@@ -1275,6 +1308,34 @@ impl<D: BlockDevice + ?Sized> BlockDevice for Box<D> {
     fn signals(&self) -> bool {
         (**self).signals()
     }
+}
+
+/// The text of the ATA IDENTIFY words `words` in `data`, two characters
+/// per word with the first in the high byte, as [`ascii`] reads it; empty
+/// where `data` ends first. Stela's AHCI driver and the firmware's disk
+/// picker both read a disk's serial number with it: the picker records it,
+/// and the driver must find the disk by it, byte for byte.
+pub fn ata_string(data: &[u8], words: core::ops::Range<usize>) -> String {
+    let Some(field) = data.get(2 * words.start..2 * words.end) else {
+        return String::new();
+    };
+    let bytes: alloc::vec::Vec<u8> = field
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .flat_map(|&[first, second]| [second, first])
+        .collect();
+    ascii(&bytes)
+}
+
+/// Whether `data` begins with 512 bytes of IDENTIFY data that carry ATA's
+/// integrity word: word 255's low byte is the signature 0xa5 and its high
+/// byte a checksum that brings the sum of all 512 bytes to zero (ACS-3
+/// 7.12.7.97), which other identify data, such as SCSI's, does not.
+pub fn ata_identify_signed(data: &[u8]) -> bool {
+    data.get(..512).is_some_and(|page| {
+        page[510] == 0xa5 && page.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)) == 0
+    })
 }
 
 /// ASCII from a fixed-width identify field, trimmed of padding.

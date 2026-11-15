@@ -60,6 +60,8 @@ pub enum Error {
     /// The original root refused a driver's quiescence receipt.
     Preparation(crate::bus::pci::requester::preparation::Error),
     Vmd(crate::bus::vmd::Error),
+    /// A refusal of a VMD host's own BARs or bus range, with what it read.
+    VmdResource(crate::bus::vmd::Error, native::VmdWords),
     Tg3(net::tg3::Error),
     Aqtion(net::aqtion::native::Error),
     Sfh(input::sfh::Error),
@@ -92,6 +94,7 @@ impl fmt::Display for Error {
             Self::Native(error) => error.fmt(f),
             Self::Preparation(error) => write!(f, "cold requester preparation: {error}"),
             Self::Vmd(error) => write!(f, "VMD: {error}"),
+            Self::VmdResource(error, words) => write!(f, "VMD: {error}; {words}"),
             Self::Tg3(error) => write!(f, "tg3: {error}"),
             Self::Aqtion(error) => write!(f, "atlantic: {error}"),
             Self::Sfh(error) => write!(f, "AMD SFH: {error:?}"),
@@ -340,6 +343,13 @@ impl Adapter {
 }
 
 impl Link for Adapter {
+    /// The driver's own state line, where it keeps one (RTL8168 family).
+    fn diagnostic(&mut self) -> Option<String> {
+        match self {
+            Self::Realtek(device) => device.diagnostic(),
+            _ => None,
+        }
+    }
     fn mac(&self) -> Mac {
         match self {
             Self::Virtio(device) => device.mac(),
@@ -418,6 +428,12 @@ impl Link for Adapter {
             Self::IntelWifi(device) => device.signals(),
             Self::MediatekWifi(device) => device.signals(),
             Self::RealtekWifi(device) => device.signals(),
+        }
+    }
+    fn retarget(&mut self, message: crate::bus::irq::MsiMessage) -> bool {
+        match self {
+            Self::Virtio(device) => device.retarget(message),
+            _ => false,
         }
     }
     fn due_us(&self) -> Option<u64> {
@@ -960,7 +976,7 @@ impl Devices {
         };
         match error {
             Error::Enumeration(_) => "PCI",
-            Error::Vmd(_) => "storage",
+            Error::Vmd(_) | Error::VmdResource(..) => "storage",
             // The r8169 Ethernet driver's; a Realtek card reader fails as a
             // device.
             Error::Realtek(_) | Error::Tg3(_) | Error::Aqtion(_) | Error::Pch(_) => "network",
@@ -1562,6 +1578,17 @@ fn first_of(scanned: Vec<Vec<Function>>, first: Option<Address>) -> (Vec<Vec<Fun
     (rest, found)
 }
 
+/// The handoff a wired network adapter attaches with: it signals arriving
+/// frames with [`Handoff::network`] where the engine gave one, which makes
+/// the host's service due, rather than with a disk's completion signal,
+/// which only sends the disks looking for completions.
+fn network_handoff(handoff: &Handoff) -> Handoff {
+    Handoff {
+        completion: handoff.network.or(handoff.completion),
+        ..handoff.clone()
+    }
+}
+
 /// [`probe_with_provider`], with `observer` told of each start.
 ///
 /// # Safety
@@ -1577,6 +1604,7 @@ pub unsafe fn probe_observed(
     wifi: Option<&Network>,
     observer: &mut dyn Observer,
 ) -> Devices {
+    let network_handoff = network_handoff(handoff);
     let mut devices = Devices {
         bluetooth_platform: captures.bluetooth,
         native_services: services.is_some(),
@@ -1934,7 +1962,8 @@ pub unsafe fn probe_observed(
                 continue;
             } else if net::virtio::matches(&function) {
                 let minimum = minimum_for_function!().clone();
-                let attached = VirtioNet::new(&mut function, handoff, dma, minimum.as_ref());
+                let attached =
+                    VirtioNet::new(&mut function, &network_handoff, dma, minimum.as_ref());
                 if attached.is_err() {
                     start.quiesce(&mut function);
                 }
@@ -1943,7 +1972,8 @@ pub unsafe fn probe_observed(
                 let minimum = minimum_for_function!().clone();
                 // SAFETY: the caller grants exclusive post-EBS controller,
                 // segment configuration and firmware/ASPM policy ownership.
-                let attached = unsafe { Igc::new(&mut function, handoff, dma, minimum.clone()) };
+                let attached =
+                    unsafe { Igc::new(&mut function, &network_handoff, dma, minimum.clone()) };
                 if attached.is_err() {
                     start.quiesce(&mut function);
                 }
@@ -1952,7 +1982,8 @@ pub unsafe fn probe_observed(
                 let minimum = minimum_for_function!().clone();
                 // SAFETY: the caller granted exclusive ownership of all mapped PCI
                 // functions and controllers after ExitBootServices.
-                let attached = unsafe { E1000e::new(&mut function, handoff, dma, minimum.clone()) };
+                let attached =
+                    unsafe { E1000e::new(&mut function, &network_handoff, dma, minimum.clone()) };
                 if attached.is_err() {
                     start.quiesce(&mut function);
                 }
@@ -1998,7 +2029,8 @@ pub unsafe fn probe_observed(
                 let minimum = minimum_for_function!().clone();
                 // SAFETY: as for e1000e, the caller granted exclusive ownership
                 // of the mapped PCI functions and their controllers.
-                let attached = unsafe { Igb::new(&mut function, handoff, dma, minimum.clone()) };
+                let attached =
+                    unsafe { Igb::new(&mut function, &network_handoff, dma, minimum.clone()) };
                 if let Ok(device) = &attached {
                     if device.warnings.nvm_autoload_timeout {
                         devices.warnings.push((
@@ -2041,8 +2073,15 @@ pub unsafe fn probe_observed(
                 let minimum = minimum_for_function!().clone();
                 // SAFETY: the caller granted exclusive post-EBS ownership of
                 // mapped PCI/MMIO and DMA, including upstream ASPM configuration.
-                let attached =
-                    unsafe { Realtek::new(&mut function, handoff, dma, firmware, minimum.clone()) };
+                let attached = unsafe {
+                    Realtek::new(
+                        &mut function,
+                        &network_handoff,
+                        dma,
+                        firmware,
+                        minimum.clone(),
+                    )
+                };
                 if let Ok(device) = &attached {
                     devices.warnings.extend(
                         device
@@ -2123,6 +2162,11 @@ pub unsafe fn probe_observed(
                 let attached = match ahci::attach(function, handoff, dma, minimum.clone()) {
                     Ok(attached) => attached,
                     Err(failure) => {
+                        devices
+                            .device_failures
+                            .extend(failure.port_failures().iter().map(|(port, error)| {
+                                (alloc::format!("{address} port {port}"), error.clone())
+                            }));
                         devices
                             .failures
                             .push((address, Error::Device(failure.error.clone())));
@@ -2874,6 +2918,37 @@ fn attach_platform(
 mod tests {
     use super::*;
 
+    /// A wired adapter signals frames on the engine's network message, or
+    /// on the disks' completion message when the engine gave none.
+    #[test]
+    fn wired_adapters_signal_on_the_network_message() {
+        use crate::bus::irq::MsiMessage;
+        let disk = MsiMessage {
+            address: 0xfee0_0000,
+            data: 0x62,
+        };
+        let frames = MsiMessage {
+            address: 0xfee0_0000,
+            data: 0x63,
+        };
+        let mut handoff = Handoff {
+            ecam: Vec::new(),
+            mapped: alloc::vec![0x1000..0x2000],
+            dma: 0..0,
+            clock: Clock {
+                ticks_per_microsecond: 1,
+            },
+            firmware: None,
+            completion: Some(disk),
+            network: Some(frames),
+        };
+        let wired = network_handoff(&handoff);
+        assert_eq!(wired.completion, Some(frames));
+        assert_eq!(wired.mapped, handoff.mapped);
+        handoff.network = None;
+        assert_eq!(network_handoff(&handoff).completion, Some(disk));
+    }
+
     /// The boot of issue 18: the mount refused both HD Audio controllers
     /// before their driver ran, and they are filed as audio, not with the
     /// devices that may hold a disk.
@@ -3222,6 +3297,7 @@ mod tests {
                 },
                 firmware: None,
                 completion: None,
+                network: None,
             };
             let services = services::tests::Refusing::minimum_only();
             // SAFETY: the empty region can allocate no DMA pages. Only the
@@ -3381,6 +3457,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let address = |device| Address {
             segment: 0,
@@ -3497,6 +3574,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let address = |device| Address {
             segment: 0,
@@ -3567,6 +3645,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let services = services::tests::Refusing::minimum_only();
         // SAFETY: no DMA pages, only the synthetic ECAM mapped, and every
@@ -3640,6 +3719,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let services = services::tests::Refusing::minimum_only();
         // SAFETY: as in the EHCI fixture above: no DMA pages, only the
@@ -3802,6 +3882,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let firmware = handoff_provider(&handoff);
         let network = Network {
@@ -3877,6 +3958,7 @@ mod tests {
             },
             firmware: None,
             completion: None,
+            network: None,
         };
         let address = Address {
             segment: 0,

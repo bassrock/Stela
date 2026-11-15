@@ -24,6 +24,7 @@
 //! boot processor itself pays nothing more than the step's own stores: no
 //! NMI goes to a processor that runs no Linux step, as a guest's or a
 //! parked one does not.
+use crate::first_stop::FirstStop;
 use alloc::{format, string::String};
 
 /// How long no step may return before the watchdog stops the boot: half of
@@ -153,9 +154,18 @@ pub enum Look {
 
 /// One watcher's look at the boot processor's step (`began`, 0 between
 /// steps) at `now` of a count at `counter_hz`, given the `last` sighting.
-/// Each step has its own start, so an unchanged one is the same step.
-pub fn look(last: Option<Sighting>, began: u64, now: u64, counter_hz: u64) -> Look {
-    if began == 0 || counter_hz == 0 {
+/// Each step has its own start, so an unchanged one is the same step. Once
+/// the boot stopped (`stop`) the watch ends: the boot processor stays
+/// inside the step it stopped in, and an NMI would replace the stop's
+/// reason with a timeout of that step.
+pub fn look(
+    stop: &FirstStop,
+    last: Option<Sighting>,
+    began: u64,
+    now: u64,
+    counter_hz: u64,
+) -> Look {
+    if began == 0 || counter_hz == 0 || stop.began() {
         return Look::Idle;
     }
     match last {
@@ -246,9 +256,218 @@ pub fn message(stage: &str, stuck: &Stuck) -> String {
     }
 }
 
+/// How long the boot processor's dispatcher may wait idle, while it runs
+/// alone, with neither its timer interrupt nor a raised wake, in each of
+/// the two windows [`IdleWatch`] counts: the timer's heartbeat fires every
+/// millisecond, so a second without it is a lost interrupt, not a late one.
+/// A halted processor counts no cycles, so the counter's limit never ends
+/// such a wait; the dispatcher then polls the time-stamp counter instead of
+/// halting, and stops the boot past both windows.
+pub const IDLE_LIMIT_MS: u64 = 1000;
+
+/// A polled idle wait's clock, by the time-stamp counter, from the wait's
+/// entry with no timer interrupt or wake since. The boot stops only after
+/// two whole [`IDLE_LIMIT_MS`] windows: the second starts where the first
+/// ran out, so a counter that jumped forward sooner than the timer's
+/// interrupt came (firmware that writes the counter, a hypervisor that
+/// delivers the timer late) ends at most the first, and the timer armed at
+/// the entry fires within the second. A counter that
+/// steps back starts its window again instead of reading as overdue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IdleWatch {
+    /// Where the running window began.
+    since: u64,
+    /// The milliseconds the windows before it counted.
+    counted: u64,
+    /// The first window ran out.
+    confirming: bool,
+}
+
+/// What an idle wait does after [`IdleWatch::check`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Idle {
+    /// Keep polling with interrupts open.
+    Wait,
+    /// Stop the boot: no timer interrupt or wake for `waited_ms`.
+    Stop { waited_ms: u64 },
+}
+
+impl IdleWatch {
+    /// A wait entered when the counter read `entered`.
+    pub fn new(entered: u64) -> Self {
+        Self {
+            since: entered,
+            counted: 0,
+            confirming: false,
+        }
+    }
+
+    /// The wait at counter `now`, still with no interrupt or wake, at
+    /// `tsc_hz`. Never stops with no known rate.
+    pub fn check(&mut self, now: u64, tsc_hz: u64) -> Idle {
+        if tsc_hz == 0 {
+            return Idle::Wait;
+        }
+        let Some(ticks) = now.checked_sub(self.since) else {
+            self.since = now;
+            return Idle::Wait;
+        };
+        let elapsed = millis(ticks, tsc_hz);
+        if elapsed < IDLE_LIMIT_MS {
+            return Idle::Wait;
+        }
+        if !self.confirming {
+            self.confirming = true;
+            self.counted = elapsed;
+            self.since = now;
+            return Idle::Wait;
+        }
+        Idle::Stop {
+            waited_ms: self.counted.saturating_add(elapsed),
+        }
+    }
+}
+
+/// The local APIC registers an idle stop names: the timer's entry and
+/// counts, the task priority, and the in-service and requested vectors
+/// (eight 32-bit registers each, vector 0 in bit 0 of the first).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct IdleApic {
+    pub lvt_timer: u32,
+    pub initial: u32,
+    pub current: u32,
+    pub tpr: u32,
+    pub in_service: [u32; 8],
+    pub requested: [u32; 8],
+}
+
+/// The highest vector set in an ISR or IRR image.
+fn highest(bits: &[u32; 8]) -> Option<u32> {
+    bits.iter()
+        .enumerate()
+        .rev()
+        .find(|(_, word)| **word != 0)
+        .map(|(index, word)| index as u32 * 32 + 31 - word.leading_zeros())
+}
+
+fn vector(vector: Option<u32>) -> String {
+    vector.map_or_else(|| String::from("none"), |vector| format!("{vector:#x}"))
+}
+
+/// The stop's reason when the dispatcher's idle wait outlived
+/// [`IDLE_LIMIT_MS`] (`waited_ms`) during `stage`.
+pub fn idle_message(stage: &str, waited_ms: u64, apic: &IdleApic) -> String {
+    format!(
+        "the boot processor's timer interrupt did not arrive for {waited_ms} ms while Linux's \
+         work waited idle ({stage}): LVT timer {:#x}{}, count {} of {}, TPR {:#x}, highest \
+         vector in service {}, highest requested {}",
+        apic.lvt_timer,
+        if apic.lvt_timer & 1 << 16 != 0 {
+            " (masked)"
+        } else {
+            ""
+        },
+        apic.current,
+        apic.initial,
+        apic.tpr,
+        vector(highest(&apic.in_service)),
+        vector(highest(&apic.requested)),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Polls `watch` from `from` to `to` in steps of `step`, as the idle
+    /// loop does, returning the first stop.
+    fn poll(watch: &mut IdleWatch, from: u64, to: u64, step: u64) -> Option<u64> {
+        let mut now = from;
+        while now <= to {
+            if let Idle::Stop { waited_ms } = watch.check(now, HZ) {
+                return Some(waited_ms);
+            }
+            now += step;
+        }
+        None
+    }
+
+    #[test]
+    fn a_lost_timer_interrupt_stops_the_wait_after_two_windows() {
+        let entered = 1 << 40;
+        let mut watch = IdleWatch::new(entered);
+        // The first window running out only starts the second.
+        assert_eq!(poll(&mut watch, entered, entered + HZ, HZ / 1000), None);
+        assert_eq!(
+            poll(&mut watch, entered + HZ, entered + 3 * HZ, HZ / 1000),
+            Some(2000)
+        );
+    }
+
+    #[test]
+    fn a_counter_that_jumps_forward_once_does_not_stop_the_wait() {
+        // The counter reads 10 s past the entry at the first poll, before
+        // the timer armed at the entry has fired: firmware that writes the
+        // counter forward, or a hypervisor that delivers the timer after
+        // the counter moved. The timer fires a millisecond later.
+        let entered = 1 << 40;
+        let mut watch = IdleWatch::new(entered);
+        assert_eq!(watch.check(entered + 10 * HZ, HZ), Idle::Wait);
+        let tick = entered + 10 * HZ + HZ / 1000;
+        assert_eq!(poll(&mut watch, entered + 10 * HZ, tick, HZ / 10_000), None);
+    }
+
+    #[test]
+    fn a_counter_that_steps_back_starts_its_window_again() {
+        // Firmware that writes the counter back: a step back must not read
+        // as a whole wrap of the counter, which would be overdue at once.
+        let entered = 1 << 40;
+        let mut watch = IdleWatch::new(entered);
+        assert_eq!(watch.check(entered - 1, HZ), Idle::Wait);
+        assert_eq!(
+            poll(&mut watch, entered - 1, entered + HZ / 2, HZ / 1000),
+            None
+        );
+        // Then a lost interrupt still stops it, two windows on.
+        let mut watch = IdleWatch::new(entered);
+        assert_eq!(watch.check(entered - HZ, HZ), Idle::Wait);
+        assert_eq!(
+            poll(&mut watch, entered - HZ, entered + 2 * HZ, HZ / 1000),
+            Some(2000)
+        );
+    }
+
+    #[test]
+    fn an_idle_wait_with_no_known_rate_never_stops() {
+        let mut watch = IdleWatch::new(0);
+        assert_eq!(watch.check(u64::MAX / 2, 0), Idle::Wait);
+        assert_eq!(watch.check(u64::MAX, 0), Idle::Wait);
+    }
+
+    #[test]
+    fn an_idle_stop_names_the_timer_and_the_vectors_that_block_it() {
+        let mut apic = IdleApic {
+            lvt_timer: 0x20,
+            initial: 2400,
+            current: 0,
+            tpr: 0,
+            ..IdleApic::default()
+        };
+        apic.in_service[1] = 1 << 17;
+        apic.requested[1] = 1;
+        apic.requested[6] = 1 << 3;
+        assert_eq!(
+            idle_message("the GPU's probe", 1000, &apic),
+            "the boot processor's timer interrupt did not arrive for 1000 ms while Linux's work \
+             waited idle (the GPU's probe): LVT timer 0x20, count 0 of 2400, TPR 0x0, highest \
+             vector in service 0x31, highest requested 0xc3"
+        );
+        apic.lvt_timer |= 1 << 16;
+        apic.in_service = [0; 8];
+        assert!(idle_message("Linux driver work", 1200, &apic).contains(
+            "LVT timer 0x10020 (masked), count 0 of 2400, TPR 0x0, highest vector in service none"
+        ));
+    }
 
     const HZ: u64 = 2_400_000_000;
 
@@ -329,30 +548,31 @@ mod tests {
     fn another_processor_finds_a_step_stuck_once_it_saw_it_run_for_the_limit() {
         const COUNT_HZ: u64 = 1_000_000_000;
         let at = |seconds: u64| 5 * COUNT_HZ + seconds * COUNT_HZ;
+        let watching = FirstStop::new();
         // Nothing runs: nothing to watch, whatever was seen before.
-        assert_eq!(look(None, 0, at(0), COUNT_HZ), Look::Idle);
+        assert_eq!(look(&watching, None, 0, at(0), COUNT_HZ), Look::Idle);
         let seen = Sighting {
             began: 77,
             seen_at: at(0),
         };
-        assert_eq!(look(Some(seen), 0, at(40), COUNT_HZ), Look::Idle);
-        assert_eq!(look(None, 77, at(0), 0), Look::Idle);
+        assert_eq!(look(&watching, Some(seen), 0, at(40), COUNT_HZ), Look::Idle);
+        assert_eq!(look(&watching, None, 77, at(0), 0), Look::Idle);
         // A step first seen is remembered, by the watcher's own count.
-        assert_eq!(look(None, 77, at(0), COUNT_HZ), Look::New(seen));
+        assert_eq!(look(&watching, None, 77, at(0), COUNT_HZ), Look::New(seen));
         // The same step, within the limit, and past it.
         assert_eq!(
-            look(Some(seen), 77, at(LIMIT_SECONDS) - 1, COUNT_HZ),
+            look(&watching, Some(seen), 77, at(LIMIT_SECONDS) - 1, COUNT_HZ),
             Look::Running
         );
         assert_eq!(
-            look(Some(seen), 77, at(LIMIT_SECONDS + 2), COUNT_HZ),
+            look(&watching, Some(seen), 77, at(LIMIT_SECONDS + 2), COUNT_HZ),
             Look::Overdue {
                 quiet_ms: (LIMIT_SECONDS + 2) * 1000
             }
         );
         // Another step since, however long the watch: a new sighting.
         assert_eq!(
-            look(Some(seen), 78, at(LIMIT_SECONDS + 2), COUNT_HZ),
+            look(&watching, Some(seen), 78, at(LIMIT_SECONDS + 2), COUNT_HZ),
             Look::New(Sighting {
                 began: 78,
                 seen_at: at(LIMIT_SECONDS + 2)
@@ -361,9 +581,31 @@ mod tests {
         // A count that went back (another watcher's earlier reading) is
         // no overdue.
         assert_eq!(
-            look(Some(seen), 77, at(0) - COUNT_HZ, COUNT_HZ),
+            look(&watching, Some(seen), 77, at(0) - COUNT_HZ, COUNT_HZ),
             Look::Running
         );
+    }
+
+    #[test]
+    fn the_watch_ends_at_the_first_stop() {
+        const COUNT_HZ: u64 = 1_000_000_000;
+        let seen = Sighting {
+            began: 77,
+            seen_at: COUNT_HZ,
+        };
+        let overdue = COUNT_HZ * (LIMIT_SECONDS + 30);
+        let stop = FirstStop::new();
+        assert!(matches!(
+            look(&stop, Some(seen), 77, overdue, COUNT_HZ),
+            Look::Overdue { .. }
+        ));
+        // The boot processor stopped inside the step: its fatal stop never
+        // returns, and the step never does either.
+        assert_eq!(stop.claim(0), crate::first_stop::Claim::First);
+        assert_eq!(look(&stop, Some(seen), 77, overdue, COUNT_HZ), Look::Idle);
+        assert_eq!(look(&stop, None, 77, overdue, COUNT_HZ), Look::Idle);
+        stop.finish(0);
+        assert_eq!(look(&stop, Some(seen), 77, overdue, COUNT_HZ), Look::Idle);
     }
 
     #[test]

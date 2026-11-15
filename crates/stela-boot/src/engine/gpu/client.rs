@@ -41,6 +41,7 @@ use core::{
         AtomicBool, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence,
     },
 };
+use stela_boot_core::gpu_requests::{HostCall, Request as Code};
 use stela_boot_core::page_window::Cache;
 use stela_boot_core::posted_call::{self, Claim};
 use stela_drivers::platform::work::{WorkError, service::Idle};
@@ -447,7 +448,8 @@ unsafe fn perform(gpu: &Installed, operation: Operation) -> i64 {
                 let Some((&start, &(mapping, pages))) = found else {
                     return EFAULT;
                 };
-                if address >= start + pages as u64 * PAGE || !client::fault(mapping, address, write)
+                if address >= start + pages as u64 * PAGE
+                    || !client::fill_around(mapping, address, write)
                 {
                     return EFAULT;
                 }
@@ -825,12 +827,25 @@ unsafe extern "C" fn wake_waiters(_: *mut c_void) {
     unsafe { client::wake() };
 }
 
-/// An ioctl by its request code; every other request as zero.
+/// An ioctl by its request code; every other host call by a small code of
+/// its own ([`HostCall`]), which the reports name.
 fn request_code(operation: &Operation) -> u32 {
-    match *operation {
-        Operation::Control { request, .. } => request,
-        _ => 0,
-    }
+    let call = match *operation {
+        Operation::Control { request, .. } => return request,
+        Operation::Open(_) => HostCall::Open,
+        Operation::Close(_) => HostCall::Close,
+        Operation::Duplicate(_) => HostCall::Duplicate,
+        Operation::Device(_) => HostCall::Device,
+        Operation::Map { .. } => HostCall::Map,
+        Operation::Unmap(_) => HostCall::Unmap,
+        Operation::Fault { .. } => HostCall::Fault,
+        Operation::Thread(_) => HostCall::Thread,
+        Operation::Wake => HostCall::Wake,
+        Operation::Export(..) => HostCall::Export,
+        Operation::Shutdown => HostCall::Shutdown,
+        Operation::Seek(..) => HostCall::Seek,
+    };
+    call.code()
 }
 
 /// Request counts and ticks by request code plus one, in slots that fill in
@@ -1030,10 +1045,15 @@ static WITHDRAWN: AtomicU64 = AtomicU64::new(0);
 
 /// Posts `request` and waits for its result, within the bounds of
 /// [`posted_call`]: None when it was withdrawn, no task having taken it by
-/// [`posted_call::WITHDRAW_MS`]; it then stays with the task that meets it.
+/// [`posted_call::WITHDRAW_MS`]; it then stays with the task that meets it,
+/// which never performs it, and the guest call it was made for is made
+/// again if it fails and may be ([`super::gate::defer_for_wait`]).
 /// A call a task performs past that is reported and waited for, and one
 /// still running at [`posted_call::STOP_MS`] stops the boot, naming it.
 fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
+    if super::slice::can_end() {
+        return job_wait(gpu, request, code);
+    }
     let millis = (gpu.tsc_hz / 1000).max(1);
     let posted = request.posted;
     let ms = || host::rdtsc().wrapping_sub(posted) / millis;
@@ -1042,13 +1062,21 @@ fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
     wait(gpu, request, withdraw_at);
     if !done() {
         if request.withdrawable() && request.claim.withdraw() {
+            // The call never ran: a guest call that can be made again is,
+            // rather than failing for a wait.
+            let again = super::gate::defer_for_wait();
             let count = WITHDRAWN.fetch_add(1, Ordering::Relaxed) + 1;
             if count.is_power_of_two() {
                 output::arguments(format_args!(
                     "GPU call {code:#x} withdrawn after {} ms on PE {}: no task took it; \
-                     answered ETIMEDOUT ({count} withdrawn)\n",
+                     answered ETIMEDOUT, {} ({count} withdrawn)\n",
                     ms(),
-                    host::processor()
+                    host::processor(),
+                    if again {
+                        "and the guest call runs again if it fails"
+                    } else {
+                        "which fails the guest call"
+                    }
                 ));
                 // The pool's state is the boot CPU's to read.
                 if host::processor() == BOOT_CPU.load(Ordering::Relaxed)
@@ -1129,6 +1157,56 @@ pub(super) fn cs_host_line(tsc_hz: u64) -> Option<alloc::string::String> {
     ))
 }
 
+/// [`posted_wait`] in a deferred job's slice, which no guest waits on: the
+/// slice gives its processor back while the call waits, and the call is not
+/// withdrawn for a wait a task would end, as a Linux process blocks in its
+/// ioctl. Only a call no task took by [`posted_call::STOP_MS`] is withdrawn,
+/// failing with ETIMEDOUT, and one a task still performs then stops the
+/// boot, naming it, as for a guest's call.
+fn job_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
+    let millis = (gpu.tsc_hz / 1000).max(1);
+    let posted = request.posted;
+    let stop_at = posted.saturating_add(posted_call::STOP_MS * millis);
+    let done = || request.done.load(Ordering::Acquire) != 0;
+    post(request);
+    if let Err(error) = gpu.events.notify() {
+        output::fatal(format_args!(
+            "the host's Linux environment failed: {error:?}"
+        ));
+    }
+    while !done() {
+        if host::rdtsc() >= stop_at {
+            if request.withdrawable() && request.claim.withdraw() {
+                output::arguments(format_args!(
+                    "GPU call {code:#x} withdrawn after {} ms in a deferred job on PE {}: \
+                     no task took it; answered ETIMEDOUT\n",
+                    host::rdtsc().wrapping_sub(posted) / millis,
+                    host::processor()
+                ));
+                return None;
+            }
+            spin(gpu, request, stop_at.saturating_add(millis));
+            if !done() {
+                output::fatal(format_args!(
+                    "a GPU call ({code:#x}) of a deferred job still ran after {} ms",
+                    posted_call::STOP_MS
+                ));
+            }
+            break;
+        }
+        // The boot processor serves the call only from its run loop, so a
+        // slice there gives it back at once; one that cannot runs Linux.
+        if host::processor() == BOOT_CPU.load(Ordering::Relaxed) && !super::slice::can_end() {
+            spin(gpu, request, stop_at);
+            continue;
+        }
+        super::slice::wait_point();
+        crate::native_mmio::shootdown::service();
+        hint::spin_loop();
+    }
+    Some(request.result.load(Ordering::Acquire))
+}
+
 /// Requests posted to the service task since [`take_posted`] by request
 /// code: how many, and the TSC ticks their posters waited for them.
 static POSTED: Counts = [const { (AtomicU32::new(0), AtomicU64::new(0), AtomicU64::new(0)) }; 64];
@@ -1186,7 +1264,7 @@ fn slowest_line(tsc_hz: u64) -> Option<alloc::string::String> {
     let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
     let mut line = alloc::string::String::from("GPU SERVED LONGEST request:longest_us/shootdowns");
     for &(request, longest, shootdowns) in rows.iter().take(SHOWN) {
-        let _ = write!(line, " {request:#x}:{}/{shootdowns}", micros(longest));
+        let _ = write!(line, " {}:{}/{shootdowns}", Code(request), micros(longest));
     }
     Some(line)
 }
@@ -1357,7 +1435,7 @@ fn workers_line(tsc_hz: u64) -> Option<alloc::string::String> {
         let code = slot.0.load(Ordering::Relaxed);
         let took = ms(slot.1.load(Ordering::Relaxed));
         if code != 0 && took >= 1000 {
-            let _ = write!(serving, " {:#x}:{took}ms", code.wrapping_sub(1));
+            let _ = write!(serving, " {}:{took}ms", Code(code.wrapping_sub(1)));
         }
     }
     if queue.is_empty() && serving.is_empty() {
@@ -1671,25 +1749,66 @@ pub(in crate::engine) fn vram_bytes(index: u32) -> Option<u64> {
     (result == 0 && parameter.value != 0).then_some(parameter.value)
 }
 
-/// Serve a fault on a mapping that moved, as Linux unmaps a buffer it evicts.
-/// False when `address` is not one a client mapped.
-pub(in crate::engine) fn serve_fault(address: u64, write: bool) -> bool {
-    installed().is_some_and(|gpu| {
-        if !gpu.window.contains(address) || MAPPINGS.load(Ordering::Relaxed) == 0 {
-            return false;
-        }
-        // The boot CPU reaches Linux only through its dispatcher, which a
-        // fault's handler cannot enter, except on a Linux task, which calls
-        // in place. Say what faulted, not only that the dispatch was refused.
-        if host::processor() == BOOT_CPU.load(Ordering::Relaxed) && current_thread(gpu).is_none()
-        {
-            output::fatal(format_args!(
-                "a GPU mapping at {address:#x} (write={write}) faulted on the boot CPU outside \
-                 Linux, which cannot map it again there: amdgpu unmapped it, as its GPU reset does"
-            ));
-        }
-        submit(Operation::Fault { address, write }) == 0
-    })
+/// Whether a fault at `address` may be on a client's mapping: a page past
+/// the window a map or an earlier fault filled, or one Linux unmapped as it
+/// moved the buffer behind it. For the #PF handler, which leaves the fault,
+/// and the fill of the rest of its window, to the faulting context
+/// ([`serve_moved`]).
+pub(in crate::engine) fn client_fault(address: u64) -> bool {
+    installed()
+        .is_some_and(|gpu| gpu.window.contains(address) && MAPPINGS.load(Ordering::Relaxed) != 0)
+}
+
+/// Client faults served so far, for the report of the first and of each
+/// power of two after it.
+static CLIENT_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// `rip` as an offset in this image.
+fn image_offset(rip: u64) -> u64 {
+    unsafe extern "C" {
+        static __ImageBase: u8;
+    }
+    rip.wrapping_sub((&raw const __ImageBase).addr() as u64)
+}
+
+/// Serve the fault at `address` that the code at `rip` took, in that code's
+/// own context, as Linux's fault handler runs in the faulting task: a Mesa
+/// thread refaults on its task, which may sleep; other code posts the
+/// refault, and the boot CPU runs Linux for it, as at any posted call.
+pub(in crate::engine) fn serve_moved(address: u64, write: bool, rip: u64) {
+    let thread = installed().and_then(current_thread).is_some();
+    let count = CLIENT_FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        output::arguments(format_args!(
+            "GPU CLIENT FAULT address={address:#x} write={write} rip=+{:#x} processor={} \
+             thread={} count={count}\n",
+            image_offset(rip),
+            host::processor(),
+            if thread { "mesa" } else { "host" },
+        ));
+    }
+    let result = submit(Operation::Fault { address, write });
+    if result != 0 {
+        output::fatal(format_args!(
+            "a GPU client fault at {address:#x} from +{:#x} on processor {} was not \
+             served: {result}",
+            image_offset(rip),
+            host::processor()
+        ));
+    }
+}
+
+/// Say why the fault at `address` from `rip` cannot reach its server, before
+/// the handler stops on it.
+pub(in crate::engine) fn note_unserved(
+    address: u64,
+    rip: u64,
+    refused: stela_boot_core::process_fault::Refused,
+) {
+    output::arguments(format_args!(
+        "GPU client fault at {address:#x} from +{:#x} not served: {refused:?}\n",
+        image_offset(rip)
+    ));
 }
 
 fn text(pointer: *const c_char) -> &'static str {
@@ -1728,7 +1847,7 @@ unsafe extern "C" fn stela_libc_log(pointer: *const u8, size: usize) {
     // SAFETY: the C library's live text.
     let bytes = unsafe { slice::from_raw_parts(pointer, size) };
     if let Ok(line) = str::from_utf8(bytes) {
-        output::arguments(format_args!("{line}"));
+        super::slice::without_yields(|| output::arguments(format_args!("{line}")));
     }
 }
 
@@ -1758,9 +1877,10 @@ extern "C" fn stela_libc_now_ns() -> u64 {
 
 #[unsafe(no_mangle)]
 extern "C" fn stela_libc_core() -> c_uint {
-    installed()
-        .and_then(current_thread)
-        .map_or_else(host::processor, |thread| thread.core)
+    match installed().and_then(current_thread) {
+        Some(thread) => thread.core,
+        None => super::slice::job_core().unwrap_or_else(host::processor),
+    }
 }
 
 /// The core a thread of the platform's own runs as: past the C library's
@@ -1800,6 +1920,8 @@ unsafe extern "C" fn stela_libc_wait(word: *const c_uint, value: c_uint, deadlin
         return hint::spin_loop();
     };
     let Some(thread) = current_thread(gpu) else {
+        // A job's slice past its time gives its processor back here.
+        super::slice::wait_point();
         return super::gate::relax();
     };
     let sleeping = &SLEEPING[thread.core as usize - PROCESSORS];

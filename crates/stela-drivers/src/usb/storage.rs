@@ -17,7 +17,11 @@ use crate::{
 #[cfg(test)]
 use alloc::vec;
 use alloc::{format, rc::Rc, string::String, vec::Vec};
-use core::cell::{Cell, RefCell};
+use core::{
+    cell::{Cell, RefCell},
+    sync::atomic::{AtomicU32, Ordering},
+};
+use stela_driver_base::stepped::block_on;
 mod media;
 pub use media::UsbStorage;
 mod bot;
@@ -37,6 +41,7 @@ const SD_MAX_RETRIES: u32 = 5;
 const SD_RUNTIME_US: u64 = (SD_MAX_RETRIES as u64 + 1) * 30_000_000;
 
 mod binding;
+pub(super) mod resume;
 pub mod settle;
 pub use binding::Binding;
 pub(super) use binding::discover as discover_binding;
@@ -141,6 +146,12 @@ trait Scsi {
     }
     /// What the last command's data phase moved in before it failed.
     fn take_failed_data(&mut self) -> Option<Vec<u8>>;
+    /// Whether the device, should it leave the bus and come back, is
+    /// started again for this transport's disks ([`resume`]): each unit's
+    /// first blocks are then kept at publication to compare it by.
+    fn resumable(&self) -> bool {
+        false
+    }
     fn media_publication(&mut self, _lun: Self::Lun, _valid: Rc<Cell<bool>>, _removable: bool) {}
     fn max_lun(&self) -> u8 {
         0
@@ -222,6 +233,9 @@ trait Scsi {
 }
 impl<I: Io> Scsi for Bot<I> {
     type Lun = u8;
+    fn resumable(&self) -> bool {
+        self.io.resumable()
+    }
     fn command(&mut self, lun: u8, cdb: &[u8], data: Data<'_>) -> Result<Vec<u8>, BlockError> {
         Bot::command(self, lun, cdb, data)
     }
@@ -416,6 +430,38 @@ struct Disk<T: Scsi> {
     /// ([`Disk::start`]).
     running: Option<Running>,
     next_tag: u32,
+    /// The unit answered SYNCHRONIZE CACHE with ILLEGAL REQUEST, INVALID
+    /// COMMAND OPERATION CODE: it has no cache command, and its flushes
+    /// complete without one, as Linux `sd_sync_cache` takes that answer.
+    cache_refused: bool,
+    /// The unit's first blocks as its publication read them, which its
+    /// owner keeps to compare a device that comes back by
+    /// ([`media::Owner::resume`]); taken when the owner takes the unit.
+    first_blocks: Option<Vec<u8>>,
+}
+
+/// Units that answered SYNCHRONIZE CACHE as an invalid opcode since the
+/// last [`take_cache_refusals`]: each counts once, when it first refused.
+static CACHE_REFUSALS: AtomicU32 = AtomicU32::new(0);
+
+/// The units that refused SYNCHRONIZE CACHE as an invalid opcode since the
+/// last call, for a log line; their later flushes send no command.
+pub fn take_cache_refusals() -> u32 {
+    CACHE_REFUSALS.swap(0, Ordering::Relaxed)
+}
+
+/// Whether `error` is a unit's answer that it implements no such command
+/// (ILLEGAL REQUEST, INVALID COMMAND OPERATION CODE), which Linux
+/// `sd_sync_cache` counts as no error for SYNCHRONIZE CACHE.
+fn invalid_opcode(error: &BlockError) -> bool {
+    matches!(
+        error,
+        BlockError::Sense(Sense {
+            key: Sense::ILLEGAL_REQUEST,
+            asc: 0x20,
+            ..
+        })
+    )
 }
 
 /// A block command a unit runs as consecutive SCSI commands, none waited
@@ -669,6 +715,17 @@ fn publication<T: Scsi>(
             rotation: Rotation::Unreported,
         };
     }
+    // The medium a device that comes back is compared by. A unit whose
+    // first blocks do not read publishes as before; its device is then
+    // never started again.
+    let first_blocks = {
+        let mut transport = owner.borrow_mut();
+        if transport.resumable() {
+            block_on(first_blocks_with(&mut Now(&mut *transport), lun, &identity)).ok()
+        } else {
+            None
+        }
+    };
     Ok(Disk {
         bot: owner.clone(),
         lun,
@@ -677,6 +734,8 @@ fn publication<T: Scsi>(
         removable,
         running: None,
         next_tag: 0,
+        cache_refused: false,
+        first_blocks,
     })
 }
 
@@ -844,6 +903,71 @@ fn discover_units<T: Scsi<Lun = u8>>(
     Ok(disks)
 }
 
+/// A transport's commands as a unit's probe runs them, written once: to
+/// completion through [`Scsi`] ([`Now`]), or in steps from a service turn
+/// for a device that came back after boot ([`resume`]).
+trait Commands {
+    type Lun: Copy + Default + PartialEq + core::fmt::Display;
+    async fn command(
+        &mut self,
+        lun: Self::Lun,
+        cdb: &[u8],
+        data: Data<'_>,
+    ) -> Result<Vec<u8>, BlockError>;
+    async fn delay(&mut self, micros: u64) -> Result<(), BlockError>;
+    async fn read_before_mode_sense(
+        &mut self,
+        lun: Self::Lun,
+        block_size: usize,
+    ) -> Result<(), BlockError>;
+    fn poisoned(&self) -> bool;
+    fn capacity16_first(&self) -> bool;
+    fn adjust_capacity(&self, blocks: u64) -> Option<u64>;
+    fn max_transfer_bytes(&self) -> usize;
+    fn write_protect_page(&self) -> Option<u8>;
+}
+
+/// A [`Scsi`] transport whose commands run to completion: its futures are
+/// ready at their first poll.
+struct Now<'a, T>(&'a mut T);
+
+impl<T: Scsi> Commands for Now<'_, T> {
+    type Lun = T::Lun;
+    async fn command(
+        &mut self,
+        lun: T::Lun,
+        cdb: &[u8],
+        data: Data<'_>,
+    ) -> Result<Vec<u8>, BlockError> {
+        self.0.command(lun, cdb, data)
+    }
+    async fn delay(&mut self, micros: u64) -> Result<(), BlockError> {
+        self.0.delay(micros)
+    }
+    async fn read_before_mode_sense(
+        &mut self,
+        lun: T::Lun,
+        block_size: usize,
+    ) -> Result<(), BlockError> {
+        self.0.read_before_mode_sense(lun, block_size)
+    }
+    fn poisoned(&self) -> bool {
+        self.0.poisoned()
+    }
+    fn capacity16_first(&self) -> bool {
+        self.0.capacity16_first()
+    }
+    fn adjust_capacity(&self, blocks: u64) -> Option<u64> {
+        self.0.adjust_capacity(blocks)
+    }
+    fn max_transfer_bytes(&self) -> usize {
+        self.0.max_transfer_bytes()
+    }
+    fn write_protect_page(&self) -> Option<u8> {
+        self.0.write_protect_page()
+    }
+}
+
 /// The unit's identity and whether its medium is removable.
 fn probe<T: Scsi>(
     bot: &mut T,
@@ -851,13 +975,26 @@ fn probe<T: Scsi>(
     location: &str,
     serial: &str,
 ) -> Result<(Identity, bool), BlockError> {
-    let inquiry = inquiry(bot, lun)?;
-    probe_identified(bot, lun, &inquiry, location, serial)
+    block_on(probe_with(&mut Now(bot), lun, location, serial))
+}
+async fn probe_with<C: Commands>(
+    bot: &mut C,
+    lun: C::Lun,
+    location: &str,
+    serial: &str,
+) -> Result<(Identity, bool), BlockError> {
+    let inquiry = inquiry_with(bot, lun).await?;
+    probe_identified_with(bot, lun, &inquiry, location, serial).await
 }
 fn inquiry<T: Scsi>(bot: &mut T, lun: T::Lun) -> Result<Vec<u8>, BlockError> {
+    block_on(inquiry_with(&mut Now(bot), lun))
+}
+async fn inquiry_with<C: Commands>(bot: &mut C, lun: C::Lun) -> Result<Vec<u8>, BlockError> {
     let mut result = Err(BlockError::Unsupported("INQUIRY did not complete"));
     for _ in 0..3 {
-        result = bot.command(lun, &scsi::inquiry(), Data::In(scsi::INQUIRY_BYTES));
+        result = bot
+            .command(lun, &scsi::inquiry(), Data::In(scsi::INQUIRY_BYTES))
+            .await;
         if !matches!(&result, Err(BlockError::Sense(sense)) if sense.key == Sense::UNIT_ATTENTION
             && matches!(sense.asc, Sense::MEDIUM_CHANGED | Sense::RESET_OCCURRED))
         {
@@ -877,6 +1014,21 @@ fn probe_identified<T: Scsi>(
     location: &str,
     serial: &str,
 ) -> Result<(Identity, bool), BlockError> {
+    block_on(probe_identified_with(
+        &mut Now(bot),
+        lun,
+        inquiry,
+        location,
+        serial,
+    ))
+}
+async fn probe_identified_with<C: Commands>(
+    bot: &mut C,
+    lun: C::Lun,
+    inquiry: &[u8],
+    location: &str,
+    serial: &str,
+) -> Result<(Identity, bool), BlockError> {
     if inquiry[0] != 0 {
         return Err(BlockError::Unsupported(
             "USB LUN is not an attached direct-access block device",
@@ -886,7 +1038,10 @@ fn probe_identified<T: Scsi>(
     let mut ready = false;
     let mut started = false;
     for attempt in 0..READY_TRIES {
-        match bot.command(lun, &[scsi::TEST_UNIT_READY, 0, 0, 0, 0, 0], Data::None) {
+        match bot
+            .command(lun, &[scsi::TEST_UNIT_READY, 0, 0, 0, 0, 0], Data::None)
+            .await
+        {
             Ok(_) => {
                 ready = true;
                 break;
@@ -905,7 +1060,7 @@ fn probe_identified<T: Scsi>(
                     && sense.ascq == Sense::INITIALIZING_COMMAND_REQUIRED =>
             {
                 started = true;
-                bot.command(lun, &scsi::start_unit(), Data::None)?;
+                bot.command(lun, &scsi::start_unit(), Data::None).await?;
             }
             // The command has already completed same-LUN REQUEST SENSE.
             Err(BlockError::Sense(sense))
@@ -915,7 +1070,7 @@ fn probe_identified<T: Scsi>(
                         && !matches!(sense.ascq, 3 | 0xb | 0xc | 0x1b | 0x24 | 0x25) =>
             {
                 if attempt + 1 < READY_TRIES {
-                    bot.delay(READY_DELAY_US)?;
+                    bot.delay(READY_DELAY_US).await?;
                 }
             }
             Err(error) => return Err(error),
@@ -925,17 +1080,17 @@ fn probe_identified<T: Scsi>(
         return Err(BlockError::Unsupported("USB storage never became ready"));
     }
     let (reported, block_size) = if bot.capacity16_first() {
-        capacity16(bot, lun)?
+        capacity16_with(bot, lun).await?
     } else {
         let mut cdb = [0; 10];
         cdb[0] = scsi::READ_CAPACITY_10;
-        let capacity = bot.command(lun, &cdb, Data::In(8))?;
+        let capacity = bot.command(lun, &cdb, Data::In(8)).await?;
         if capacity.len() < 8 {
             return Err(BlockError::Unsupported("short READ CAPACITY data"));
         }
         let last = u32::from_be_bytes(capacity[..4].try_into().unwrap());
         if last == u32::MAX {
-            capacity16(bot, lun)?
+            capacity16_with(bot, lun).await?
         } else {
             (
                 u64::from(last) + 1,
@@ -957,17 +1112,19 @@ fn probe_identified<T: Scsi>(
             "USB storage block size or capacity",
         ));
     }
-    bot.read_before_mode_sense(lun, block_size as usize)?;
+    bot.read_before_mode_sense(lun, block_size as usize).await?;
     let read_only = match bot.write_protect_page() {
         None => false,
         Some(page) => {
-            match bot.command(
-                lun,
-                &scsi::mode_sense(page),
-                Data::In(scsi::MODE_SENSE_BYTES),
-            ) {
-                Ok(mode) => scsi::write_protected(&mode)
-                    .ok_or(BlockError::Unsupported("short MODE SENSE data"))?,
+            match bot
+                .command(
+                    lun,
+                    &scsi::mode_sense(page),
+                    Data::In(scsi::MODE_SENSE_BYTES),
+                )
+                .await
+            {
+                Ok(mode) => scsi::write_protect_flag(&mode),
                 // MODE SENSE is optional only when the unit reports an
                 // unsupported CDB. USB/transport errors cannot default to writable.
                 Err(BlockError::Sense(sense)) if sense.key == Sense::ILLEGAL_REQUEST => false,
@@ -981,7 +1138,7 @@ fn probe_identified<T: Scsi>(
         model: format!("{} {}", text(&inquiry[8..16]), text(&inquiry[16..32]))
             .trim()
             .into(),
-        serial: if lun == T::Lun::default() {
+        serial: if lun == C::Lun::default() {
             serial.into()
         } else {
             format!("{serial}:lun{lun}")
@@ -995,12 +1152,12 @@ fn probe_identified<T: Scsi>(
     Ok((identity, inquiry[1] & 0x80 != 0))
 }
 
-fn capacity16<T: Scsi>(bot: &mut T, lun: T::Lun) -> Result<(u64, u32), BlockError> {
+async fn capacity16_with<C: Commands>(bot: &mut C, lun: C::Lun) -> Result<(u64, u32), BlockError> {
     let mut cdb = [0; 16];
     cdb[0] = scsi::SERVICE_ACTION_IN_16;
     cdb[1] = scsi::READ_CAPACITY_16;
     cdb[13] = 32;
-    let bytes = bot.command(lun, &cdb, Data::In(32))?;
+    let bytes = bot.command(lun, &cdb, Data::In(32)).await?;
     if bytes.len() < 12 {
         return Err(BlockError::Unsupported("short READ CAPACITY (16) data"));
     }
@@ -1008,6 +1165,60 @@ fn capacity16<T: Scsi>(bot: &mut T, lun: T::Lun) -> Result<(u64, u32), BlockErro
         .checked_add(1)
         .ok_or(BlockError::Unsupported("USB storage capacity overflow"))?;
     Ok((blocks, u32::from_be_bytes(bytes[8..12].try_into().unwrap())))
+}
+
+/// The blocks at the start of a unit's medium that tell it apart from
+/// another of the same model, serial number and capacity: the protective
+/// MBR and the GPT header, whose disk GUID and CRCs differ between any two
+/// tables made apart, or whatever a medium without a GPT holds there.
+pub(super) const FIRST_BLOCKS: u64 = 2;
+
+/// Read the unit's first blocks ([`FIRST_BLOCKS`], fewer on a smaller
+/// medium) with `identity`'s geometry.
+async fn first_blocks_with<C: Commands>(
+    bot: &mut C,
+    lun: C::Lun,
+    identity: &Identity,
+) -> Result<Vec<u8>, BlockError> {
+    let blocks = identity.blocks.min(FIRST_BLOCKS);
+    let bytes = blocks as usize * identity.block_size as usize;
+    let cdb = scsi::read_write(false, false, 0, blocks as u32);
+    let read = bot.command(lun, cdb.as_ref(), Data::In(bytes)).await?;
+    if read.len() != bytes {
+        return Err(BlockError::Protocol("short USB first-blocks read"));
+    }
+    Ok(read)
+}
+
+/// A Bulk-Only unit's block zero, read before MODE SENSE as Linux sd's
+/// probe reaches it: twice where the device's `INITIAL_READ10` quirk asks
+/// (`initial_read`), the first result discarded.
+async fn read_block_zero<C: Commands<Lun = u8>>(
+    bot: &mut C,
+    lun: u8,
+    block_size: usize,
+    initial_read: bool,
+) -> Result<(), BlockError> {
+    let mut cdb = [0; 10];
+    cdb[0] = scsi::READ_10;
+    cdb[8] = 1;
+    if initial_read {
+        // This workaround runs only while probing metadata before
+        // publication, never on a caller's data command or after an
+        // observed media change.
+        match bot.command(lun, &cdb, Data::In(block_size)).await {
+            Err(BlockError::Sense(sense)) if media::changed(&sense, true) => {
+                return Err(BlockError::Sense(sense));
+            }
+            Err(error) if bot.poisoned() => return Err(error),
+            _ => {}
+        }
+    }
+    let bytes = bot.command(lun, &cdb, Data::In(block_size)).await?;
+    if bytes.len() != block_size {
+        return Err(BlockError::Protocol("short USB block-zero read"));
+    }
+    Ok(())
 }
 
 impl<T: Scsi> Disk<T> {
@@ -1072,6 +1283,27 @@ impl<T: Scsi> Disk<T> {
                 }
                 SenseCompletion::MediaChanged | SenseCompletion::Fail => return failed,
             }
+        }
+    }
+    /// Whether a flush sends SYNCHRONIZE CACHE: Linux sends it only to a
+    /// unit reporting a write cache (WCE), and none to one that refused it
+    /// as an invalid opcode. Without one a flush completes at once.
+    fn synchronizes(&self) -> bool {
+        self.identity.features.write_cache && !self.cache_refused
+    }
+    /// A SYNCHRONIZE CACHE's `result`: an invalid-opcode answer is no error,
+    /// as Linux `sd_sync_cache` takes it, and the unit is sent the command
+    /// no more; it is counted once for the log ([`take_cache_refusals`]).
+    fn synchronized(&mut self, result: Result<(), BlockError>) -> Result<(), BlockError> {
+        match result {
+            Err(error) if invalid_opcode(&error) => {
+                if !self.cache_refused {
+                    self.cache_refused = true;
+                    CACHE_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+            result => result,
         }
     }
     fn check_media(&self) -> Result<(), BlockError> {
@@ -1139,7 +1371,9 @@ impl<T: Scsi> Disk<T> {
                 running.result = Some(Ok(read.then_some(data)));
                 return;
             }
-            Command::Flush if running.done == 0 => (scsi::Cdb::Ten(scsi::synchronize_cache()), 0),
+            Command::Flush if running.done == 0 && self.synchronizes() => {
+                (scsi::Cdb::Ten(scsi::synchronize_cache()), 0)
+            }
             Command::Flush => {
                 self.running.as_mut().unwrap().result = Some(Ok(None));
                 return;
@@ -1246,7 +1480,11 @@ impl<T: Scsi> BlockDevice for Disk<T> {
 
     fn flush_cache(&mut self) -> Result<(), BlockError> {
         self.check_media()?;
-        self.io(&scsi::synchronize_cache(), BlockData::None)
+        if !self.synchronizes() {
+            return Ok(());
+        }
+        let result = self.io(&scsi::synchronize_cache(), BlockData::None);
+        self.synchronized(result)
     }
 
     /// A transport that begins commands without waiting runs one block
@@ -1286,7 +1524,10 @@ impl<T: Scsi> BlockDevice for Disk<T> {
             return None;
         }
         if let Some(length) = self.running.as_ref()?.begun {
-            let ended = self.bot.borrow_mut().end()?;
+            let mut ended = self.bot.borrow_mut().end()?;
+            if matches!(self.running.as_ref()?.command, Command::Flush) {
+                ended = self.synchronized(ended.map(drop)).map(|()| Vec::new());
+            }
             let running = self.running.as_mut()?;
             running.begun = None;
             match ended {
@@ -1437,11 +1678,27 @@ mod tests {
         delays: RefCell<Vec<u64>>,
         failed: Option<Vec<u8>>,
         minimum_error: Option<BlockError>,
+        /// Each command's operation code, in order.
+        opcodes: Vec<u8>,
+        /// The begun command's result, until it ends.
+        begun: Option<Result<Vec<u8>, BlockError>>,
     }
     impl Scsi for Unit {
         type Lun = u8;
-        fn command(&mut self, _: u8, _: &[u8], data: Data<'_>) -> Result<Vec<u8>, BlockError> {
+        fn queued(&self) -> bool {
+            true
+        }
+        fn begin(&mut self, lun: u8, cdb: &[u8], data: Data<'_>) -> Option<Result<(), BlockError>> {
+            let result = self.command(lun, cdb, data);
+            self.begun = Some(result);
+            Some(Ok(()))
+        }
+        fn end(&mut self) -> Option<Result<Vec<u8>, BlockError>> {
+            self.begun.take()
+        }
+        fn command(&mut self, _: u8, cdb: &[u8], data: Data<'_>) -> Result<Vec<u8>, BlockError> {
             self.commands += 1;
+            self.opcodes.push(cdb[0]);
             self.now.set(self.now.get() + 1_000_000);
             match self.senses.pop_front().flatten() {
                 // A failed read still moves its data.
@@ -1485,6 +1742,8 @@ mod tests {
                 delays: RefCell::new(Vec::new()),
                 failed: None,
                 minimum_error: None,
+                opcodes: Vec::new(),
+                begun: None,
             })),
             lun: 0,
             identity: Identity {
@@ -1504,6 +1763,8 @@ mod tests {
             removable,
             running: None,
             next_tag: 0,
+            cache_refused: false,
+            first_blocks: None,
         }
     }
 
@@ -1563,5 +1824,61 @@ mod tests {
         let mut unit = disk(false, &[reset; 400]);
         assert!(unit.flush_cache().is_err());
         assert_eq!(unit.bot.borrow().commands, 181);
+    }
+    /// A flush run as a queued command ([`BlockDevice::start`]).
+    fn queued_flush(disk: &mut Disk<Unit>) -> Finished {
+        let tag = disk.start(Command::Flush).unwrap();
+        disk.finish(tag).expect("the unit's commands end at once")
+    }
+
+    #[test]
+    fn a_unit_without_a_write_cache_is_sent_no_synchronize_cache() {
+        let mut unit = disk(false, &[]);
+        unit.identity.features.write_cache = false;
+        assert_eq!(unit.flush_cache(), Ok(()));
+        assert_eq!(queued_flush(&mut unit), Ok(None));
+        assert!(unit.bot.borrow().opcodes.is_empty());
+        // One reporting a write cache is sent it, either way.
+        let mut cached = disk(false, &[]);
+        assert_eq!(cached.flush_cache(), Ok(()));
+        assert_eq!(queued_flush(&mut cached), Ok(None));
+        assert_eq!(
+            cached.bot.borrow().opcodes,
+            [scsi::SYNCHRONIZE_CACHE_10, scsi::SYNCHRONIZE_CACHE_10]
+        );
+    }
+
+    #[test]
+    fn synchronize_cache_refused_as_an_invalid_opcode_completes_and_is_sent_no_more() {
+        let sense = |asc| {
+            Some(Sense {
+                key: Sense::ILLEGAL_REQUEST,
+                asc,
+                ascq: 0,
+            })
+        };
+        take_cache_refusals();
+        // Queued, as the stores write: the refusal completes the flush.
+        let mut unit = disk(false, &[sense(0x20)]);
+        assert_eq!(queued_flush(&mut unit), Ok(None));
+        assert_eq!(queued_flush(&mut unit), Ok(None));
+        assert_eq!(unit.flush_cache(), Ok(()));
+        assert_eq!(unit.bot.borrow().opcodes, [scsi::SYNCHRONIZE_CACHE_10]);
+        // Waited for, the same.
+        let mut unit = disk(false, &[sense(0x20)]);
+        assert_eq!(unit.flush_cache(), Ok(()));
+        assert_eq!(queued_flush(&mut unit), Ok(None));
+        assert_eq!(unit.bot.borrow().commands, 1);
+        assert_eq!(take_cache_refusals(), 2);
+        assert_eq!(take_cache_refusals(), 0);
+        // Writes still go to the unit.
+        assert_eq!(unit.write(0, &[0; 512]), Ok(()));
+        assert_eq!(unit.bot.borrow().opcodes[1], scsi::WRITE_10);
+        // Any other failure stays one, and the command is sent again.
+        let mut unit = disk(false, &[sense(0x24)]);
+        assert!(matches!(queued_flush(&mut unit), Err(BlockError::Sense(_))));
+        assert_eq!(queued_flush(&mut unit), Ok(None));
+        assert_eq!(unit.bot.borrow().commands, 2);
+        assert_eq!(take_cache_refusals(), 0);
     }
 }

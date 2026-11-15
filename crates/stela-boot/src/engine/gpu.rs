@@ -32,6 +32,8 @@ mod kext {
 #[cfg(feature = "metal-device")]
 mod refused;
 #[cfg(feature = "metal-device")]
+mod slice;
+#[cfg(feature = "metal-device")]
 mod stack;
 #[cfg(feature = "metal-device")]
 mod waiter;
@@ -419,6 +421,8 @@ struct Host {
     /// The first error Linux reported, which a stop before the start
     /// finished names as the reason the GPU did not start.
     first_error: RefCell<Option<String>>,
+    /// What GSP-RM said about its start, which that reason then names.
+    gsp_start: RefCell<stela_boot_core::gpu_status::GspStart>,
 }
 
 impl Host {
@@ -514,6 +518,7 @@ impl Platform for Host {
         let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
         self.report(format_args!("<{level}> {message}"));
         // KERN_ALERT to KERN_ERR; KERN_EMERG is a terminal stop's own report.
+        self.gsp_start.borrow_mut().observe(message);
         if (1..=3).contains(&level) {
             let mut first = self.first_error.borrow_mut();
             if first.is_none() {
@@ -528,13 +533,17 @@ impl Platform for Host {
         let message = message.to_str().unwrap_or("(not UTF-8)").trim_end();
         // Before the start finished, its first error is why the GPU did not
         // start; after it, an error is a running GPU's and names nothing.
-        let failed_start = match installed() {
-            None => self.first_error.borrow().clone(),
-            Some(_) => None,
+        let (failed_start, firmware) = match installed() {
+            None => (
+                self.first_error.borrow().clone(),
+                self.gsp_start.borrow().failure(),
+            ),
+            Some(_) => (None, None),
         };
         output::fatal(stela_boot_core::gpu_status::driver_stopped(
             message,
             failed_start.as_deref(),
+            firmware.as_deref(),
         ))
     }
 
@@ -1227,18 +1236,43 @@ fn claim(
     let ready = cold
         .quiesce_and_bind()
         .map_err(|failure| cold_refusal(address, failure.error))?;
+    // The BARs as firmware sized them, which the reset kept: a BAR as large
+    // as the GPU's memory is a Resizable BAR firmware enabled.
+    let sizes: Vec<(usize, u64)> = placement
+        .regions
+        .iter()
+        .enumerate()
+        .filter(|(_, region)| region.size != 0)
+        .map(|(index, region)| (index, region.size))
+        .collect();
+    let sizes = stela_boot_core::gpu_status::bar_sizes(&sizes);
+    // A driver that resets the GPU itself has not yet: the BARs are firmware's.
+    let reset = matches!(
+        ready.reset(),
+        Some(gpu::cold::Reset::SecondaryBus | gpu::cold::Reset::Function(_))
+    );
     match ready.reset() {
         None => output::arguments(format_args!(
-            "GPU {address}: no function-local reset; started as firmware left it, DMA translated\n"
+            "GPU {address}: no function-local reset; started as firmware left it, DMA translated; {sizes}\n"
         )),
         Some(gpu::cold::Reset::SecondaryBus) => output::arguments(format_args!(
-            "GPU {address}: no function-local reset; reset through its bridge's secondary bus\n"
+            "GPU {address}: no function-local reset; reset through its bridge's secondary bus; kept {sizes}\n"
         )),
         Some(gpu::cold::Reset::Driver) => output::arguments(format_args!(
-            "GPU {address}: no reset at claim; {} resets it itself\n",
+            "GPU {address}: no reset at claim; {} resets it itself; {sizes}\n",
             driver.name
         )),
-        Some(gpu::cold::Reset::Function(_)) => {}
+        Some(gpu::cold::Reset::Function(method)) => {
+            let name = match method {
+                stela_drivers::bus::pci::ResetMethod::FunctionLevel => "Function Level Reset",
+                stela_drivers::bus::pci::ResetMethod::PowerManagement => {
+                    "a D3hot to D0 power state reset"
+                }
+            };
+            output::arguments(format_args!(
+                "GPU {address}: reset by {name}; kept {sizes}\n"
+            ));
+        }
     }
     output::arguments(format_args!("GPU {address}: bound for its driver\n"));
     // SAFETY: both original owners transfer into this retained function
@@ -1246,6 +1280,9 @@ fn claim(
     let (bound, views) = unsafe { ready.into_parts() };
     let attachment = ManuallyDrop::new(bound.attachment);
     let mut function = ManuallyDrop::new(bound.requester.into_function());
+    if reset {
+        resized_bars(address, &function, &mut placement, &mut bars);
+    }
     let mut views = ManuallyDrop::new(views);
     views
         .check(&mut function)
@@ -1312,6 +1349,61 @@ fn claim(
         #[cfg(feature = "metal-device")]
         link,
     })
+}
+
+/// After a reset, which puts each Resizable BAR back at the size firmware
+/// set without checking it, as Linux `pci_restore_rebar_state` does: a BAR
+/// that kept a smaller size decodes only that, so the GPU's placement and
+/// windows take the size it reads back, with a line. One that reads back
+/// larger keeps the size its window was placed for, which it decodes too.
+fn resized_bars<C: ConfigSpace>(
+    address: stela_drivers::bus::pci::Address,
+    function: &Function<C>,
+    placement: &mut Placement,
+    bars: &mut [core::ops::Range<u64>],
+) {
+    let resizable = match function.resizable_bars() {
+        Ok(resizable) => resizable,
+        Err(error) => {
+            output::arguments(format_args!(
+                "GPU {address}: its Resizable BAR sizes did not read after its reset ({error:?}); \
+                 going on with the sizes firmware set\n"
+            ));
+            return;
+        }
+    };
+    for bar in resizable {
+        let Some(region) = placement.regions.get_mut(usize::from(bar.bar)) else {
+            continue;
+        };
+        if region.size == 0 || region.size == bar.bytes {
+            continue;
+        }
+        let mib = |bytes: u64| bytes >> 20;
+        if bar.bytes > region.size {
+            output::arguments(format_args!(
+                "GPU {address}: BAR{} reads back at {} MiB after its reset, where firmware set {} MiB; \
+                 keeping {} MiB, the window it was placed in\n",
+                bar.bar,
+                mib(bar.bytes),
+                mib(region.size),
+                mib(region.size)
+            ));
+            continue;
+        }
+        output::arguments(format_args!(
+            "GPU {address}: BAR{} came back at {} MiB after its reset, where firmware set {} MiB; \
+             going on with {} MiB, as Linux goes on from the reset\n",
+            bar.bar,
+            mib(bar.bytes),
+            mib(region.size),
+            mib(bar.bytes)
+        ));
+        if let Some(window) = bars.iter_mut().find(|window| window.start == region.start) {
+            window.end = window.start + bar.bytes;
+        }
+        region.size = bar.bytes;
+    }
 }
 
 /// Read one BAR0 register through a scoped read-only page of `registers`,
@@ -1446,6 +1538,8 @@ pub(super) struct Refused {
     pub(super) address: String,
     pub(super) device: u16,
     pub(super) reason: stela_boot_core::gpu_status::Reason,
+    /// The refusal's own words, for the screen as for the log.
+    pub(super) why: String,
 }
 
 /// The driver in this image that runs `adapter`, if one does: nouveau every
@@ -1473,11 +1567,12 @@ pub(super) fn claim_all(
     catalog: Option<&Arc<Catalog>>,
 ) -> (Vec<Claimed>, Vec<Refused>) {
     use stela_boot_core::gpu_status::Reason;
-    let refused_as = |adapter: &gpu::Adapter, reason| Refused {
+    let refused_as = |adapter: &gpu::Adapter, reason, why: &dyn core::fmt::Display| Refused {
         vendor: adapter.vendor,
         address: format!("{}", adapter.address),
         device: adapter.device,
         reason,
+        why: format!("{why}"),
     };
     let mut claimed = Vec::new();
     let mut refused = Vec::new();
@@ -1496,7 +1591,11 @@ pub(super) fn claim_all(
                     "GPU {} left with firmware: build the image with `cargo xtask boot build`\n",
                     adapter.address
                 ));
-                refused.push(refused_as(adapter, Reason::Other));
+                refused.push(refused_as(
+                    adapter,
+                    Reason::Other,
+                    &"this image has no GPU driver: build it with `cargo xtask boot build`",
+                ));
             }
             Some(driver) => driven.push((adapter, driver)),
         }
@@ -1509,7 +1608,7 @@ pub(super) fn claim_all(
         Err(why) => {
             for (adapter, _) in driven {
                 output::arguments(format_args!("GPU {} refused: {why}\n", adapter.address));
-                refused.push(refused_as(adapter, Reason::Other));
+                refused.push(refused_as(adapter, Reason::Other, &why));
             }
             return (claimed, refused);
         }
@@ -1535,7 +1634,7 @@ pub(super) fn claim_all(
                     ServiceError::Refused(NO_FIRMWARE) => Reason::MissingFirmware,
                     _ => Reason::Other,
                 };
-                refused.push(refused_as(adapter, reason));
+                refused.push(refused_as(adapter, reason, &error));
             }
         }
     }
@@ -1876,6 +1975,7 @@ pub(super) fn open(machine: Machine, claimed: Vec<Claimed>) -> Result<(), Error>
         lines: RefCell::new(lines),
         reported: RefCell::new(BTreeSet::new()),
         first_error: RefCell::new(None),
+        gsp_start: RefCell::new(Default::default()),
     };
     // SAFETY: boot's original code and allocator remain installed permanently.
     unsafe {
@@ -2574,7 +2674,9 @@ pub(super) fn pump_report(tsc_hz: u64) -> Option<String> {
         serving.push('-');
     }
     let [device, pages, files, stacks] = UNMAPS.each_ref().map(take);
-    #[cfg(feature = "metal-device")]
+    #[cfg(feature = "nvk")]
+    let nvkm = nvkm_report() + &perf_report();
+    #[cfg(all(feature = "metal-device", not(feature = "nvk")))]
     let nvkm = nvkm_report();
     #[cfg(not(feature = "metal-device"))]
     let nvkm = String::new();
@@ -2783,7 +2885,7 @@ fn nvkm_report() -> String {
     times + &sizes
 }
 
-/// `amdgpu_stela_counts.h` (Linux patch 0206): `struct
+/// `amdgpu_stela_counts.h` (Linux patch 0207): `struct
 /// stela_amdgpu_cs_counts`, which amdgpu updates only atomically.
 #[cfg(feature = "radv")]
 #[repr(C)]
@@ -2817,7 +2919,7 @@ const AMDGPU_CS_PHASES: [&str; 7] = ["parse", "deps", "bos", "vm", "sync", "subm
 #[cfg(feature = "radv")]
 pub(super) fn amdgpu_cs_report() -> Option<String> {
     unsafe extern "C" {
-        /// `amdgpu/amdgpu_cs.c`, under Linux patch 0206.
+        /// `amdgpu/amdgpu_cs.c`, under Linux patch 0207.
         static stela_amdgpu_cs_counts: AmdgpuCsCounts;
     }
     // SAFETY: amdgpu's static counters, which it only updates atomically.
@@ -2949,6 +3051,28 @@ pub(super) fn linux_costs_report(tsc_hz: u64) -> Option<String> {
         " cache_steps={steps} range={range_calls}/{range_steps} copy_bytes={bytes}"
     ));
     any.then_some(line)
+}
+
+/// `\nGPU PERF pstate=… seen=… rounds=…`: the GPU's P-state as GSP-RM
+/// reported it since the last report
+/// (`stela_drivers::gpu::gsp_perf`), at the first report after GSP starts and
+/// then when they changed. Empty otherwise.
+#[cfg(feature = "nvk")]
+fn perf_report() -> String {
+    use stela_drivers::gpu::gsp_perf::{Report, Reported};
+    unsafe extern "C" {
+        /// `nvkm/subdev/gsp/rm/r535/perf.c`, which nouveau updates only
+        /// atomically.
+        static nvkm_perf: Report;
+    }
+    static REPORTED: Reported = Reported::new();
+    // SAFETY: nouveau's static report, which it only updates atomically.
+    let report = unsafe { &nvkm_perf };
+    report
+        .take()
+        .and_then(|taken| REPORTED.line(&taken))
+        .map(|line| format!("\n{line}"))
+        .unwrap_or_default()
 }
 
 /// The function of the timer-list timer due first when Linux last looked,

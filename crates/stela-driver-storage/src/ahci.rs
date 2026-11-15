@@ -11,8 +11,8 @@
 use crate::{
     Clock, Deadline, Handoff,
     block::{
-        BlockDevice, BlockError, Command, DiscardLimits, Extent, Features, Finished, Identity,
-        Rotation, Sense, SenseCompletion, Transport, ascii,
+        BlockDevice, BlockError, Command, DiscardLimits, Expired, Extent, Features, Finished,
+        Identity, Rotation, Sense, SenseCompletion, Transport, ata_string,
     },
     bus::{
         dma::{DmaAllocator, DmaBuffer},
@@ -21,7 +21,7 @@ use crate::{
     },
     registers,
 };
-use alloc::{format, rc::Rc, vec::Vec};
+use alloc::{boxed::Box, format, rc::Rc, vec::Vec};
 use core::cell::Cell;
 use core::sync::atomic::{Ordering, fence};
 
@@ -220,7 +220,9 @@ const ERR_INVALID: u32 = 1 << 7;
 /// SStatus.DET: a device is present and Phy communication is established.
 const DEVICE_PRESENT: u32 = 3;
 const SATA_STATUS_DETECTION: u32 = 0xf;
-/// SControl.DET: perform interface initialization (COMRESET).
+/// SControl.DET, whose value 1 performs interface initialization
+/// (COMRESET).
+#[cfg(test)]
 const SATA_CONTROL_DETECTION: u32 = 0xf;
 const SATA_CONTROL_RESET: u32 = 1;
 /// `sata_link_hardreset`: keep SPD, disable partial and slumber, then
@@ -445,6 +447,21 @@ const STOP_FIS_TIMEOUT_US: u64 = 1_000_000;
 const COMRESET_HOLD_US: u64 = 1_000;
 const SPIN_UP_TIMEOUT_US: u64 = 10_000_000;
 const COMMAND_TIMEOUT_US: u64 = 30_000_000;
+/// Linux `ata_eh_cmd_timeout_table` for the internal commands issued here:
+/// each class's timeouts, the next one taken after a timeout
+/// (`ata_internal_cmd_timed_out`). Another command gets
+/// [`INTERNAL_DEFAULT_TIMEOUT_US`].
+const INTERNAL_TIMEOUTS_US: [(&[u8], &[u64]); 4] = [
+    (&[ATA_IDENTIFY], &[5_000_000, 10_000_000, 30_000_000]),
+    (
+        &[ATA_READ_LOG_EXT, ATA_READ_LOG_DMA_EXT],
+        &[15_000_000, 15_000_000],
+    ),
+    (&[ATA_SET_FEATURES], &[5_000_000, 10_000_000]),
+    (&[ATA_STANDBY_IMMEDIATE], &[15_000_000]),
+];
+/// `ATA_EH_CMD_DFL_TIMEOUT`.
+const INTERNAL_DEFAULT_TIMEOUT_US: u64 = 5_000_000;
 /// `ata_eh_reset_timeouts`: one hardreset per entry.
 const RESET_TIMEOUTS_US: [u64; 4] = [10_000_000, 10_000_000, 35_000_000, 5_000_000];
 /// `ATA_EH_DEV_TRIES`: revalidations before the disk is disabled.
@@ -508,6 +525,9 @@ pub struct AhciDisk {
     identity: Identity,
     clock: Clock,
     command_timeout_us: u64,
+    /// `ehc->cmd_timeout_idx`: per [`INTERNAL_TIMEOUTS_US`] class, the
+    /// timeout an internal command takes in this error handling run.
+    timeout_steps: [u8; INTERNAL_TIMEOUTS_US.len()],
     /// Set when error handling cannot recover the disk, as libata disables
     /// it. The queue, FIS and bounce allocations remain reserved for this boot.
     fault: Option<BlockError>,
@@ -612,6 +632,7 @@ struct AtaRequest {
 struct Launched {
     slot: usize,
     queued: bool,
+    command: u8,
     deadline: Deadline,
 }
 
@@ -955,11 +976,9 @@ fn sense_reporting(word: impl Fn(usize) -> u16) -> (bool, bool) {
 
 fn identify(data: &[u8]) -> Result<Identified, BlockError> {
     let word = |index: usize| u16::from_le_bytes([data[2 * index], data[2 * index + 1]]);
-    // ATA strings hold two characters per word, high byte first.
-    let string = |words: core::ops::Range<usize>| {
-        let bytes: Vec<u8> = words.flat_map(|index| word(index).to_be_bytes()).collect();
-        ascii(&bytes)
-    };
+    // As the firmware's disk picker reads them, which names the disk by its
+    // serial number for this driver to find.
+    let string = |words: core::ops::Range<usize>| ata_string(data, words);
     if word(IDENTIFY_COMMANDS_2) & COMMANDS_2_LBA48 == 0 {
         return Err(BlockError::Unsupported(
             "SATA disk without 48-bit addressing",
@@ -1283,7 +1302,7 @@ fn debounce(
 }
 
 /// A port's link reset ([`AhciDisk::link_ports`]): PxCMD before the port
-/// stopped, the SPD limit and SControl without DET.
+/// stopped, the SPD limit and the SControl that releases COMRESET.
 pub(super) struct Link {
     command: u32,
     speed_limit: u32,

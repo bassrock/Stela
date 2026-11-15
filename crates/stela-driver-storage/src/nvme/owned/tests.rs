@@ -185,6 +185,9 @@ struct Model {
     stuck_ready: bool,
     /// CSTS.RDY never follows CC.EN: the controller never answers.
     never_ready: bool,
+    /// CAP's low dword once CC is written with EN clear on the stopped
+    /// controller: NVMe lets CAP change after that first write.
+    cap_after_configuration: Option<u32>,
     /// After each enable, this many CSTS reads report CSTS.CFS without
     /// CSTS.RDY before the controller is ready; `usize::MAX` for ever.
     fatal_while_enabling: usize,
@@ -293,6 +296,7 @@ impl Model {
             fail_disable: false,
             stuck_ready: false,
             never_ready: false,
+            cap_after_configuration: None,
             fatal_while_enabling: 0,
             enabling_reads: 0,
             coherent: true,
@@ -865,6 +869,13 @@ unsafe impl Registers for Regs {
                     m.stopped = false;
                     m.queues[0] = (m.register64(0x28), m.register64(0x30));
                     m.record("enable");
+                } else if value != 0 && !m.enabled {
+                    // Linux `nvme_enable_ctrl`'s first write, which stops
+                    // nothing.
+                    m.record("configure");
+                    if let Some(capabilities) = m.cap_after_configuration {
+                        m.registers.insert(0, capabilities);
+                    }
                 } else {
                     m.record("stop");
                     m.stopped_at = Clock::ticks();
@@ -1232,6 +1243,28 @@ fn a_controller_that_never_becomes_ready_fails_within_its_bound() {
     assert!(budget.expired().is_some());
 }
 
+/// Linux `nvme_enable_ctrl` writes CC with EN clear, reads CAP again, as
+/// CAP may change once CC is written, and only then sets CC.EN: the ready
+/// wait follows CAP.TO as read after that first write.
+#[test]
+fn the_controller_is_configured_then_enabled_like_nvme_enable_ctrl() {
+    let _clock = crate::test_clock::virtualize();
+    let f = Fixture::new();
+    {
+        let mut m = f.model.lock().unwrap();
+        m.never_ready = true;
+        // CAP.TO is 500 ms until CC is written, 2 s after.
+        m.cap_after_configuration = Some(15 | 4 << 24);
+    }
+    let started = Clock::ticks();
+    assert_eq!(f.attach().err(), Some(BlockError::Timeout.at(ENABLE_WAIT)));
+    let took_us = (Clock::ticks() - started) / 1000;
+    assert!((2_000_000..3_000_000).contains(&took_us), "{took_us}");
+    let m = f.model.lock().unwrap();
+    let at = |event| m.events.iter().position(|e| *e == event).unwrap();
+    assert!(at("configure") < at("enable"));
+}
+
 /// Linux `nvme_setup_io_queues` sets the Number of Queues before it creates
 /// an I/O queue, at probe and after every reset: a controller that refuses
 /// queues it was not asked for attaches and resets. A refused feature
@@ -1578,19 +1611,26 @@ fn async_events_are_handled_and_requested_again_like_nvme_complete_async_event()
         m.post_event(result);
         m.blocks += 1024;
     };
+    // An event's log and the rescan's Identify commands go out with one
+    // start and are taken at a later one, which never waits for them.
+    let commands = |disk: &mut Namespace| {
+        for _ in 0..4 {
+            disk.flush().unwrap();
+        }
+    };
     // A namespace change clears the changed list and rescans: the
     // namespace grew.
     event(2);
-    disk.flush().unwrap();
+    commands(disk);
     assert_eq!(disk.identity().blocks, 2048);
     // A firmware activation reads the slot log once processing resumes.
     event(2 | 1 << 8);
-    disk.flush().unwrap();
+    commands(disk);
     assert_eq!(disk.identity().blocks, 2048);
     // A persistent internal error resets the controller, whose rescan
     // sees the namespace grow again.
     event(3 << 8);
-    disk.flush().unwrap();
+    commands(disk);
     assert_eq!(disk.identity().blocks, 4096);
     let m = f.model.lock().unwrap();
     assert_eq!(m.event_configs, [1 << 8 | 1 << 9; 2]);

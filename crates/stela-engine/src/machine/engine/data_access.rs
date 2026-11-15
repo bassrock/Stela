@@ -60,6 +60,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
         value: u64,
         now: u64,
     ) -> Result<super::super::mmu::MemoryLocks, DeviceError> {
+        // A write under its device's own lock leaves the memory
+        // controllers' write lock as this PE holds it.
+        if let Some(written) = self
+            .devices
+            .write_own(self.current, physical, bytes, value, now)
+        {
+            self.watch(physical, bytes, written.is_ok().then_some(value), true);
+            if written.is_err() {
+                self.run_refused_store_call();
+            }
+            return written.map(|()| self.cpu.memory_lock);
+        }
         let started = self
             .step_timing
             .is_some()
@@ -355,13 +367,29 @@ impl<H: Host, D: Devices> Machine<H, D> {
         physical: u64,
         write: bool,
     ) -> Step {
+        let Ok(instruction) = Decoder.lift(GuestAddress(self.cpu.pc), word) else {
+            return self.device_unexecuted(
+                address,
+                physical,
+                write,
+                "device access by an undecodable instruction".into(),
+            );
+        };
+        self.decoded_device_access(&instruction, address, physical, write)
+    }
+
+    /// [`Self::device_access`] by `instruction`, the word at the PC decoded.
+    pub(super) fn decoded_device_access(
+        &mut self,
+        instruction: &stela_compiler::aarch64::Instruction,
+        address: u64,
+        physical: u64,
+        write: bool,
+    ) -> Step {
         let pc = self.cpu.pc;
         let mut settled_failure = None;
         let refuse = |machine: &mut Self, detail: &str| {
             machine.device_unexecuted(address, physical, write, detail.into())
-        };
-        let Ok(instruction) = Decoder.lift(GuestAddress(pc), word) else {
-            return refuse(self, "device access by an undecodable instruction");
         };
         self.count_device_access(physical);
         if self.step_timing.is_some() {
@@ -376,7 +404,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // that did not move across the load left them as they were.
         let kept = self.device_lines.take();
         let generation = self.devices.generation();
-        if let Some(load) = ScalarLoad::from_instruction(&instruction) {
+        if let Some(load) = ScalarLoad::from_instruction(instruction) {
             let (accessed, writeback) = self.scalar_address(load.address());
             if accessed != address {
                 return refuse(self, "device load address differs from the fault");
@@ -415,7 +443,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if let Some((base, updated)) = writeback {
                 self.write_register(base, updated);
             }
-        } else if let Some(store) = ScalarStore::from_instruction(&instruction) {
+        } else if let Some(store) = ScalarStore::from_instruction(instruction) {
             let (accessed, writeback) = self.scalar_address(store.address());
             if accessed != address {
                 return refuse(self, "device store address differs from the fault");

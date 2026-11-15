@@ -1326,6 +1326,8 @@ fn real_block_api_chunks_units_checks_bounds_and_never_copies_short_reads() {
             removable,
             running: None,
             next_tag: 0,
+            cache_refused: false,
+            first_blocks: None,
         });
     }
     let mut bytes = vec![0; MAX_TD * 2 + 512];
@@ -1547,7 +1549,6 @@ fn invalid_identification_capacity_and_mode_never_publish_a_block_device() {
         (0x25, short_capacity),
         (0x25, bad_block),
         (0x9e, overflow),
-        (0x1a, vec![0; 4]),
     ] {
         let mut memory = vec![0u64; 32 * 1024];
         let start = memory.as_mut_ptr() as u64;
@@ -1558,6 +1559,31 @@ fn invalid_identification_capacity_and_mode_never_publish_a_block_device() {
         io.0.borrow_mut().override_payload.push((opcode, payload));
         let mut bot = Bot::new(io, 3, endpoints(), &mut dma).unwrap();
         assert!(super::super::probe(&mut bot, 0, "slot", "serial").is_err());
+    }
+}
+#[test]
+fn a_short_mode_sense_reply_reads_its_header_as_zero_filled_like_linux() {
+    // No data, part of the header, a header whose data length is 0, and a
+    // short header with write protection: the bytes that did not arrive read
+    // as zeros, as in Linux's zeroed mode buffer.
+    for (payload, read_only) in [
+        (vec![], false),
+        (vec![3, 0], false),
+        (vec![0; 4], false),
+        (vec![0, 0, 0x80], true),
+    ] {
+        let mut memory = vec![0u64; 32 * 1024];
+        let start = memory.as_mut_ptr() as u64;
+        let mut dma = dma(&mut memory);
+        let io = model(
+            start,
+            start + memory.len() as u64 * 8,
+            vec![Some(unit(0).unwrap())],
+        );
+        io.0.borrow_mut().override_payload.push((0x1a, payload));
+        let mut bot = Bot::new(io, 3, endpoints(), &mut dma).unwrap();
+        let (identity, _) = super::super::probe(&mut bot, 0, "slot", "serial").unwrap();
+        assert_eq!(identity.read_only, read_only);
     }
 }
 #[test]
@@ -1820,6 +1846,8 @@ fn metadata_warmup_limits_and_last_sector_split_reach_block_commands() {
         removable: false,
         running: None,
         next_tag: 0,
+        cache_refused: false,
+        first_blocks: None,
     };
     let before = state.borrow().history.len();
     let mut data = vec![0; 128 * 1024];
@@ -2044,8 +2072,11 @@ fn an_owned_begun_command_is_retried_as_a_waiting_one_is() {
     };
     // A class reset ends one command; the device's UNIT ATTENTION after it
     // is retried once.
+    // (A flush would send nothing: the unit reports no write cache.)
     state.borrow_mut().fault = Fault::Phase;
-    let tag = disks[1].start(Command::Flush).unwrap();
+    let tag = disks[1]
+        .start(Command::Read { lba: 0, bytes: 512 })
+        .unwrap();
     assert!(finish(&mut disks[1], tag).is_err());
     state.borrow_mut().fault = Fault::None;
     state.borrow_mut().now += RESET_RECOVERY_US;

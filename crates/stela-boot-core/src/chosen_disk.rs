@@ -91,6 +91,52 @@ impl Stale {
     }
 }
 
+/// Which partition the macOS choice starts from when the USB holds no
+/// record: a USB made new, or made again, has none, yet the PC may hold the
+/// macOS an earlier USB installed. Offering only Install macOS there offers
+/// only to erase it. A USB with a record keeps it whatever it starts: its
+/// disk may be out for now or its install unfinished.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Adopted {
+    /// The USB holds a record: nothing is looked for.
+    Recorded,
+    /// The one partition on this PC's disks that starts macOS, by its place
+    /// among those found. The record names it once the macOS choice is
+    /// taken.
+    One(usize),
+    /// No partition found starts macOS: only Install macOS is offered.
+    None,
+    /// This many partitions start macOS, so none can be told to be the one
+    /// meant: only Install macOS is offered, and its picker shows them.
+    Several(usize),
+}
+
+/// What the macOS choice starts from. `recorded` is whether the USB holds
+/// a record; `found` holds, for each of Stela's macOS partitions
+/// on this PC's disks, whether macOS can start from it.
+pub fn adopt(recorded: bool, found: &[bool]) -> Adopted {
+    if recorded {
+        return Adopted::Recorded;
+    }
+    let mut ready = found.iter().enumerate().filter(|(_, ready)| **ready);
+    match (ready.next(), ready.count()) {
+        (None, _) => Adopted::None,
+        (Some((index, _)), 0) => Adopted::One(index),
+        (Some(_), more) => Adopted::Several(more + 1),
+    }
+}
+
+/// The disk a startup choice takes: `disk` as the record names it, or as
+/// it was `found` on the PC's disks. A found partition is the macOS
+/// choice's alone (`mac`), so no other choice, an update among them,
+/// changes a disk nobody chose for it.
+pub fn disk_for(mac: bool, disk: Option<&str>, found: bool) -> Option<&str> {
+    match found && !mac {
+        true => None,
+        false => disk,
+    }
+}
+
 /// A whole disk Install macOS's picker lists, as far as whether it can be
 /// chosen goes.
 #[derive(Clone, Copy, Debug)]
@@ -178,6 +224,21 @@ pub const UNREADABLE_STORE: &str = "NVRAM on the disk chosen for macOS cannot be
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_usb_without_a_usable_record_takes_the_one_macos_on_the_pc() {
+        // The record starts macOS: the disks are not looked at.
+        assert_eq!(adopt(true, &[true, true]), Adopted::Recorded);
+        assert_eq!(adopt(true, &[]), Adopted::Recorded);
+        // A new USB on a PC with one installed macOS, beside a partition
+        // an interrupted install left.
+        assert_eq!(adopt(false, &[true]), Adopted::One(0));
+        assert_eq!(adopt(false, &[false, true]), Adopted::One(1));
+        // Nothing to start, or no way to tell which is meant.
+        assert_eq!(adopt(false, &[]), Adopted::None);
+        assert_eq!(adopt(false, &[false, false]), Adopted::None);
+        assert_eq!(adopt(false, &[true, false, true]), Adopted::Several(2));
+    }
+
     use super::*;
 
     #[test]
@@ -197,6 +258,16 @@ mod tests {
             controller: None,
         }];
         assert_eq!(picker_refusal(&disks, 0, 60_000_000_000), None);
+    }
+
+    #[test]
+    fn a_found_partition_goes_to_the_macos_choice_alone() {
+        assert_eq!(disk_for(true, Some("A:1"), true), Some("A:1"));
+        assert_eq!(disk_for(false, Some("A:1"), true), None);
+        // A recorded one goes to every choice, as before.
+        assert_eq!(disk_for(true, Some("A:1"), false), Some("A:1"));
+        assert_eq!(disk_for(false, Some("A:1"), false), Some("A:1"));
+        assert_eq!(disk_for(false, None, false), None);
     }
 
     #[test]

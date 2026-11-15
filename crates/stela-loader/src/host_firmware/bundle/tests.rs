@@ -170,7 +170,7 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
     let turing = select(&[pci(0x10de, 0x1e07, 0x03)]);
     let mut expected: Vec<&str> = USB.to_vec();
     expected.extend([
-        "nvidia/gp102/acr/bl.bin",
+        "nvidia/tu102/acr/bl.bin",
         "nvidia/tu102/gsp/booter_load-570.144.bin",
         "nvidia/tu102/gsp/booter_unload-570.144.bin",
         "nvidia/tu102/gsp/bootloader-570.144.bin",

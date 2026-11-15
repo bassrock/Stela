@@ -253,6 +253,7 @@ impl AhciDisk {
                     write: issue.write,
                     buffer: None,
                 },
+                self.command_timeout_us,
             ) {
                 Ok(started) => {
                     issue.launched = Some(started);
@@ -329,7 +330,8 @@ impl AhciDisk {
     }
 
     /// An internal command (`ata_exec_internal`): a failure kicks the engine
-    /// so it forgets the command, and is returned as is.
+    /// so it forgets the command, and is returned as is, also when the
+    /// engine does not stop, as `ahci_post_internal_cmd` ignores that.
     #[expect(
         clippy::result_large_err,
         reason = "Return complete typed command failure and recovery context without allocation on the failure path."
@@ -359,13 +361,36 @@ impl AhciDisk {
             return Ok(());
         };
         self.minimum.ready().map_err(Failure::new)?;
-        stop_engine(port, self.clock).map_err(Failure::new)?;
-        start_engine(port);
+        if stop_engine(port, self.clock).is_ok() {
+            start_engine(port);
+        }
         Err(failure)
     }
 
-    /// Issue the command once in slot 0, the port running nothing else, and
-    /// wait for its completion or error.
+    /// Linux `ata_internal_cmd_timeout`: an internal command's timeout in
+    /// this error handling run, never longer than a block command's.
+    pub(super) fn internal_timeout_us(&self, command: u8) -> u64 {
+        let timeout = match internal_class(command) {
+            Some(class) => INTERNAL_TIMEOUTS_US[class].1[usize::from(self.timeout_steps[class])],
+            None => INTERNAL_DEFAULT_TIMEOUT_US,
+        };
+        timeout.min(self.command_timeout_us)
+    }
+
+    /// Linux `ata_internal_cmd_timed_out`: the class's next command waits
+    /// for the next timeout, the last one staying.
+    pub(super) fn internal_timed_out(&mut self, command: u8) {
+        if let Some(class) = internal_class(command) {
+            let step = &mut self.timeout_steps[class];
+            if usize::from(*step) + 1 < INTERNAL_TIMEOUTS_US[class].1.len() {
+                *step += 1;
+            }
+        }
+    }
+
+    /// Issue the internal command once in slot 0, the port running nothing
+    /// else, and wait for its completion or error, at most its
+    /// [`Self::internal_timeout_us`].
     #[expect(
         clippy::result_large_err,
         reason = "Return complete typed command failure and recovery context without allocation on the failure path."
@@ -375,19 +400,28 @@ impl AhciDisk {
         port: &impl CommandPort,
         request: AtaRequest,
     ) -> Result<(), Failure> {
-        let launched = self.launch(port, 0, true, request)?;
+        let command = request.command;
+        let timeout_us = self.internal_timeout_us(command);
+        let launched = self.launch(port, 0, true, request, timeout_us)?;
         loop {
             self.minimum.ready().map_err(Failure::new)?;
             if let Some(seen) = self.look(port, &[&launched]) {
-                return seen.failure.map_or(Ok(()), Err);
+                let Some(failure) = seen.failure else {
+                    return Ok(());
+                };
+                if failure.mask & ERR_TIMEOUT != 0 {
+                    self.internal_timed_out(command);
+                }
+                return Err(failure);
             }
             crate::waiting();
             core::hint::spin_loop();
         }
     }
 
-    /// Issue the command once in `slot`; `alone` when the port runs no
-    /// other command, whose interrupts and ending FIS marks it may clear.
+    /// Issue the command once in `slot`, to complete within `timeout_us`;
+    /// `alone` when the port runs no other command, whose interrupts and
+    /// ending FIS marks it may clear.
     #[expect(
         clippy::result_large_err,
         reason = "Return complete typed command failure and recovery context without allocation on the failure path."
@@ -398,6 +432,7 @@ impl AhciDisk {
         slot: usize,
         alone: bool,
         request: AtaRequest,
+        timeout_us: u64,
     ) -> Result<Launched, Failure> {
         self.ready().map_err(Failure::new)?;
         let AtaRequest {
@@ -479,7 +514,7 @@ impl AhciDisk {
         fence(Ordering::SeqCst);
         let deadline = self
             .clock
-            .try_deadline(self.command_timeout_us)
+            .try_deadline(timeout_us)
             .map_err(|_| Failure::new(BlockError::Timeout))?;
         // ahci_qc_issue: a queued command is active in PxSACT until the
         // disk's Set Device Bits FIS clears it.
@@ -490,6 +525,7 @@ impl AhciDisk {
         Ok(Launched {
             slot,
             queued,
+            command,
             deadline,
         })
     }
@@ -571,6 +607,28 @@ impl AhciDisk {
         let lpm = self.lpm.policy > LPM_MAX_POWER;
         let task_file = port.read32(PORT_TASK_FILE);
         let mut failure = classify(interrupts, serror, task_file, timed_out, lpm);
+        // The first expired command, named with what the port showed.
+        if let Some(launched) = launched
+            .iter()
+            .find(|launched| expired >> launched.slot & 1 != 0)
+        {
+            failure.error = BlockError::Expired(Box::new(Expired {
+                step: command_wait(launched.command),
+                waited_us: self
+                    .clock
+                    .try_elapsed_us(launched.deadline.started())
+                    .unwrap_or(0),
+                registers: alloc::vec![
+                    ("PxCI", port.read32(PORT_ISSUE)),
+                    ("PxSACT", port.read32(PORT_SATA_ACTIVE)),
+                    ("PxTFD", task_file),
+                    ("PxSSTS", port.read32(PORT_SATA_STATUS)),
+                    ("PxIS", status),
+                    ("PxSERR", serror),
+                    ("PxCMD", port.read32(PORT_COMMAND)),
+                ],
+            }));
+        }
         // ahci_qc_fill_rtf, before error handling issues anything else: the
         // Set Device Bits FIS for a queued command, else the last D2H FIS.
         let fis = if queued { RECEIVED_SDB } else { RECEIVED_D2H };
@@ -768,5 +826,53 @@ impl AhciDisk {
             ATA_SECTOR_BYTES as usize,
             true,
         )
+    }
+}
+
+/// The [`INTERNAL_TIMEOUTS_US`] class of an internal command.
+fn internal_class(command: u8) -> Option<usize> {
+    INTERNAL_TIMEOUTS_US
+        .iter()
+        .position(|(commands, _)| commands.contains(&command))
+}
+
+/// What a command's expired wait is reported as: the command, and the
+/// slot's bit it waited to see cleared.
+fn command_wait(command: u8) -> &'static str {
+    macro_rules! wait {
+        ($name:literal, $code:literal) => {
+            concat!(
+                "ATA ",
+                $name,
+                " (",
+                $code,
+                "), waiting for its PxCI bit to clear"
+            )
+        };
+        ($name:literal, $code:literal, queued) => {
+            concat!(
+                "ATA ",
+                $name,
+                " (",
+                $code,
+                "), waiting for its PxSACT bit to clear"
+            )
+        };
+    }
+    match command {
+        ATA_IDENTIFY => wait!("IDENTIFY DEVICE", "0xec"),
+        ATA_SET_FEATURES => wait!("SET FEATURES", "0xef"),
+        ATA_READ_LOG_EXT => wait!("READ LOG EXT", "0x2f"),
+        ATA_READ_LOG_DMA_EXT => wait!("READ LOG DMA EXT", "0x47"),
+        ATA_REQUEST_SENSE_DATA_EXT => wait!("REQUEST SENSE DATA EXT", "0x0b"),
+        ATA_STANDBY_IMMEDIATE => wait!("STANDBY IMMEDIATE", "0xe0"),
+        ATA_READ_DMA_EXT => wait!("READ DMA EXT", "0x25"),
+        ATA_WRITE_DMA_EXT => wait!("WRITE DMA EXT", "0x35"),
+        ATA_READ_FPDMA_QUEUED => wait!("READ FPDMA QUEUED", "0x60", queued),
+        ATA_WRITE_FPDMA_QUEUED => wait!("WRITE FPDMA QUEUED", "0x61", queued),
+        ATA_FLUSH_CACHE => wait!("FLUSH CACHE", "0xe7"),
+        ATA_FLUSH_CACHE_EXT => wait!("FLUSH CACHE EXT", "0xea"),
+        ATA_DATA_SET_MANAGEMENT => wait!("DATA SET MANAGEMENT", "0x06"),
+        _ => "ATA command, waiting for its PxCI bit to clear",
     }
 }

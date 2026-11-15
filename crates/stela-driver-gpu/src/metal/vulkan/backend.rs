@@ -346,7 +346,7 @@ pub trait Backend {
     fn deferred(&self) -> bool {
         false
     }
-    /// The pipeline creation the call deferred.
+    /// The next of the jobs the call left, oldest first.
     fn take_job(&mut self) -> Option<crate::metal::deferred::Job> {
         None
     }

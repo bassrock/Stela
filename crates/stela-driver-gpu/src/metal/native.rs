@@ -17,6 +17,7 @@
 //! submission, and stay there.
 mod blocks;
 mod deferral;
+pub use deferral::take_turn_work as take_pipeline_turn_work;
 mod device_generated;
 mod memory;
 mod objects;
@@ -1620,6 +1621,7 @@ impl NativeBackend {
             self.report_executables(pipeline);
             return Ok(pipeline);
         }
+        let started = (self.ticks)();
         let pipeline = self.through_store(info.source, |backend, source, feedback| {
             let info = ComputePipelineInfo { source, ..*info };
             objects::compute_pipeline(&info, backend.layout, |create| {
@@ -1637,6 +1639,7 @@ impl NativeBackend {
                 .map_err(|(_, error)| failure(error))
             })
         })?;
+        deferral::note_created(info.source, (self.ticks)().wrapping_sub(started));
         self.report_executables(pipeline);
         Ok(pipeline)
     }
@@ -2130,6 +2133,8 @@ impl NativeOutside {
     }
 
     fn with_state<T>(&self, body: impl FnOnce(&mut Upkeep) -> T) -> T {
+        // A job's pipeline creation may free through it; its bodies allocate.
+        let _held = crate::metal::deferred::hold_lock();
         while self
             .locked
             .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -2714,7 +2719,8 @@ impl Backend for NativeBackend {
             self.report_executables(pipeline);
             return Ok(Pipeline(raw(pipeline)));
         }
-        self.through_store(info.source, |backend, source, feedback| {
+        let started = (self.ticks)();
+        let created = self.through_store(info.source, |backend, source, feedback| {
             // Only a full store's lookup changes the creation flags.
             let replaced;
             let info = if create_flags_differ(info.source, source) {
@@ -2742,8 +2748,9 @@ impl Backend for NativeBackend {
                 .map(|pipelines| pipelines[0])
                 .map_err(|(_, error)| failure(error))
             })
-        })
-        .map(|pipeline| {
+        });
+        deferral::note_created(info.source, (self.ticks)().wrapping_sub(started));
+        created.map(|pipeline| {
             self.report_executables(pipeline);
             Pipeline(raw(pipeline))
         })
@@ -2788,8 +2795,8 @@ impl Backend for NativeBackend {
     }
 
     fn pipeline_cache_data(&mut self, cache: PipelineCache) -> Result<Vec<u8>> {
-        // SAFETY: the cache is alive and the service creates no pipeline
-        // meanwhile.
+        // SAFETY: the cache is alive and internally synchronized: a job may
+        // create through it meanwhile.
         unsafe { self.device.get_pipeline_cache_data(handle(cache.0)) }.map_err(failure)
     }
 
@@ -2917,9 +2924,11 @@ impl Backend for NativeBackend {
                 Object::Pipeline(pipeline) => {
                     self.device.destroy_pipeline(handle(pipeline.0), None);
                 }
-                Object::PipelineCache(cache) => {
+                // A job creating through it destroys it once done.
+                Object::PipelineCache(cache) if !self.cache_in_use(handle(cache.0)) => {
                     self.device.destroy_pipeline_cache(handle(cache.0), None);
                 }
+                Object::PipelineCache(_) => {}
                 Object::QueryPool(pool) => self.device.destroy_query_pool(handle(pool.0), None),
                 Object::Semaphore(semaphore) => {
                     InFlight::forget(&mut self.in_flight, handle(semaphore.0));

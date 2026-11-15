@@ -26,7 +26,7 @@ use crate::{
     choice::{self, Press, Wait},
     console::{Framebuffer, font},
     output,
-    payload::{Aligned, device_path, disk_model, disk_rotation, disk_serial},
+    payload::{Aligned, device_path, disk_model, disk_rotation, disk_serial, serial_sources},
     ui::{self, Canvas},
 };
 use alloc::string::ToString;
@@ -551,6 +551,14 @@ fn disks() -> Vec<Disk> {
             blocks: media.last_block() + 1,
         };
         let serial = disk_serial(handle, &path);
+        // What a disk without a serial number offers, which says why.
+        if serial.is_none() {
+            output::arguments(format_args!(
+                "INSTALLER disk {} without a serial number: {}\n",
+                bus(&path),
+                serial_sources(handle, &path)
+            ));
+        }
         let rotation = disk_rotation(handle);
         let mut disk = Disk {
             media: media.media_id(),
@@ -596,6 +604,38 @@ fn disks() -> Vec<Disk> {
         disk.refusal = refusal;
     }
     disks
+}
+
+/// Stela's macOS partitions on this PC's disks, each as the record names
+/// one (`SERIAL:GUID`), in the disks' order. A disk without a serial number
+/// of its own is passed over, as is one the picker refuses: Stela could not
+/// find it again, or its drivers cannot reach it.
+pub fn installed() -> Vec<String> {
+    let disks = disks();
+    let mut found = Vec::new();
+    for disk in &disks {
+        let (Some(serial), Some(table)) = (disk.serial.as_deref(), disk.table.as_ref()) else {
+            continue;
+        };
+        let alone = disks
+            .iter()
+            .filter(|other| other.serial.as_deref() == Some(serial))
+            .count()
+            == 1;
+        if !alone
+            || disk.refusal.is_some()
+            || serial.is_empty()
+            || serial.contains(char::is_whitespace)
+        {
+            continue;
+        }
+        for partition in &table.partitions {
+            if partition.role() == Some(Role::AppleRegion) {
+                found.push(format!("{serial}:{}", partition.unique_guid));
+            }
+        }
+    }
+    found
 }
 
 /// A partition type's name and colour.

@@ -506,7 +506,7 @@ pub(super) fn machine_on(
 /// both regimes (4 KiB granule, T0SZ 25, one 1 GiB block, EL0 access
 /// with `el0`, whose writable mapping EL1 cannot execute), for DC ZVA,
 /// which faults on the Device memory of a disabled stage 1.
-pub(super) fn normal_memory(machine: &mut Machine<FakeHost, NoDevices>, el0: bool) {
+pub(super) fn normal_memory<D: Devices>(machine: &mut Machine<FakeHost, D>, el0: bool) {
     const TABLE: usize = 0xf000;
     const TCR: u64 = 25 | 1 << 8 | 1 << 10 | 3 << 12 | 1 << 23 | 5 << 32;
     const SCTLR_M_C: u64 = 1 | 1 << 2;
@@ -811,6 +811,40 @@ fn a_lock_free_device_load_keeps_the_cached_lines() {
         machine.device_lines_of(pe, now);
         assert_eq!(machine.devices.queries, queries, "{address:#x}");
     }
+}
+
+/// A signal armed for the running PE that comes due by itself (an Apple
+/// deferred fast IPI, `Devices::own_deadline`) ends its wait: its next
+/// deadline, and its wake while it serves the host, are no later.
+#[test]
+fn a_pes_own_due_signal_ends_its_wait() {
+    #[derive(Default)]
+    struct Armed(Option<u64>);
+    impl Devices for Armed {
+        fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            Ok(0)
+        }
+        fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+            Ok(())
+        }
+        fn lines(&mut self, _: usize, _: u64) -> Lines {
+            Lines::default()
+        }
+        fn own_deadline(&mut self, _: usize) -> Option<u64> {
+            self.0
+        }
+    }
+    let mut machine = board(&[], Armed::default(), Vec::new());
+    assert_eq!(machine.next_deadline(10), None);
+    machine.devices.0 = Some(77);
+    assert_eq!(machine.next_deadline(10), Some(77));
+    // In WFI, which a FIQ ends whatever its mask.
+    machine.waiting = Some(Wait {
+        kind: WaitKind::Interrupt,
+        timeout: None,
+        down: false,
+    });
+    assert_eq!(machine.own_deadline(10), Some(77));
 }
 
 #[test]
@@ -3796,14 +3830,18 @@ fn page_descriptor(frame: u64, pxn: bool) -> u64 {
 }
 
 /// Write `entry` at RAM offset `at`.
-fn write_entry(machine: &mut Machine<FakeHost, NoDevices>, at: u64, entry: u64) {
+pub(super) fn write_entry<D: Devices>(machine: &mut Machine<FakeHost, D>, at: u64, entry: u64) {
     let at = at as usize;
     machine.host.ram[at..at + 8].copy_from_slice(&entry.to_le_bytes());
 }
 
 /// Address space `space` maps BASE's GiB through 4 KiB pages: page `n` of
 /// BASE to `frames[n]`. TTBR0_EL1 then selects it, with the MMU on.
-fn paged_space(machine: &mut Machine<FakeHost, NoDevices>, space: usize, frames: &[u64]) {
+pub(super) fn paged_space<D: Devices>(
+    machine: &mut Machine<FakeHost, D>,
+    space: usize,
+    frames: &[u64],
+) {
     const MSR_TTBR0_EL1_X0: u32 = 0xd518_2000;
     let [l1, l2, l3] = SPACES_TABLES[space];
     if machine.cpu.read(SystemRegister::SCTLR_EL1) & 1 == 0 {
@@ -3819,7 +3857,7 @@ fn paged_space(machine: &mut Machine<FakeHost, NoDevices>, space: usize, frames:
 }
 
 /// A TLBI by VA of the page at `va`, of every ASID.
-fn tlbi_page(machine: &mut Machine<FakeHost, NoDevices>, va: u64) {
+pub(super) fn tlbi_page<D: Devices>(machine: &mut Machine<FakeHost, D>, va: u64) {
     use mmu::tlbi::{Everywhere, Reach};
     let reach = Reach::Containing(va);
     machine.tlb_maintained(reach, Everywhere::Addresses(reach), None);

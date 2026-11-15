@@ -2086,6 +2086,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                             });
                         self.queue.clock.retire(
                             flight.serial,
+                            flight.submits,
                             flight.committed,
                             seen,
                             [ns(times[0]), ns(times[1])],
@@ -2651,7 +2652,7 @@ impl<B: Backend, C: Compiler> Resolver for DeviceResolver<'_, B, C> {
         update: &mut dyn FnMut(&mut IndirectCommandBuffer) -> Result<()>,
     ) -> Result<()> {
         // A commit running again would apply the update twice.
-        self.device.stop_deferring();
+        self.device.stop_deferring()?;
         update(self.device.indirect_command_buffer_mut(id)?)
     }
 }

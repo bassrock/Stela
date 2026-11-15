@@ -16,6 +16,7 @@ pub mod linux;
 
 pub mod amdgpu_chip;
 pub mod cold;
+pub mod gsp_perf;
 pub mod nouveau_chip;
 
 #[cfg(feature = "linux-kernel")]
