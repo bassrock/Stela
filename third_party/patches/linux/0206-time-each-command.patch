@@ -1,0 +1,284 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel Brooks <bass_rock@me.com>
+Date: Sat, 14 Nov 2026 21:00:00 +0000
+Subject: [PATCH] feat(amdgpu): time each command submission's phases and each
+ VA update for Stela's GPU report
+
+Stela diagnostics: amdgpu_cs_ioctl charges Linux's clock and the task's
+context switches between its steps to one phase each (parse, dependencies,
+BOs, VM, sync, submit, fini), with its BO list's length, and
+amdgpu_gem_va_ioctl is timed whole, in stela_amdgpu_cs_counts, which the
+host reads and clears for its 10 s `GPU CS PHASES` line. Nothing in Linux
+reads the counts back.
+---
+ drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c        |  21 +++
+ drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c       |  18 ++-
+ .../gpu/drm/amd/amdgpu/amdgpu_stela_counts.h  | 127 ++++++++++++++++++
+ 3 files changed, 164 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/gpu/drm/amd/amdgpu/amdgpu_stela_counts.h
+
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+index 35d76cfbc88af7bd824b3bb28ace2ff940d1f863..e2362fff9a625a75400dc2e1d1f0533f8efd8e76 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_cs.c
+@@ -41,6 +41,10 @@
+ #include "amdgpu_gem.h"
+ #include "amdgpu_ras.h"
+ #include "amdgpu_hmm.h"
++#include "amdgpu_stela_counts.h"
++
++/* Stela diagnostics (amdgpu_stela_counts.h). */
++struct stela_amdgpu_cs_counts stela_amdgpu_cs_counts;
+ 
+ /*
+  * Maximum IB length (dwords) for rings whose emit_ib packet format
+@@ -1439,6 +1443,8 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ {
+ 	struct amdgpu_device *adev = drm_to_adev(dev);
+ 	struct amdgpu_cs_parser parser;
++	struct stela_amdgpu_clock clock;
++	unsigned int bos = 0;
+ 	int r;
+ 
+ 	if (amdgpu_ras_intr_triggered())
+@@ -1447,21 +1453,29 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 	if (!adev->accel_working)
+ 		return -EBUSY;
+ 
++	stela_amdgpu_clock_start(&clock);
+ 	r = amdgpu_cs_parser_init(&parser, adev, filp, data);
+ 	if (r) {
+ 		drm_err_ratelimited(dev, "Failed to initialize parser %d!\n", r);
++		stela_amdgpu_cs_lap(&clock, STELA_AMDGPU_CS_PARSE);
++		stela_amdgpu_cs_end(&clock, r, 0);
+ 		return r;
+ 	}
+ 
+ 	r = amdgpu_cs_pass1(&parser, data);
++	stela_amdgpu_cs_lap(&clock, STELA_AMDGPU_CS_PARSE);
+ 	if (r)
+ 		goto error_fini;
+ 
+ 	r = amdgpu_cs_pass2(&parser);
++	stela_amdgpu_cs_lap(&clock, STELA_AMDGPU_CS_DEPS);
+ 	if (r)
+ 		goto error_fini;
+ 
+ 	r = amdgpu_cs_parser_bos(&parser, data);
++	stela_amdgpu_cs_lap(&clock, STELA_AMDGPU_CS_BOS);
++	if (parser.bo_list)
++		bos = parser.bo_list->num_entries;
+ 	if (r) {
+ 		if (r == -ENOMEM)
+ 			drm_err(dev, "Not enough memory for command submission!\n");
+@@ -1475,20 +1489,25 @@ int amdgpu_cs_ioctl(struct drm_device *dev, void *data, struct drm_file *filp)
+ 		goto error_backoff;
+ 
+ 	r = amdgpu_cs_vm_handling(&parser);
++	stela_amdgpu_cs_lap(&clock, STELA_AMDGPU_CS_VM);
+ 	if (r)
+ 		goto error_backoff;
+ 
+ 	r = amdgpu_cs_sync_rings(&parser);
++	stela_amdgpu_cs_lap(&clock, STELA_AMDGPU_CS_SYNC);
+ 	if (r)
+ 		goto error_backoff;
+ 
+ 	trace_amdgpu_cs_ibs(&parser);
+ 
+ 	r = amdgpu_cs_submit(&parser, data);
++	stela_amdgpu_cs_lap(&clock, STELA_AMDGPU_CS_SUBMIT);
+ 	if (r)
+ 		goto error_backoff;
+ 
+ 	amdgpu_cs_parser_fini(&parser);
++	stela_amdgpu_cs_lap(&clock, STELA_AMDGPU_CS_FINI);
++	stela_amdgpu_cs_end(&clock, 0, bos);
+ 	return 0;
+ 
+ error_backoff:
+@@ -1496,6 +1515,8 @@ error_backoff:
+ 
+ error_fini:
+ 	amdgpu_cs_parser_fini(&parser);
++	stela_amdgpu_cs_lap(&clock, STELA_AMDGPU_CS_FINI);
++	stela_amdgpu_cs_end(&clock, r, bos);
+ 	return r;
+ }
+ 
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+index f754a4a3a1c22dbb5f3bd13b91c179543db02269..b4136a94c3660681398f107ffb6d5daab163ecfc 100644
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_gem.c
+@@ -45,6 +45,7 @@
+ #include "amdgpu_display.h"
+ #include "amdgpu_dma_buf.h"
+ #include "amdgpu_hmm.h"
++#include "amdgpu_stela_counts.h"
+ #include "amdgpu_xgmi.h"
+ #include "amdgpu_vm.h"
+ 
+@@ -829,8 +830,8 @@ error:
+ 	return dma_fence_get(vm->last_update);
+ }
+ 
+-int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
+-			  struct drm_file *filp)
++static int amdgpu_gem_va(struct drm_device *dev, void *data,
++			 struct drm_file *filp)
+ {
+ 	const uint32_t valid_flags = AMDGPU_VM_DELAY_UPDATE |
+ 		AMDGPU_VM_PAGE_READABLE | AMDGPU_VM_PAGE_WRITEABLE |
+@@ -1025,6 +1026,19 @@ error_put_gobj:
+ 	return r;
+ }
+ 
++/* Stela diagnostics (amdgpu_stela_counts.h): amdgpu_gem_va timed whole. */
++int amdgpu_gem_va_ioctl(struct drm_device *dev, void *data,
++			struct drm_file *filp)
++{
++	struct stela_amdgpu_clock clock;
++	int r;
++
++	stela_amdgpu_clock_start(&clock);
++	r = amdgpu_gem_va(dev, data, filp);
++	stela_amdgpu_va_end(&clock);
++	return r;
++}
++
+ int amdgpu_gem_op_ioctl(struct drm_device *dev, void *data,
+ 			struct drm_file *filp)
+ {
+diff --git a/drivers/gpu/drm/amd/amdgpu/amdgpu_stela_counts.h b/drivers/gpu/drm/amd/amdgpu/amdgpu_stela_counts.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e8c51fd645e90403212782e2b34d7867869236cb
+--- /dev/null
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_stela_counts.h
+@@ -0,0 +1,127 @@
++/* SPDX-License-Identifier: MIT */
++/* Stela diagnostics: where amdgpu's command submissions and VA updates
++ * spend their time, read and cleared by the host's 10 s report (`GPU CS
++ * PHASES`, crates/stela-boot/src/engine/gpu/gate.rs). Observation only:
++ * nothing in Linux reads these back. Each phase is timed by Linux's clock
++ * around amdgpu_cs_ioctl's steps, waits and sleeps included, with the
++ * task's context switches across it (a park, a yield or a reschedule ends
++ * the task's step, and the task resumes only at a later Linux step). */
++#ifndef __AMDGPU_STELA_COUNTS_H__
++#define __AMDGPU_STELA_COUNTS_H__
++
++#include <linux/ktime.h>
++#include <linux/minmax.h>
++#include <linux/sched.h>
++#include <linux/types.h>
++
++enum stela_amdgpu_cs_phase {
++	/* amdgpu_cs_parser_init and pass 1: chunks, the BO list, IB jobs. */
++	STELA_AMDGPU_CS_PARSE,
++	/* Pass 2: IBs, dependencies, syncobjs (timeline waits for submit). */
++	STELA_AMDGPU_CS_DEPS,
++	/* amdgpu_cs_parser_bos: lock and validate each BO. */
++	STELA_AMDGPU_CS_BOS,
++	/* amdgpu_cs_patch_jobs and amdgpu_cs_vm_handling: page tables. */
++	STELA_AMDGPU_CS_VM,
++	/* amdgpu_cs_sync_rings: the previous fence's wait, each resv. */
++	STELA_AMDGPU_CS_SYNC,
++	/* amdgpu_cs_submit: arm, fence each resv, push to the scheduler. */
++	STELA_AMDGPU_CS_SUBMIT,
++	/* amdgpu_cs_parser_fini: unlock and free. */
++	STELA_AMDGPU_CS_FINI,
++	STELA_AMDGPU_CS_PHASES
++};
++
++/* All u64, updated with relaxed atomics; the host swaps each to zero. */
++struct stela_amdgpu_cs_counts {
++	u64 count;
++	u64 failed;
++	/* BO list entries over all submissions, and the most in one. */
++	u64 bos;
++	u64 bos_most;
++	/* The longest submission, and context switches over all of them. */
++	u64 longest_ns;
++	u64 switches;
++	u64 ns[STELA_AMDGPU_CS_PHASES];
++	u64 phase_switches[STELA_AMDGPU_CS_PHASES];
++	/* amdgpu_gem_va_ioctl: calls, time, the longest, context switches. */
++	u64 va_count;
++	u64 va_ns;
++	u64 va_longest_ns;
++	u64 va_switches;
++};
++
++extern struct stela_amdgpu_cs_counts stela_amdgpu_cs_counts;
++
++struct stela_amdgpu_clock {
++	u64 start, at;
++	unsigned long first, switches;
++};
++
++static inline unsigned long stela_amdgpu_switches(void)
++{
++	return READ_ONCE(current->nvcsw) + READ_ONCE(current->nivcsw);
++}
++
++static inline void stela_amdgpu_add(u64 *counter, u64 value)
++{
++	__atomic_fetch_add(counter, value, __ATOMIC_RELAXED);
++}
++
++static inline void stela_amdgpu_most(u64 *counter, u64 value)
++{
++	u64 seen = __atomic_load_n(counter, __ATOMIC_RELAXED);
++
++	while (value > seen &&
++	       !__atomic_compare_exchange_n(counter, &seen, value, false,
++					    __ATOMIC_RELAXED, __ATOMIC_RELAXED))
++		;
++}
++
++static inline void stela_amdgpu_clock_start(struct stela_amdgpu_clock *clock)
++{
++	clock->start = clock->at = ktime_get_ns();
++	clock->first = clock->switches = stela_amdgpu_switches();
++}
++
++/* Charges the time and switches since the last lap to `phase`. */
++static inline void stela_amdgpu_cs_lap(struct stela_amdgpu_clock *clock,
++				       enum stela_amdgpu_cs_phase phase)
++{
++	u64 now = ktime_get_ns();
++	unsigned long switches = stela_amdgpu_switches();
++
++	stela_amdgpu_add(&stela_amdgpu_cs_counts.ns[phase], now - clock->at);
++	stela_amdgpu_add(&stela_amdgpu_cs_counts.phase_switches[phase],
++			 switches - clock->switches);
++	clock->at = now;
++	clock->switches = switches;
++}
++
++static inline void stela_amdgpu_cs_end(struct stela_amdgpu_clock *clock,
++				       int result, unsigned int bos)
++{
++	struct stela_amdgpu_cs_counts *counts = &stela_amdgpu_cs_counts;
++
++	stela_amdgpu_add(&counts->count, 1);
++	if (result)
++		stela_amdgpu_add(&counts->failed, 1);
++	stela_amdgpu_add(&counts->bos, bos);
++	stela_amdgpu_most(&counts->bos_most, bos);
++	stela_amdgpu_most(&counts->longest_ns, clock->at - clock->start);
++	stela_amdgpu_add(&counts->switches, clock->switches - clock->first);
++}
++
++static inline void stela_amdgpu_va_end(struct stela_amdgpu_clock *clock)
++{
++	struct stela_amdgpu_cs_counts *counts = &stela_amdgpu_cs_counts;
++	u64 took = ktime_get_ns() - clock->start;
++
++	stela_amdgpu_add(&counts->va_count, 1);
++	stela_amdgpu_add(&counts->va_ns, took);
++	stela_amdgpu_most(&counts->va_longest_ns, took);
++	stela_amdgpu_add(&counts->va_switches,
++			 stela_amdgpu_switches() - clock->first);
++}
++
++#endif

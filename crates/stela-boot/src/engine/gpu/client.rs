@@ -241,6 +241,11 @@ struct Request {
     wake_task: bool,
     /// The TSC at posting, for the report of calls that wait.
     posted: u64,
+    /// The TSCs at which the boot CPU took it, a worker started it and
+    /// finished it, for [`cs_host_line`]; zero until then.
+    taken: AtomicU64,
+    started: AtomicU64,
+    finished: AtomicU64,
     /// Whether a task took it, or its poster withdrew it.
     claim: Claim,
 }
@@ -254,6 +259,9 @@ impl Request {
             done: AtomicU32::new(0),
             wake_task: false,
             posted: host::rdtsc(),
+            taken: AtomicU64::new(0),
+            started: AtomicU64::new(0),
+            finished: AtomicU64::new(0),
             claim: Claim::new(),
         }
     }
@@ -655,7 +663,10 @@ unsafe fn serve(gpu: &Installed, request: NonNull<Request>) {
         slot.0.store(0, Ordering::Relaxed);
     }
     count(&QUEUED, code, started.wrapping_sub(request.posted));
-    let took = host::rdtsc().wrapping_sub(started);
+    let finished = host::rdtsc();
+    request.started.store(started, Ordering::Relaxed);
+    request.finished.store(finished, Ordering::Relaxed);
+    let took = finished.wrapping_sub(started);
     count(&SERVED, code, took);
     // A report between the two reads cleared the count.
     let now_shot = crate::native_mmio::shootdown::count();
@@ -913,10 +924,12 @@ pub(super) fn start(gpu: &Installed) -> Result<(), WorkError> {
             _ if current.claim.withdrawn()
                 && unsafe { release_withdrawn(NonNull::new_unchecked(request.cast_mut())) } => {}
             _ => {
+                let taken = host::rdtsc();
+                current.taken.store(taken, Ordering::Relaxed);
                 count(
                     &TAKEN,
                     request_code(&current.operation),
-                    host::rdtsc().wrapping_sub(current.posted),
+                    taken.wrapping_sub(current.posted),
                 );
                 service
                     .queue
@@ -995,6 +1008,11 @@ fn submit(operation: Operation) -> i64 {
     let Some(result) = posted_wait(gpu, unsafe { request.as_ref() }, code) else {
         return ETIMEDOUT;
     };
+    #[cfg(feature = "radv")]
+    if code == AMDGPU_CS {
+        // SAFETY: done, so no task touches it again; still this frame's box.
+        count_cs_host(unsafe { request.as_ref() });
+    }
     // SAFETY: done, so no task touches it again; this frame's box.
     drop(unsafe { Box::from_raw(request.as_ptr()) });
     let waited = host::rdtsc().wrapping_sub(posted);
@@ -1059,6 +1077,56 @@ fn posted_wait(gpu: &Installed, request: &Request, code: u32) -> Option<i64> {
         }
     }
     Some(request.result.load(Ordering::Acquire))
+}
+
+/// `DRM_IOCTL_AMDGPU_CS`: `DRM_IOWR(DRM_COMMAND_BASE + 0x04, union
+/// drm_amdgpu_cs)`.
+#[cfg(feature = "radv")]
+const AMDGPU_CS: u32 = 0xc018_6444;
+
+/// Diagnostics: the posted command submissions since [`cs_host_line`],
+/// their count and TSC ticks from posting until the boot CPU took each,
+/// from then until a worker started it, performing it, and from its
+/// completion until its poster saw it.
+#[cfg(feature = "radv")]
+static CS_HOST: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+#[cfg(feature = "radv")]
+fn count_cs_host(request: &Request) {
+    let [taken, started, finished] = [&request.taken, &request.started, &request.finished]
+        .map(|tsc| tsc.load(Ordering::Relaxed));
+    // Only a call a worker performed has every stamp.
+    if taken == 0 || started == 0 || finished == 0 {
+        return;
+    }
+    let returned = host::rdtsc();
+    let [count, to_taken, to_started, served, to_returned] = &CS_HOST;
+    count.fetch_add(1, Ordering::Relaxed);
+    to_taken.fetch_add(taken.saturating_sub(request.posted), Ordering::Relaxed);
+    to_started.fetch_add(started.saturating_sub(taken), Ordering::Relaxed);
+    served.fetch_add(finished.saturating_sub(started), Ordering::Relaxed);
+    to_returned.fetch_add(returned.saturating_sub(finished), Ordering::Relaxed);
+}
+
+/// Diagnostics: `GPU CS HOST count=… taken_us=… queued_us=… served_us=…
+/// returned_us=…`, the totals of [`CS_HOST`] since the last call, cleared,
+/// or None with none posted.
+#[cfg(feature = "radv")]
+pub(super) fn cs_host_line(tsc_hz: u64) -> Option<alloc::string::String> {
+    let [count, taken, queued, served, returned] = CS_HOST
+        .each_ref()
+        .map(|value| value.swap(0, Ordering::Relaxed));
+    if count == 0 {
+        return None;
+    }
+    let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
+    Some(alloc::format!(
+        "GPU CS HOST count={count} taken_us={} queued_us={} served_us={} returned_us={}",
+        micros(taken),
+        micros(queued),
+        micros(served),
+        micros(returned),
+    ))
 }
 
 /// Requests posted to the service task since [`take_posted`] by request

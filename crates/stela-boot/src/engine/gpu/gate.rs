@@ -939,6 +939,15 @@ pub(in crate::engine) fn report_calls(tsc_hz: u64) {
         output::arguments(format_args!(" {request:#x}:{count}/{}", micros(took)));
     }
     output::arguments(format_args!("\n"));
+    // Diagnostics: where amdgpu's command submissions spend their time, in
+    // Linux and around it.
+    #[cfg(feature = "radv")]
+    for line in [super::amdgpu_cs_report(), client::cs_host_line(tsc_hz)]
+        .into_iter()
+        .flatten()
+    {
+        output::arguments(format_args!("{line}\n"));
+    }
 }
 
 /// `GPU LOCK operation:held_us/waited_us/longest_wait_us/compiled_us/compiles`:

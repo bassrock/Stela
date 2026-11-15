@@ -2783,6 +2783,96 @@ fn nvkm_report() -> String {
     times + &sizes
 }
 
+/// `amdgpu_stela_counts.h` (Linux patch 0206): `struct
+/// stela_amdgpu_cs_counts`, which amdgpu updates only atomically.
+#[cfg(feature = "radv")]
+#[repr(C)]
+struct AmdgpuCsCounts {
+    count: AtomicU64,
+    failed: AtomicU64,
+    bos: AtomicU64,
+    bos_most: AtomicU64,
+    longest_ns: AtomicU64,
+    switches: AtomicU64,
+    ns: [AtomicU64; AMDGPU_CS_PHASES.len()],
+    phase_switches: [AtomicU64; AMDGPU_CS_PHASES.len()],
+    va_count: AtomicU64,
+    va_ns: AtomicU64,
+    va_longest_ns: AtomicU64,
+    va_switches: AtomicU64,
+}
+
+/// `enum stela_amdgpu_cs_phase`, in order.
+#[cfg(feature = "radv")]
+const AMDGPU_CS_PHASES: [&str; 7] = ["parse", "deps", "bos", "vm", "sync", "submit", "fini"];
+
+/// Diagnostics: `GPU CS PHASES count=… failed=… bos=mean/most longest_us=…
+/// mean_us=… switches=… parse_us=… deps_us=… bos_us=… vm_us=… sync_us=…
+/// submit_us=… fini_us=… phase_switches=parse/…/fini:…` for amdgpu's command
+/// submissions since the last report, each phase's total by Linux's clock,
+/// its waits and sleeps included, and the submitting task's context switches
+/// in it (each a Linux step ended before the call did), then `\nGPU VA
+/// count=… total_us=… longest_us=… switches=…` for its VA updates. None with
+/// neither.
+#[cfg(feature = "radv")]
+pub(super) fn amdgpu_cs_report() -> Option<String> {
+    unsafe extern "C" {
+        /// `amdgpu/amdgpu_cs.c`, under Linux patch 0206.
+        static stela_amdgpu_cs_counts: AmdgpuCsCounts;
+    }
+    // SAFETY: amdgpu's static counters, which it only updates atomically.
+    let counts = unsafe { &stela_amdgpu_cs_counts };
+    let take = |counter: &AtomicU64| counter.swap(0, Ordering::Relaxed);
+    let micros = |ns: u64| ns / 1000;
+    let mut lines = Vec::new();
+    let count = take(&counts.count);
+    let (failed, bos, bos_most) = (
+        take(&counts.failed),
+        take(&counts.bos),
+        take(&counts.bos_most),
+    );
+    let (longest, switches) = (take(&counts.longest_ns), take(&counts.switches));
+    let ns = counts.ns.each_ref().map(take);
+    let phase_switches = counts.phase_switches.each_ref().map(take);
+    if count != 0 {
+        let total: u64 = ns.iter().sum();
+        let mut line = format!(
+            "GPU CS PHASES count={count} failed={failed} bos={}/{bos_most} longest_us={} \
+             mean_us={} switches={switches}",
+            bos / count,
+            micros(longest),
+            micros(total / count),
+        );
+        for (name, ns) in AMDGPU_CS_PHASES.iter().zip(ns) {
+            line.push_str(&format!(" {name}_us={}", micros(ns)));
+        }
+        let switches: Vec<String> = phase_switches
+            .iter()
+            .map(|count| format!("{count}"))
+            .collect();
+        line.push_str(&format!(
+            " phase_switches={}:{}",
+            AMDGPU_CS_PHASES.join("/"),
+            switches.join("/")
+        ));
+        lines.push(line);
+    }
+    let va_count = take(&counts.va_count);
+    let (va_ns, va_longest, va_switches) = (
+        take(&counts.va_ns),
+        take(&counts.va_longest_ns),
+        take(&counts.va_switches),
+    );
+    if va_count != 0 {
+        lines.push(format!(
+            "GPU VA count={va_count} total_us={} longest_us={} switches={va_switches}",
+            micros(va_ns),
+            micros(va_longest),
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// The function of the timer-list timer due first when Linux last looked,
 /// as an offset in this image, or `-` for none.
 fn next_timer() -> String {
