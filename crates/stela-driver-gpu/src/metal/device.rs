@@ -184,6 +184,9 @@ pub struct Device<B: Backend, C: Compiler> {
     unsupported: Vec<&'static str>,
     /// What it left undone that no call has reported yet, oldest first.
     unreported: Vec<&'static str>,
+    /// What it did another way than asked, for the platform's log, oldest
+    /// first: a texture whose rows it mirrors.
+    notices: Vec<alloc::string::String>,
     /// The phases of the call it serves now, for the platform's log.
     timing: Recorder,
     /// Who owned the GPU addresses of whole allocations, for a lost
@@ -325,6 +328,12 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         (!self.unreported.is_empty()).then(|| self.unreported.remove(0))
     }
 
+    /// The oldest notice no call has logged yet, such as a mirrored
+    /// texture's.
+    pub fn take_notice(&mut self) -> Option<alloc::string::String> {
+        (!self.notices.is_empty()).then(|| self.notices.remove(0))
+    }
+
     /// The compiler's detail of the last function it refused, once.
     pub fn take_refusal(&mut self) -> Option<Refusal> {
         self.compiler.take_refusal()
@@ -377,6 +386,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             queue: queue::Queue::default(),
             unsupported: Vec::new(),
             unreported: Vec::new(),
+            notices: Vec::new(),
             timing: Recorder::default(),
             book: memory_book::MemoryBook::default(),
         })

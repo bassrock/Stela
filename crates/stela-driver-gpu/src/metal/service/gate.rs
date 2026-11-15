@@ -75,6 +75,16 @@ impl<B: Backend, C: Compiler> Service<B, C> {
                 call.operation
             ));
         }
+        // What the device did another way joins what the call made.
+        while let Some(notice) = self.device.take_notice() {
+            match &mut self.noted {
+                Some(noted) => {
+                    noted.push_str("; ");
+                    noted.push_str(&notice);
+                }
+                None => self.noted = Some(notice),
+            }
+        }
         // The reason the caller reads names the raw value it refused too.
         let detailed;
         let (status, reason) = match outcome {

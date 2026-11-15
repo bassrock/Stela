@@ -6,7 +6,9 @@
 //! framebuffers and Core Animation's surfaces share with the display. The
 //! texture is those planes: shaders sample and read them through linear
 //! images, an `RGB10A2Unorm` view of the codes and an `R8Unorm` view of
-//! alpha, which they decode ([`ResourceId::XR10`]). A pass renders the
+//! alpha, which they decode ([`ResourceId::XR10`]), or through a mirror of
+//! a plane whose rows no linear image takes (RADV's alpha rows of 1920
+//! bytes), which commits fill from the rows. A pass renders the
 //! texture as the half floats its format's other textures hold, in a
 //! working image kept with it: the pass's start decodes the planes into it
 //! when the attachment loads, and its end encodes it into the planes when it
@@ -200,39 +202,36 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             ));
         }
         let buffer = self.resources.buffers.get(buffer_id.0)?;
-        let (memory, memory_offset, length) = (buffer.memory, buffer.memory_offset, buffer.length);
+        let rows = (buffer.buffer, buffer.memory, buffer.memory_offset);
+        let (memory_offset, length) = (buffer.memory_offset, buffer.length);
+        // Passes encode into the planes through their addresses, so a
+        // mirrored plane's image is only read.
         let plane = |pixel_format, layout: PlaneLayout| {
             let plane = TextureDescriptor {
                 pixel_format,
                 usage: TextureUsage::SHADER_READ,
                 ..*descriptor
             };
-            resource::linear_texture(
+            resource::buffer_texture(
                 &self.capabilities,
                 &plane,
                 length,
+                memory_offset,
                 layout.offset,
                 layout.bytes_per_row,
             )
         };
         let plans = [plane(formats[0], planes[0])?, plane(formats[1], planes[1])?];
-        let (_, linear) = self.capabilities.linear_texture_alignments();
         let mut images = Vec::with_capacity(2);
+        let mut mirrors = Vec::new();
         let mut views = Vec::with_capacity(2);
         let created = (|| -> Result<ResourceId> {
-            for (plan, layout) in plans.iter().zip(planes) {
-                let place = memory_offset
-                    .checked_add(layout.offset)
-                    .filter(|place| place.is_multiple_of(linear))
-                    .ok_or(Error::Invalid(
-                        "the surface's plane is not aligned for a texture",
-                    ))?;
-                images.push(
-                    self.backend
-                        .create_placed_image(&plan.image, memory, place)?,
-                );
-                let image = images[images.len() - 1];
+            for ((plan, layout), format) in plans.iter().zip(planes).zip(formats) {
+                let (image, mirror) = self.buffer_image(rows, plan, format, layout)?;
+                images.push(image);
+                mirrors.extend(mirror);
                 let info = plan
+                    .plan()
                     .views
                     .sampled
                     .ok_or(Error::Invalid("a plane has no sampled view"))?;
@@ -261,6 +260,9 @@ impl<B: Backend, C: Compiler> Device<B, C> {
                 for image in images {
                     self.backend.destroy(Object::Image(image));
                 }
+                for mirror in mirrors {
+                    self.free_mirror(mirror);
+                }
                 return Err(error);
             }
         };
@@ -280,9 +282,10 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             dependents: 0,
             cpu_copy: None,
             second_plane: Some(images[1]),
+            mirrors,
         };
         self.resources.buffers.get_mut(buffer_id.0)?.dependents += 1;
-        let id = TextureId(self.resources.textures.insert(texture));
+        let id = self.insert_over_buffer(texture);
         self.resources.extended_planes.insert(
             id.0,
             PlaneState {
@@ -811,6 +814,60 @@ mod tests {
             })
             .collect();
         assert_eq!(kernels, [true]);
+    }
+
+    /// WindowServer's surface whose alpha rows a linear image cannot take
+    /// (RADV's are multiples of 256 bytes; NVK's, here, of 32): the alpha
+    /// plane is mirrored and filled from its rows before each command
+    /// buffer, and as passes encode into the rows themselves, never copied
+    /// back.
+    #[test]
+    fn surface_textures_mirror_an_unaligned_alpha_plane() {
+        let mut device = device();
+        let buffer = device
+            .new_buffer(5_251_264, options(StorageMode::Shared))
+            .unwrap();
+        let alpha = PlaneLayout {
+            bytes_per_row: 1288,
+            ..PLANES[1]
+        };
+        let mut descriptor = surface_texture(PixelFormat::Rgb10A8_2pXr10);
+        descriptor.height = 790;
+        let texture = device
+            .new_extended_plane_texture(buffer, &descriptor, [PLANES[0], alpha])
+            .unwrap();
+        let notice = device.take_notice().unwrap();
+        assert!(
+            notice.contains("1280x790 R8Unorm at bytesPerRow 1288"),
+            "{notice}"
+        );
+        let image = device.second_plane(texture).unwrap().unwrap();
+        let rows = device.buffer(buffer).unwrap().buffer;
+        let mut commands = device.new_command_buffer();
+        device
+            .begin_render(&mut commands, &pass(texture, LoadAction::Load))
+            .unwrap();
+        commands.end_encoding(&mut device.resolver()).unwrap();
+        device.commit(commands).unwrap();
+        let segments = device.backend().submissions.last().unwrap();
+        let copies: Vec<_> = segments
+            .iter()
+            .flat_map(|segment| &segment.commands)
+            .filter(|command| {
+                matches!(
+                    command,
+                    Command::CopyBufferToImage { .. } | Command::CopyImageToBuffer { .. }
+                )
+            })
+            .collect();
+        let [Command::CopyBufferToImage { src, dst, region }] = copies[..] else {
+            panic!("{copies:?}");
+        };
+        assert_eq!((*src, *dst), (rows, image));
+        assert_eq!(region.buffer_offset, alpha.offset);
+        assert_eq!(region.buffer_row_length, 1288);
+        assert_eq!(region.extent, [1280, 790, 1]);
+        device.destroy_texture(texture).unwrap();
     }
 
     /// The conversions an empty pass of `request` runs, in order: a decode

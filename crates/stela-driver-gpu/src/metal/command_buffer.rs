@@ -789,6 +789,9 @@ pub struct CommandBuffer {
     /// What its passes change of the extended-range textures' planes,
     /// applied once it is committed.
     pub(crate) planes: super::device::resources::PlaneChanges,
+    /// The textures with mirrored planes its passes attach, whose images
+    /// its commit copies back to their rows.
+    pub(crate) rendered: Vec<super::device::TextureId>,
 }
 
 impl CommandBuffer {
@@ -801,6 +804,7 @@ impl CommandBuffer {
             pipelines: Vec::new(),
             workload: Workload::default(),
             planes: Default::default(),
+            rendered: Vec::new(),
         }
     }
 
