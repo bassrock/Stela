@@ -157,6 +157,12 @@ const BUNDLE_FLAGS: &[&str] = &[
     "-fobjc-arc",
     "-fblocks",
     "-fobjc-runtime=macosx-27.0",
+    // Calls go through objc_msgSend itself: `objc_msgSend$<selector>` and
+    // `objc_msgSendClass$<selector>$<class>` stubs
+    // are the linker's to synthesize, which ld64 does and `plugin::link`
+    // does not, so a clang that emits them leaves dlopen an undefined symbol.
+    "-fno-objc-msgsend-selector-stubs",
+    "-fno-objc-msgsend-class-selector-stubs",
     "-fno-common",
     "-fno-unwind-tables",
     "-fno-asynchronous-unwind-tables",
