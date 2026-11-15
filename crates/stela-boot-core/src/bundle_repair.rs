@@ -426,9 +426,10 @@ pub fn diagnose_steps() -> Vec<Step> {
         // cached blank: the system store goes, the next login renders anew.
         optional("/bin/rm -rf /Library/Caches/com.apple.iconservices.store", 60),
         optional(&format!("/bin/ls -lt {REPORTS} 2>&1 | /usr/bin/head -40"), 30),
+        optional("/bin/ls -lt /Users/*/Library/Logs/DiagnosticReports 2>&1 | /usr/bin/head -20", 30),
         optional(
             &format!(
-                "for f in $(/bin/ls -t {REPORTS}/iconservicesagent* {REPORTS}/WindowServer* 2>/dev/null | /usr/bin/head -3); do echo \"== $f\"; /usr/bin/head -c 16000 \"$f\"; echo; done"
+                "for f in $(/bin/ls -t {REPORTS}/iconservicesagent* {REPORTS}/WindowServer* /Users/*/Library/Logs/DiagnosticReports/iconservicesagent* /Users/*/Library/Logs/DiagnosticReports/Retired/iconservicesagent* 2>/dev/null | /usr/bin/head -3); do echo \"== $f\"; /usr/bin/head -c 16000 \"$f\"; echo; done"
             ),
             120,
         ),
