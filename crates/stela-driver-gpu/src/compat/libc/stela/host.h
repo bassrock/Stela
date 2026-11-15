@@ -43,6 +43,8 @@ int stela_libc_drm_close(int fd);
 int stela_libc_drm_dup(int fd);
 /* The descriptor's device number. */
 long stela_libc_drm_rdev(int fd);
+/* The descriptor's llseek: the new offset. */
+long long stela_libc_drm_seek(int fd, long long offset, int whence);
 /* `argument` is in-process. */
 int stela_libc_drm_ioctl(int fd, unsigned long request, void *argument);
 /* A pointer, or a negative errno. Every page is mapped on return. */
