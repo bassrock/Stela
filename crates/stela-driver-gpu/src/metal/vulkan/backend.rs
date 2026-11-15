@@ -31,6 +31,82 @@ use alloc::{boxed::Box, sync::Arc, vec::Vec};
 use core::{any::Any, num::NonZeroU64};
 use stela_contracts::gate::MemoryRange;
 
+/// A digest of rows that changes with any one 64-bit word of them, and
+/// with several but by chance: four lanes, each a chain of bijections of
+/// its state for a given word and of the word for a given state.
+#[derive(Clone, Copy, Debug)]
+pub struct RowsDigest {
+    lanes: [u64; 4],
+    length: u64,
+}
+
+const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+
+impl Default for RowsDigest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RowsDigest {
+    pub fn new() -> Self {
+        Self {
+            lanes: [MIX, MIX ^ 1, MIX ^ 2, MIX ^ 3],
+            length: 0,
+        }
+    }
+
+    fn block(&mut self, words: [u64; 4]) {
+        for (lane, word) in self.lanes.iter_mut().zip(words) {
+            *lane = (*lane ^ word).wrapping_mul(MIX).rotate_left(29);
+        }
+        self.length += 32;
+    }
+
+    /// Takes `bytes`; every call but the last takes whole 32-byte blocks.
+    pub fn update(&mut self, bytes: &[u8]) {
+        let (blocks, rest) = bytes.as_chunks::<32>();
+        for block in blocks {
+            let (words, _) = block.as_chunks::<8>();
+            self.block([0, 1, 2, 3].map(|at| u64::from_le_bytes(words[at])));
+        }
+        if !rest.is_empty() {
+            let mut tail = [0; 32];
+            tail[..rest.len()].copy_from_slice(rest);
+            self.update(&tail);
+            self.length -= 32 - rest.len() as u64;
+        }
+    }
+
+    /// [`Self::update`] of `length` bytes at `bytes`, read in place.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` is readable for `length` bytes.
+    pub unsafe fn update_from(&mut self, bytes: *const u8, length: usize) {
+        let whole = length / 32 * 32;
+        let mut at = 0;
+        while at < whole {
+            // SAFETY: the block lies in the caller's range.
+            let words = unsafe { bytes.add(at).cast::<[u64; 4]>().read_unaligned() };
+            self.block(words.map(u64::from_le));
+            at += 32;
+        }
+        let mut tail = [0u8; 32];
+        // SAFETY: as above, for the bytes after the last whole block.
+        unsafe {
+            core::ptr::copy_nonoverlapping(bytes.add(whole), tail.as_mut_ptr(), length - whole);
+        }
+        self.update(&tail[..length - whole]);
+    }
+
+    pub fn finish(self) -> u64 {
+        self.lanes.iter().fold(self.length, |digest, &lane| {
+            (digest ^ lane).wrapping_mul(MIX).rotate_left(31)
+        })
+    }
+}
+
 /// Driver work that needs no service state, which a call does after its
 /// turn so that its host kernel calls, which wait for the boot processor,
 /// hold no other connection's call. It is callable from any processor, one
@@ -350,6 +426,21 @@ pub trait Backend {
     fn write_memory(&mut self, memory: Memory, offset: u64, bytes: &[u8]) -> Result<()>;
     /// Invalidates mapped memory and copies out of it.
     fn read_memory(&mut self, memory: Memory, offset: u64, bytes: &mut [u8]) -> Result<()>;
+    /// The [`RowsDigest`] of `length` bytes at `offset` of mapped memory,
+    /// which the guest may write meanwhile (the digest then differs from a
+    /// later one). A backend that maps the memory may read it in place.
+    fn digest_memory(&mut self, memory: Memory, offset: u64, length: u64) -> Result<u64> {
+        let mut digest = RowsDigest::new();
+        let mut block = [0u8; 4096];
+        let mut at = 0;
+        while at < length {
+            let count = (length - at).min(block.len() as u64) as usize;
+            self.read_memory(memory, offset + at, &mut block[..count])?;
+            digest.update(&block[..count]);
+            at += count as u64;
+        }
+        Ok(digest.finish())
+    }
     /// `vkFlushMappedMemoryRanges` after CPU writes through another mapping.
     fn flush_memory(&mut self, memory: Memory, offset: u64, size: u64) -> Result<()>;
     /// `vkInvalidateMappedMemoryRanges` before CPU reads.

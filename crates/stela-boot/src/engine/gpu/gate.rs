@@ -672,7 +672,10 @@ fn report_long_turn(served: &Served) {
 /// What a device holds: its allocation with the part waiting for submitted
 /// work and the part of that only held work keeps (now and its peak), that
 /// work, the resources automatic heaps answered nil for (no
-/// room / room only in pieces), its memory blocks with the resources placed in them and
+/// room / room only in pieces), its mirrors of rows no linear image takes
+/// (alive/MiB, made, textures that took another's, rows copied into images
+/// of those commits compared, images copied back to rows, rows copied
+/// again after the GPU wrote them), its memory blocks with the resources placed in them and
 /// those in memory of their own, and the connections counting the most
 /// bytes, each as
 /// id:objects/MiB. Nothing while a call holds the service.
@@ -684,7 +687,7 @@ fn report_memory(service: &Shared) {
     let mib = |bytes: u64| bytes >> 20;
     let device = memory.device;
     output::arguments(format_args!(
-        "GPU MEMORY allocated={}M deferred={}/{}M pinned={}/{}M/{}M in_flight={} completed={}/{} recycled={}/{}M reused={}/{} heap_nils={}/{} blocks={}/{}M placed={}/{}M own={} connections={}",
+        "GPU MEMORY allocated={}M deferred={}/{}M pinned={}/{}M/{}M in_flight={} completed={}/{} recycled={}/{}M reused={}/{} heap_nils={}/{} mirrors={}/{}M made={} shared={} mirror_uploads={}/{} copy_backs={} refreshes={} blocks={}/{}M placed={}/{}M own={} connections={}",
         mib(device.allocated),
         device.deferred,
         mib(device.deferred_bytes),
@@ -700,6 +703,14 @@ fn report_memory(service: &Shared) {
         device.recycled.hits + device.recycled.misses,
         device.heap_refusals.full,
         device.heap_refusals.fragmented,
+        device.mirrors.live,
+        mib(device.mirrors.bytes),
+        device.mirrors.created,
+        device.mirrors.shared,
+        device.mirrors.uploads,
+        device.mirrors.uploads + device.mirrors.skipped,
+        device.mirrors.copy_backs,
+        device.mirrors.refreshes,
         device.blocks.blocks,
         mib(device.blocks.block_bytes),
         device.blocks.placed,
