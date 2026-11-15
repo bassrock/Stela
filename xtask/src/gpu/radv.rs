@@ -34,6 +34,7 @@ pub(super) const RADV: Lane = Lane {
         "soft_float",
         "drm_amdgpu",
         "radv_nir_options",
+        "radv_submit",
     ],
     vendored: &[
         ("libdrm", "amdgpu/amdgpu_bo.c"),

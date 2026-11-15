@@ -234,6 +234,33 @@ fn a_lost_device_reopens_while_an_empty_connection_stays_open() {
     assert!(!service.device().is_lost());
 }
 
+/// The lost device's backend, which the reopened device replaces: released
+/// by default, kept unreleased for a driver whose release may wait without
+/// bound ([`Service::keep_lost_devices`], RADV's).
+fn lost_backend_after_reopen(keep: bool) -> usize {
+    let probe = alloc::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    let mut service = service().with_reopen(Box::new(|| Ok(device_on(MockBackend::new()))));
+    if keep {
+        service = service.keep_lost_devices();
+    }
+    service.device().backend().pipeline_gate = Some(probe.clone());
+    let connection = connect(&mut service);
+    service.device().mark_lost();
+    service.disconnect(connection).unwrap();
+    assert!(!service.device().is_lost());
+    alloc::sync::Arc::strong_count(&probe)
+}
+
+#[test]
+fn a_reopened_device_releases_the_lost_one() {
+    assert_eq!(lost_backend_after_reopen(false), 1);
+}
+
+#[test]
+fn a_reopened_device_keeps_the_lost_one_when_asked() {
+    assert_eq!(lost_backend_after_reopen(true), 2);
+}
+
 #[test]
 fn a_device_that_does_not_reopen_stays_lost() {
     let mut service = service().with_reopen(Box::new(|| Err(Error::OutOfMemory)));
