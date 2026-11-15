@@ -83,6 +83,11 @@ static bool request_supported(gfp_t flags)
 		allowed |= __GFP_ACCOUNT;
 	bool quiescent = stela_linux_quiescent();
 	bool may_block = gfpflags_allow_blocking(flags);
+	/* A request that may not fail is one that may wait: DRM's
+	 * drm_modeset_lock_all takes its context so, and goes on without one when
+	 * refused, leaving every modeset lock to the next atomic commit. */
+	if (may_block)
+		allowed |= __GFP_NOFAIL;
 	if ((flags & ~allowed) || (may_block && !quiescent)) {
 		stela_linux_unsupported("kmalloc allocation policy or context");
 		return false;
@@ -109,6 +114,8 @@ static void *allocate(size_t size, gfp_t flags, size_t minimum_align)
 	u8 *base = gfpflags_allow_blocking(flags) ?
 		stela_linux_heap_alloc(align + size, align) :
 		stela_linux_heap_try_alloc(align + size, align);
+	if (!base && (flags & __GFP_NOFAIL))
+		stela_linux_fatal("a kmalloc that may not fail found no memory");
 	if (!base)
 		return NULL;
 	struct header *header = (struct header *)(base + align) - 1;
@@ -306,7 +313,7 @@ static void policy_and_context(void)
 		GFP_KERNEL | __GFP_DMA, GFP_KERNEL | __GFP_DMA32,
 		GFP_KERNEL | __GFP_RECLAIMABLE, GFP_KERNEL | __GFP_MOVABLE,
 		GFP_KERNEL | __GFP_COMP, GFP_KERNEL | __GFP_MEMALLOC,
-		GFP_KERNEL | __GFP_NOFAIL,
+		GFP_ATOMIC | __GFP_NOFAIL,
 		GFP_KERNEL | __GFP_THISNODE,
 		GFP_KERNEL | (__force gfp_t)(1U << 31),
 	};
@@ -327,7 +334,7 @@ static void policy_and_context(void)
 	const gfp_t admitted[] = {
 		GFP_KERNEL, GFP_KERNEL | __GFP_ZERO, GFP_KERNEL | __GFP_NOWARN,
 		GFP_KERNEL | __GFP_NOMEMALLOC, GFP_KERNEL | __GFP_NORETRY,
-		GFP_KERNEL_ACCOUNT,
+		GFP_KERNEL_ACCOUNT, GFP_KERNEL | __GFP_NOFAIL,
 	};
 	unsigned int before = refusals;
 	for (size_t i = 0; i < ARRAY_SIZE(admitted); i++) {
