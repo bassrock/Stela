@@ -136,6 +136,16 @@ impl Sysroot {
             "-nostdlib".to_owned(),
         ];
         link.extend(PROBE_LINK.map(str::to_owned));
+        // Meson asks the compiler, with the compile flags, where libraries
+        // are; without the sysroot there Clang names the build host's, and a
+        // probe such as Mesa's `find_library('elf')` finds what the image
+        // does not have.
+        let sysroot = format!("--sysroot={}", slashed(&self.directory));
+        let with_sysroot = |flags: &[String]| {
+            let mut flags = flags.to_vec();
+            flags.push(sysroot.clone());
+            flags
+        };
         let mut link_cxx = link.clone();
         link.push("-lc".to_owned());
         link_cxx.extend(["-lc++".to_owned(), "-lc".to_owned()]);
@@ -167,8 +177,8 @@ impl Sysroot {
             symbols = slashed(&toolchain.symbols),
             linker = slashed(&toolchain.linker),
             pkg_config = super::toolchain::pkg_config()?,
-            compile = list(&self.compile),
-            compile_cxx = list(&self.compile_cxx),
+            compile = list(&with_sysroot(&self.compile)),
+            compile_cxx = list(&with_sysroot(&self.compile_cxx)),
             link = list(&link),
             link_cxx = list(&link_cxx),
             packages = slashed(packages),

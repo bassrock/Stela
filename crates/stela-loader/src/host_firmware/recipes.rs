@@ -1027,13 +1027,18 @@ const fn amdgpu(member: &'static str, length: usize, sha256: &'static str) -> Re
 }
 
 /// The files amdgpu asks for on Navi 48, named by its IP blocks' versions:
-/// GC 12.0.1, PSP and SMU 14.0.3, SDMA 7.0.1 and VCN 5.0.0. MES runs one
-/// image for both its pipes (`amdgpu_uni_mes`, on by default), and the PSP
-/// loads the rest, so GC's table of contents for RLC's backdoor load is not
-/// asked for. Neither is the display's DMCUB, which amdgpu loads only with
-/// its display core, nor the "kicker" images of 1002:7551 rev C8
-/// (`amdgpu_is_kicker_fw`).
+/// GC 12.0.1, PSP and SMU 14.0.3, SDMA 7.0.1 and VCN 5.0.0, and DCN 4.0.1's
+/// DMCUB, which amdgpu_dm.c requests when amdgpu runs with its display core
+/// (`amdgpu-dc`) and the PSP loads. MES runs one image for both its pipes
+/// (`amdgpu_uni_mes`, on by default), and the PSP loads the rest, so GC's
+/// table of contents for RLC's backdoor load is not asked for. Neither are
+/// the "kicker" images of 1002:7551 rev C8 (`amdgpu_is_kicker_fw`).
 pub const AMDGPU: &[Recipe] = &[
+    amdgpu(
+        "amdgpu/dcn_4_0_1_dmcub.bin",
+        368288,
+        "74b567655ac89bfe03389b660e973dc3c067aebd464c6389a071662cfbe6237f",
+    ),
     amdgpu(
         "amdgpu/gc_12_0_1_imu.bin",
         132352,
